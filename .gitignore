@@ -1,0 +1,6 @@
+node_modules/
+.vscode/
+uploads/
+.env
+*.log
+.DS_Store
