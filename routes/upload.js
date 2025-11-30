@@ -8,8 +8,12 @@ const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../db');
 
-// 上传根目录：/Users/liwenyu/imgmgr-api/uploads
-const uploadRoot = path.join(__dirname, '..', 'uploads');
+// 上传根目录：优先使用环境变量 UPLOAD_ABS_DIR，否则回退到仓库内的 uploads
+const uploadsAbsDir = process.env.UPLOAD_ABS_DIR || path.join(__dirname, '..', 'uploads');
+// 如果传入的是父目录（例如 C:/ALL/MaMage/Photo_Base），实际文件通常在其下的 'uploads' 子目录
+const uploadRoot = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWith('/uploads')
+  ? uploadsAbsDir
+  : path.join(uploadsAbsDir, 'uploads');
 
 // === multer 配置：按日期分目录，文件名用 uuid ===
 const storage = multer.diskStorage({
@@ -32,6 +36,7 @@ const storage = multer.diskStorage({
     }
 
     fs.mkdirSync(dir, { recursive: true });
+    console.log('[upload] destination dir:', dir);
     cb(null, dir);
   },
 
@@ -59,7 +64,7 @@ const upload = multer({
 // === 单张照片上传接口 ===
 // POST /api/upload/photo
 // 表单字段：file（图片），projectId（可选），title（可选），type（可选），tags（可选 JSON）
-router.post('/photo', upload.single('file'), async (req, res) => {
+async function processUpload(req, res) {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -81,42 +86,40 @@ router.post('/photo', upload.single('file'), async (req, res) => {
     }
 
     // 原图绝对路径
-    const absPath = req.file.path; // e.g. /Users/liwenyu/imgmgr-api/uploads/2025/11/16/xxx.jpg
+    const absPath = req.file.path;
+    console.log('[upload] saved absPath:', absPath, ' uploadRoot:', uploadRoot);
 
     // 相对路径（给前端用）：把 uploadRoot 去掉，然后统一换成 /uploads/...
-    let relPath = absPath.replace(uploadRoot, '');   // => /2025/11/16/xxx.jpg
-    relPath = relPath.split(path.sep).join('/');     // 处理 windows 反斜杠
-    relPath = '/uploads' + relPath;                  // => /uploads/2025/11/16/xxx.jpg
+    let relPath = absPath.replace(uploadRoot, '');
+    relPath = relPath.split(path.sep).join('/');
+    relPath = '/uploads' + relPath;
 
     // === 生成缩略图 ===
-    const dirName = path.dirname(absPath);           // .../uploads/2025/11/16
-    const thumbDir = path.join(dirName, 'thumbs');   // .../uploads/2025/11/16/thumbs
+    const dirName = path.dirname(absPath);
+    const thumbDir = path.join(dirName, 'thumbs');
     fs.mkdirSync(thumbDir, { recursive: true });
 
-    const baseName = path.basename(absPath);         // xxx.jpg
-    const thumbName = 'thumb_' + baseName;           // thumb_xxx.jpg
+    const baseName = path.basename(absPath);
+    const thumbName = 'thumb_' + baseName;
     const thumbAbsPath = path.join(thumbDir, thumbName);
 
-    // 用 sharp 生成压缩图（宽度 800 以内）
     await sharp(absPath)
-      .resize(800) // 宽 800，高度按比例
+      .resize(800)
       .jpeg({ quality: 80 })
       .toFile(thumbAbsPath);
 
     let thumbRel = thumbAbsPath.replace(uploadRoot, '');
     thumbRel = thumbRel.split(path.sep).join('/');
-    thumbRel = '/uploads' + thumbRel;               // => /uploads/2025/11/16/thumbs/thumb_xxx.jpg
+    thumbRel = '/uploads' + thumbRel;
 
-    // === 写入数据库 ===
     const [result] = await pool.query(
       `INSERT INTO photos
-        (uuid, project_id, url, thumb_url, local_path, title, tags, type)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
+        (uuid, project_id, url, thumb_url, title, tags, type)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?)`,
       [
         projectId || null,
         relPath,
         thumbRel,
-        absPath,
         title,
         tags ? JSON.stringify(tags) : null,
         type
@@ -125,7 +128,44 @@ router.post('/photo', upload.single('file'), async (req, res) => {
 
     const insertedId = result.insertId;
 
-    // 返回给前端
+    if (projectId) {
+      try {
+        const [projRows] = await pool.query(
+          `SELECT photo_ids FROM projects WHERE id = ? FOR UPDATE`,
+          [projectId]
+        );
+
+        if (projRows && projRows.length) {
+          const existing = projRows[0].photo_ids;
+          let arr = [];
+
+          if (existing) {
+            if (typeof existing === 'string') {
+              try {
+                const parsed = JSON.parse(existing);
+                if (Array.isArray(parsed)) arr = parsed.map(Number);
+                else arr = String(existing).split(',').map(s => s.trim()).filter(Boolean).map(Number);
+              } catch (e) {
+                arr = String(existing).split(',').map(s => s.trim()).filter(Boolean).map(Number);
+              }
+            } else if (Array.isArray(existing)) {
+              arr = existing.map(Number);
+            }
+          }
+
+          if (!arr.includes(insertedId)) arr.push(insertedId);
+
+          const newVal = arr.length ? JSON.stringify(arr) : null;
+          await pool.query(
+            `UPDATE projects SET photo_ids = ? WHERE id = ?`,
+            [newVal, projectId]
+          );
+        }
+      } catch (e) {
+        console.error('append photo id to project failed:', e.message);
+      }
+    }
+
     res.json({
       id: insertedId,
       projectId: projectId || null,
@@ -138,6 +178,12 @@ router.post('/photo', upload.single('file'), async (req, res) => {
     console.error('POST /api/upload/photo error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
+
+router.post('/photo', upload.single('file'), processUpload);
+
+// Attach multer instance and handler to router so other modules can reuse them
+router.upload = upload;
+router.processUpload = processUpload;
 
 module.exports = router;

@@ -4,3 +4,6 @@ uploads/
 .env
 *.log
 .DS_Store
+data/
+mysql-data/
+*.sql.gz

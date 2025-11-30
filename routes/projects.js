@@ -1,7 +1,7 @@
 // routes/projects.js
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../db');
+const { pool, buildUploadUrl } = require('../db');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
@@ -72,7 +72,10 @@ router.get('/', async (req, res) => {
 
     const list = rows.map((r) => ({
       ...r,
-      meta: parseMeta(r.meta)
+      meta: parseMeta(r.meta),
+      // 覆盖返回的 coverUrl/coverThumbUrl 为完整地址
+      coverUrl: r.coverUrl ? buildUploadUrl(r.coverUrl) : null,
+      coverThumbUrl: r.coverThumbUrl ? buildUploadUrl(r.coverThumbUrl) : null
     }));
 
     res.json(list);
@@ -102,14 +105,8 @@ router.get('/list', async (req, res) => {
 
     if (keyword) {
       const like = `%${keyword}%`;
-      whereClauses.push(`
-        (
-          p.name LIKE ?
-          OR p.description LIKE ?
-          OR p.event_date LIKE ?
-          OR p.meta LIKE ?
-        )
-      `);
+      // 在项目名、描述、meta、photo_ids 上做模糊匹配
+      whereClauses.push('(p.name LIKE ? OR p.description LIKE ? OR p.meta LIKE ? OR p.photo_ids LIKE ?)');
       params.push(like, like, like, like);
     }
 
@@ -237,7 +234,7 @@ router.get('/:id', async (req, res) => {
         ph.project_id AS projectId,
         ph.url,
         ph.thumb_url AS thumbUrl,
-        ph.local_path AS localPath,
+        /* local_path column removed from schema; do not select it */
         ph.title,
         ph.tags,
         ph.type,
@@ -251,7 +248,14 @@ router.get('/:id', async (req, res) => {
       [id]
     );
 
-    project.photos = photoRows;
+    project.photos = photoRows.map((p) => ({
+      ...p,
+      fullUrl: p.url ? buildUploadUrl(p.url) : null,
+      fullThumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null
+    }));
+
+    project.coverFullUrl = project.coverUrl ? buildUploadUrl(project.coverUrl) : null;
+    project.coverFullThumbUrl = project.coverThumbUrl ? buildUploadUrl(project.coverThumbUrl) : null;
 
     res.json(project);
   } catch (err) {
@@ -400,9 +404,9 @@ router.delete('/:id', async (req, res) => {
   }
 
   try {
-    // 1. 查询该项目下所有照片
+    // 1. 查询该项目下所有照片（不再包含已删除的 local_path 列）
     const [photos] = await pool.query(
-      `SELECT id, local_path AS localPath, thumb_url AS thumbUrl
+      `SELECT id, url, thumb_url AS thumbUrl
        FROM photos
        WHERE project_id = ?`,
       [id]
@@ -410,20 +414,24 @@ router.delete('/:id', async (req, res) => {
 
     // 2. 删除照片文件（原图 + 缩略图）
     for (const p of photos) {
-      // 原图
-      if (p.localPath) {
+
+      // 原图（通过 url 还原绝对路径）
+      if (p.url) {
         try {
-          if (fs.existsSync(p.localPath)) {
-            fs.unlink(p.localPath, err => {
+          let rel = p.url.replace(/^\/uploads[\\/]/, '');
+          rel = rel.split('/').join(path.sep);
+          const abs = path.join(uploadRoot, rel);
+          if (fs.existsSync(abs)) {
+            fs.unlink(abs, err => {
               if (err) {
-                console.error('unlink photo file error:', p.localPath, err.message);
+                console.error('unlink photo file error:', abs, err.message);
               } else {
-                console.log('photo file deleted:', p.localPath);
+                console.log('photo file deleted:', abs);
               }
             });
           }
         } catch (e) {
-          console.error('check/unlink photo error:', p.localPath, e.message);
+          console.error('check/unlink photo error:', p.url, e.message);
         }
       }
 
