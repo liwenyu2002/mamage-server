@@ -4,6 +4,7 @@ const path = require('path');
 const projectsRouter = require('./routes/projects');
 const photosRouter = require('./routes/photos');
 const uploadRouter = require('./routes/upload'); // ✨ 一会儿会新建这个文件
+const usersRouter = require('./routes/users');
 
 const app = express();
 
@@ -31,6 +32,7 @@ app.use((req, res, next) => {
 app.use('/api/projects', projectsRouter);
 app.use('/api/photos', photosRouter);
 app.use('/api/upload', uploadRouter);  // ✨ 上传相关接口
+app.use('/api/users', usersRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });

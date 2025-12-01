@@ -7,10 +7,24 @@ const pool = mysql.createPool({
   user: 'root',
   password: '320911',
   database: 'MaMage',
+  charset: 'utf8mb4',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0
 });
+
+// Ensure each new connection uses utf8mb4 character set at session level.
+// This guarantees correct handling of Chinese characters even if server defaults differ.
+if (typeof pool.on === 'function') {
+  pool.on('connection', (conn) => {
+    try {
+      conn.query("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
+    } catch (e) {
+      // non-fatal, just log if debugging
+      console.error('[db] failed to set connection names utf8mb4', e && e.stack ? e.stack : e);
+    }
+  });
+}
 
 // 你在一个地方手动修改这个常量就行：
 // - 开发环境示例： 'http://localhost:3000'

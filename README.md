@@ -27,15 +27,11 @@ cmd /c '"C:\\Program Files\\MySQL\\MySQL Server 8.4\\bin\\mysql.exe" -u root -p 
 
 说明：不要把 MySQL 的实际数据目录加入 Git。项目已在 `.gitignore` 中忽略常见的数据目录（如 `data/`）。
 
----
 
 ## 前端 API 参考（常用）
 
 ### 静态资源（图片）
 - 访问路径：`GET /uploads/<path>`
-- 说明：服务会把服务器上的 `UPLOAD_ABS_DIR` 下的 `uploads` 子目录暴露为 `/uploads`，例如：
-  - 本地文件 `C:/ALL/MaMage/Photo_Base/uploads/2025/11/18/x.png` 对应 URL `http://localhost:3000/uploads/2025/11/18/x.png`。
-
 ### 健康检查
 - `GET /api/health` — 返回服务状态：`{ status: 'ok' }`。
 
@@ -56,7 +52,6 @@ cmd /c '"C:\\Program Files\\MySQL\\MySQL Server 8.4\\bin\\mysql.exe" -u root -p 
 - `POST /api/photos/delete` — 批量删除照片，body（JSON）：`{ "photoIds": [1,2,3] }`。
 
 ### 上传（upload）相关
-- `POST /api/upload/photo` — 单张照片上传（multipart/form-data）
   - 字段：`file`（图片），`projectId`（可选），`title`、`type`、`tags`（JSON 字符串）
   - 返回示例：`{ id, projectId, url, thumbUrl, title, type }`，其中 `url`/`thumbUrl` 是以 `/uploads/...` 开头的路径。
 
