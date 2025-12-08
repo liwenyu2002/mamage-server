@@ -1,0 +1,10 @@
+node_modules/
+.vscode/
+uploads/
+.env
+.env.example
+*.log
+.DS_Store
+data/
+mysql-data/
+*.sql.gz
