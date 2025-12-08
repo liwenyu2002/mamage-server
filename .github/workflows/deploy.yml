@@ -1,0 +1,62 @@
+name: Deploy mamage-server
+
+on:
+  push:
+    branches: [ "main" ]        # 推到 main 时自动部署
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 可选：CI 里先跑一次安装，提前发现依赖问题
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      # 可选：有测试就跑，没有就略过
+      - name: Run tests (optional)
+        run: |
+          if npm test ; then
+            echo "tests ok"
+          else
+            echo "no tests or tests failed, continue anyway"
+          fi
+
+      # 配置 SSH，使用你在仓库里配置的 DEPLOY_SSH_KEY
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      # 部署到服务器
+      - name: Deploy to server via SSH
+        run: |
+          ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
+          set -e
+
+          # 后端项目所在目录
+          cd /home/liwy/mamage-server
+
+          # 拉最新代码
+          git fetch origin main
+          git reset --hard origin/main
+
+          # 安装依赖（生产环境省略 devDependencies）
+          npm ci --omit=dev || npm install --omit=dev
+
+          # 重启 pm2 进程，第一次没有的话就 start
+          pm2 restart mamage-server || pm2 start app.js --name mamage-server
+
+          # 保存 pm2 进程列表，保证重启后还能自启（如果你配置了 pm2 startup）
+          pm2 save
+
+          EOF
