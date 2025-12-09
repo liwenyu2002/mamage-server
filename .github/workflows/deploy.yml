@@ -9,19 +9,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. 在 GitHub runner 上拉代码
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2. 准备 Node 环境（跑依赖/测试用，非必须但建议保留）
       - name: Use Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # 可选：CI 里先跑一次安装，提前发现依赖问题
+      # 3. 在 CI 上先装一遍依赖，提前暴露问题
       - name: Install dependencies
         run: npm ci || npm install
 
-      # 可选：有测试就跑，没有就略过
+      # 4. （可选）跑测试，没有测试的话会直接 continue
       - name: Run tests (optional)
         run: |
           if npm test ; then
@@ -30,33 +32,36 @@ jobs:
             echo "no tests or tests failed, continue anyway"
           fi
 
-      # 配置 SSH，使用你在仓库里配置的 DEPLOY_SSH_KEY
+      # 5. 配置 SSH agent，加载你在仓库 Secrets 里的 DEPLOY_SSH_KEY
       - name: Setup SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      # 部署到服务器
-      - name: Deploy to server via SSH
+      # 6. 用 rsync 将当前仓库内容同步到 ECS（替代原来的 git fetch/reset）
+      - name: Sync code to server via rsync
+        run: |
+          rsync -avz --delete \
+            --exclude ".git/" \
+            --exclude "node_modules/" \
+            --exclude ".github/" \
+            -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
+            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage-server/
+
+      # 7. SSH 登录 ECS，安装依赖并重启 pm2
+      - name: Install & restart on server
         run: |
           ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
           set -e
-
-          # 后端项目所在目录
           cd /home/liwy/mamage-server
 
-          # 拉最新代码
-          git fetch origin main
-          git reset --hard origin/main
-
-          # 安装依赖（生产环境省略 devDependencies）
+          # 在服务器上安装生产依赖
           npm ci --omit=dev || npm install --omit=dev
 
-          # 重启 pm2 进程，第一次没有的话就 start
+          # 重启 pm2 进程，第一次没有就 start
           pm2 restart mamage-server || pm2 start app.js --name mamage-server
 
-          # 保存 pm2 进程列表，保证重启后还能自启（如果你配置了 pm2 startup）
+          # 保存 pm2 进程列表（如果配置了 pm2 startup）
           pm2 save
-
           EOF
