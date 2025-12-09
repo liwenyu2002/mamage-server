@@ -14,11 +14,20 @@ const uploadRoot = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWith('/up
   ? uploadsAbsDir
   : path.join(uploadsAbsDir, 'uploads');
 
-// 当图片迁移到远程对象存储（如腾讯云 COS）时，可以通过 UPLOAD_SKIP_LOCAL_FILE_CHECK=1
-// 跳过本地文件存在性检查，直接返回 buildUploadUrl 的结果。
+// 当图片迁移到远程对象存储（如腾讯云 COS）时，
+// 默认在部署到没有本地 uploads 的环境（例如 ECS）时跳过本地文件存在性检查，
+// 或者可通过环境变量 UPLOAD_SKIP_LOCAL_FILE_CHECK=1 强制跳过。
 const skipLocalFileCheck = (() => {
-  const v = String(process.env.UPLOAD_SKIP_LOCAL_FILE_CHECK || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  const envVal = String(process.env.UPLOAD_SKIP_LOCAL_FILE_CHECK || '').trim().toLowerCase();
+  if (envVal === '1' || envVal === 'true' || envVal === 'yes') return true;
+  // 如果配置了 UPLOAD_BASE_URL 并且是一个 http(s) 地址且不是 localhost/127.0.0.1，则默认跳过本地检查
+  try {
+    const base = (keys.UPLOAD_BASE_URL || '').trim();
+    if (base && /^https?:\/\//i.test(base) && !/localhost|127\.0\.0\.1/.test(base)) return true;
+  } catch (e) {}
+  // 如果没有配置 UPLOAD_ABS_DIR，说明没有本地 uploads 目录，跳过本地检查
+  if (!keys.UPLOAD_ABS_DIR) return true;
+  return false;
 })();
 
 // 根据 users 表里实际的 id 改这两个值
@@ -330,13 +339,7 @@ router.post('/zip', async (req, res) => {
     for (const r of rows) {
       try {
         if (!r.url) continue;
-        let rel = r.url.replace(/^\/uploads[\\/]/, '');
-        rel = rel.split('/').join(path.sep);
-        const abs = path.join(uploadRoot, rel);
-        if (!fs.existsSync(abs)) {
-          console.warn('[photos.zip] file not found, skip:', abs);
-          continue;
-        }
+        const urlStr = String(r.url);
 
         const projId = r.projectId || 0;
         const rawProjName = projMap[projId] || `project-${projId}`;
@@ -346,11 +349,46 @@ router.post('/zip', async (req, res) => {
         counters[projId] = (counters[projId] || 0) + 1;
         const seq = counters[projId];
 
-        const ext = path.extname(abs) || '';
-        const nameInZip = `${safeProjName}-${seq}${ext}`;
-        archive.file(abs, { name: nameInZip });
+        // 如果是远程 URL（例如 COS 上的图片），通过 HTTP(S) 下载并把响应流追加到 zip
+        if (/^https?:\/\//i.test(urlStr)) {
+          const ext = path.extname(urlStr) || '';
+          const nameInZip = `${safeProjName}-${seq}${ext}`;
+          try {
+            const client = urlStr.startsWith('https') ? require('https') : require('http');
+            await new Promise((resolve) => {
+              const req = client.get(urlStr, (response) => {
+                if (response.statusCode >= 200 && response.statusCode < 300) {
+                  archive.append(response, { name: nameInZip });
+                } else {
+                  console.warn('[photos.zip] remote file not available, skip:', urlStr, response.statusCode);
+                  response.resume();
+                }
+                resolve();
+              });
+              req.on('error', (err) => {
+                console.error('[photos.zip] remote download error:', urlStr, err && err.message ? err.message : err);
+                resolve();
+              });
+            });
+          } catch (e) {
+            console.error('[photos.zip] append remote file failed:', e && e.message ? e.message : e);
+          }
+        } else {
+          // 本地文件处理（保留原有行为）
+          let rel = r.url.replace(/^\/uploads[\\\/]/, '');
+          rel = rel.split('/').join(path.sep);
+          const abs = path.join(uploadRoot, rel);
+          if (!fs.existsSync(abs)) {
+            console.warn('[photos.zip] file not found, skip:', abs);
+            continue;
+          }
+
+          const ext = path.extname(abs) || '';
+          const nameInZip = `${safeProjName}-${seq}${ext}`;
+          archive.file(abs, { name: nameInZip });
+        }
       } catch (e) {
-        console.error('add file to zip error:', e.message);
+        console.error('add file to zip error:', e && e.message ? e.message : e);
       }
     }
 
@@ -417,7 +455,14 @@ router.patch('/:id', requireAdmin(), async (req, res) => {
     let parsedTags = null;
     try { parsedTags = p.tags ? JSON.parse(p.tags) : null; } catch (e) { parsedTags = null; }
 
-    res.json({ id: p.id, url: p.url, thumbUrl: p.thumbUrl, title: p.title, description: p.description, tags: parsedTags });
+    res.json({
+      id: p.id,
+      url: buildUploadUrl(p.url),
+      thumbUrl: buildUploadUrl(p.thumbUrl),
+      title: p.title,
+      description: p.description,
+      tags: parsedTags
+    });
   } catch (err) {
     console.error('PATCH /api/photos/:id error:', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Internal server error' });

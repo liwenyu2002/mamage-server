@@ -12,6 +12,18 @@ const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
 // 上传根目录（和 upload.js 保持一致）
 const uploadRoot = path.join(__dirname, '..', 'uploads');
 
+// 当部署到没有本地 uploads 的环境（例如 ECS）时，默认跳过本地文件删除/检查
+const skipLocalFileCheck = (() => {
+  const envVal = String(process.env.UPLOAD_SKIP_LOCAL_FILE_CHECK || '').trim().toLowerCase();
+  if (envVal === '1' || envVal === 'true' || envVal === 'yes') return true;
+  try {
+    const base = (keys.UPLOAD_BASE_URL || '').trim();
+    if (base && /^https?:\/\//i.test(base) && !/localhost|127\.0\.0\.1/.test(base)) return true;
+  } catch (e) {}
+  if (!keys.UPLOAD_ABS_DIR) return true;
+  return false;
+})();
+
 // 基于数据库的权限检查（使用 role_permissions 表）
 const { requirePermission } = require('../lib/permissions');
 
@@ -558,42 +570,51 @@ router.delete('/:id', requirePermission('projects.delete'), async (req, res) => 
       // 原图（通过 url 还原绝对路径）
       if (p.url) {
         try {
-          let rel = p.url.replace(/^\/uploads[\\/]/, '');
-          rel = rel.split('/').join(path.sep);
-          const abs = path.join(uploadRoot, rel);
-          if (fs.existsSync(abs)) {
-            fs.unlink(abs, err => {
-              if (err) {
-                console.error('unlink photo file error:', abs, err.message);
-              } else {
-                console.log('photo file deleted:', abs);
-              }
-            });
+          // 如果是远程 URL（COS）或配置为跳过本地检查，则不尝试删除本地文件
+          if (/^https?:\/\//i.test(String(p.url)) || skipLocalFileCheck) {
+            // nothing to remove locally
+          } else {
+            let rel = p.url.replace(/^\/uploads[\\\/]/, '');
+            rel = rel.split('/').join(path.sep);
+            const abs = path.join(uploadRoot, rel);
+            if (fs.existsSync(abs)) {
+              fs.unlink(abs, err => {
+                if (err) {
+                  console.error('unlink photo file error:', abs, err.message);
+                } else {
+                  console.log('photo file deleted:', abs);
+                }
+              });
+            }
           }
         } catch (e) {
-          console.error('check/unlink photo error:', p.url, e.message);
+          console.error('check/unlink photo error:', p.url, e && e.message ? e.message : e);
         }
       }
 
       // 缩略图（通过 thumbUrl 还原绝对路径）
       if (p.thumbUrl) {
         try {
-          // 形如 /uploads/2025/11/16/thumbs/thumb_xxx.jpg
-          let rel = p.thumbUrl.replace(/^\/uploads[\\/]/, ''); // 去掉 /uploads/
-          rel = rel.split('/').join(path.sep);
-          const absThumb = path.join(uploadRoot, rel);
+          if (/^https?:\/\//i.test(String(p.thumbUrl)) || skipLocalFileCheck) {
+            // skip local thumb delete
+          } else {
+            // 形如 /uploads/2025/11/16/thumbs/thumb_xxx.jpg
+            let rel = p.thumbUrl.replace(/^\/uploads[\\\/]/, ''); // 去掉 /uploads/
+            rel = rel.split('/').join(path.sep);
+            const absThumb = path.join(uploadRoot, rel);
 
-          if (fs.existsSync(absThumb)) {
-            fs.unlink(absThumb, err => {
-              if (err) {
-                console.error('unlink thumb file error:', absThumb, err.message);
-              } else {
-                console.log('thumb file deleted:', absThumb);
-              }
-            });
+            if (fs.existsSync(absThumb)) {
+              fs.unlink(absThumb, err => {
+                if (err) {
+                  console.error('unlink thumb file error:', absThumb, err.message);
+                } else {
+                  console.log('thumb file deleted:', absThumb);
+                }
+              });
+            }
           }
         } catch (e) {
-          console.error('check/unlink thumb error:', p.thumbUrl, e.message);
+          console.error('check/unlink thumb error:', p.thumbUrl, e && e.message ? e.message : e);
         }
       }
     }

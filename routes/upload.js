@@ -7,6 +7,7 @@ const multer = require('multer');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../db');
+const { buildUploadUrl } = require('../db');
 const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
 const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
@@ -282,8 +283,8 @@ async function processUpload(req, res) {
     const respPayload = {
       id: insertedId,
       projectId: projectId || null,
-      url: relPath,
-      thumbUrl: thumbRel,
+      url: buildUploadUrl(relPath),
+      thumbUrl: buildUploadUrl(thumbRel),
       title,
       type
     };

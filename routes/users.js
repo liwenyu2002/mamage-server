@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../db');
+const { pool, buildUploadUrl } = require('../db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
@@ -44,6 +44,12 @@ async function authMiddleware(req, res, next) {
     const [rows] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [payload.id]);
     if (!rows || rows.length === 0) return res.status(401).json({ error: 'Invalid token (user not found)' });
     const user = rows[0];
+    // convert avatar_url to full URL if present
+    try {
+      user.avatar_url = user.avatar_url ? buildUploadUrl(user.avatar_url) : null;
+    } catch (e) {
+      user.avatar_url = user.avatar_url || null;
+    }
     // attach permissions fetched from role_permissions table
     try {
       user.permissions = await getPermissionsForRole(user.role);
@@ -233,6 +239,9 @@ router.put('/me', authMiddleware, async (req, res) => {
     const sql = `UPDATE users SET ${updates.join(', ')}, updated_at = ? WHERE id = ?`;
     await pool.query(sql, params);
     const [rows] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [req.user.id]);
+    if (rows && rows[0]) {
+      try { rows[0].avatar_url = rows[0].avatar_url ? buildUploadUrl(rows[0].avatar_url) : null; } catch (e) { rows[0].avatar_url = rows[0].avatar_url || null; }
+    }
     res.json(rows[0]);
   } catch (err) {
     console.error('[users.update]', err);
@@ -315,6 +324,9 @@ router.post('/me/invite', authMiddleware, async (req, res) => {
     await conn.commit();
     conn.release();
     const [rows2] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [req.user.id]);
+    if (rows2 && rows2[0]) {
+      try { rows2[0].avatar_url = rows2[0].avatar_url ? buildUploadUrl(rows2[0].avatar_url) : null; } catch (e) { rows2[0].avatar_url = rows2[0].avatar_url || null; }
+    }
     res.json(rows2[0]);
   } catch (err) {
     if (conn) { try { await conn.rollback(); conn.release(); } catch(_){} }
