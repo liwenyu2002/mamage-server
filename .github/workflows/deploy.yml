@@ -9,11 +9,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 在 GitHub runner 上拉代码
+      # 1. 在 GitHub runner 上拉代码（主要是为了跑 npm / 测试）
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. 准备 Node 环境（跑依赖/测试用，非必须但建议保留）
+      # 2. 准备 Node 环境
       - name: Use Node.js 20
         uses: actions/setup-node@v4
         with:
@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: npm ci || npm install
 
-      # 4. （可选）跑测试，没有测试的话会直接 continue
+      # 4. （可选）跑测试，没有测试就会 echo 一句继续
       - name: Run tests (optional)
         run: |
           if npm test ; then
@@ -32,50 +32,42 @@ jobs:
             echo "no tests or tests failed, continue anyway"
           fi
 
-      # 5. 配置 SSH agent，加载你在仓库 Secrets 里的 DEPLOY_SSH_KEY
+      # 5. 配置 SSH agent，加载仓库 Secrets 里的 DEPLOY_SSH_KEY（用来 ssh 登服务器）
       - name: Setup SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      # 6. 在同步代码前先在远端备份 .env（以免意外被删除），然后用 rsync 将当前仓库内容同步到 ECS
-      - name: Backup remote .env before sync
-        run: |
-          ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
-            "mkdir -p /home/${{ secrets.DEPLOY_USER }}/.backup || true; if [ -f /home/liwy/mamage_server/.env ]; then cp /home/liwy/mamage_server/.env /home/${{ secrets.DEPLOY_USER }}/.backup/.env.bak.$(date +%s); fi"
-
-      - name: Sync code to server via rsync
-        run: |
-          # 注意：排除 .env，防止 --delete 删除服务器上的配置文件
-          rsync -avz --delete \
-            --exclude ".git/" \
-            --exclude "node_modules/" \
-            --exclude ".github/" \
-            --exclude ".env" \
-            -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
-            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
-
-      # 7. SSH 登录 ECS，安装依赖、验证环境变量并重启 pm2
-      - name: Install, validate env & restart on server
+      # 6. 登录服务器，用 git 拉最新代码 + npm 安装 + pm2 重启
+      - name: Deploy to server via SSH (git pull)
         run: |
           ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
           set -e
           cd /home/liwy/mamage_server
 
-          # 在服务器上安装生产依赖
+          echo "当前 git remote："
+          git remote -v
+
+          echo "拉取 main 分支最新代码..."
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "安装生产依赖..."
           npm ci --omit=dev || npm install --omit=dev
 
-          # 验证环境变量已配置（这会在应用启动前检查）
-          echo "✅ 环境变量验证..."
-          node -e "require('./lib/validateEnv').validateEnvironment(true)" || {
-            echo "❌ 环境变量检查失败，应用不会启动"
-            exit 1
-          }
+          # 如果你有 lib/validateEnv.js 就做一次环境检查，没有的话这段会被跳过
+          if [ -f "./lib/validateEnv.js" ]; then
+            echo "✅ 运行 validateEnv 检查环境变量..."
+            node -e "require('./lib/validateEnv').validateEnvironment(true)" || {
+              echo "❌ 环境变量检查失败，停止部署"
+              exit 1
+            }
+          fi
 
-          # 重启 pm2 进程，第一次没有就 start
+          echo "重启 pm2 进程..."
           pm2 restart mamage-server || pm2 start app.js --name mamage-server
-
-          # 保存 pm2 进程列表（如果配置了 pm2 startup）
           pm2 save
+
+          echo "✅ 部署完成"
           EOF
