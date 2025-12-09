@@ -38,7 +38,12 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      # 6. 用 rsync 将当前仓库内容同步到 ECS（替代原来的 git fetch/reset）
+      # 6. 在同步代码前先在远端备份 .env（以免意外被删除），然后用 rsync 将当前仓库内容同步到 ECS
+      - name: Backup remote .env before sync
+        run: |
+          ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "mkdir -p /home/${{ secrets.DEPLOY_USER }}/.backup || true; if [ -f /home/liwy/mamage_server/.env ]; then cp /home/liwy/mamage_server/.env /home/${{ secrets.DEPLOY_USER }}/.backup/.env.bak.$(date +%s); fi"
+
       - name: Sync code to server via rsync
         run: |
           # 注意：排除 .env，防止 --delete 删除服务器上的配置文件
