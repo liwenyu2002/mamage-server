@@ -1,23 +1,23 @@
-// app.js（节选）
+// backend/app.js（完整示例）
 // Load local .env in development (optional). Ensure .env is in .gitignore.
 try { require('dotenv').config(); } catch (e) {}
+
 const express = require('express');
 const path = require('path');
 const projectsRouter = require('./routes/projects');
 const photosRouter = require('./routes/photos');
-const uploadRouter = require('./routes/upload'); // ✨ 一会儿会新建这个文件
+const uploadRouter = require('./routes/upload');
 const usersRouter = require('./routes/users');
 
 const app = express();
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); 
-// 简单 CORS 中间件：开发时允许来自前端开发服务器的跨域请求
-// 可通过环境变量 `CORS_ORIGIN` 覆盖（例如: http://localhost:5173 或 *）
+app.use(express.urlencoded({ extended: true }));
+
+// ============ CORS（保留你的逻辑） ============
 const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
 app.use((req, res, next) => {
   const origin = req.get('origin');
-  // 如果显式配置了 CORS_ORIGIN，则使用它；否则使用请求的 Origin 或默认值
   const allow = process.env.CORS_ORIGIN || origin || corsOrigin;
   if (allow) res.setHeader('Access-Control-Allow-Origin', allow);
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -26,36 +26,59 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
-// 静态文件：对外暴露 /uploads
-// 支持用环境变量或 config/keys 指定本地 uploads 的绝对目录（例如 Windows: C:/ALL/MaMage/Photo_Base）
+
+// ============ /uploads 静态文件（你原来的逻辑） ============
 const keys = require('./config/keys');
 const uploadsAbsDir = keys.UPLOAD_ABS_DIR || path.join(__dirname, 'uploads');
-// 如果用户传入的是父目录（例如 C:/ALL/MaMage/Photo_Base），常见情况是实际文件在其下的 'uploads' 子目录。
-// 这里做兼容：如果路径已经以 'uploads' 结尾则直接使用，否则使用其下的 'uploads' 子目录。
+
 const staticUploadsDir = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWith('/uploads')
   ? uploadsAbsDir
   : path.join(uploadsAbsDir, 'uploads');
+
 app.use('/uploads', express.static(staticUploadsDir));
 
-// (已移除临时调试路由)
+// ============ ★ 新增：静态托管 dist ============
+/**
+ * 这里假设 dist 在项目根目录：
+ *   MaMage_Web/
+ *     backend/app.js  （当前文件）
+ *     dist/           （npm run build 生成）
+ */
+const distPath = path.join(__dirname, '..',  'MaMage_Web', 'dist');
 
-// 日志
+// 1）把 dist 里的静态文件暴露出来：/index.html、/bundle.js、/favicon.ico 等
+app.use(express.static(distPath));
+
+// ============ 日志 ============
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.url}`);
   next();
 });
 
-// 路由挂载
+// ============ API 路由 ============
 app.use('/api/projects', projectsRouter);
 app.use('/api/photos', photosRouter);
-app.use('/api/upload', uploadRouter);  // ✨ 上传相关接口
+app.use('/api/upload', uploadRouter);
 app.use('/api/users', usersRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-const PORT = 3000;
+// ============ ★ 新增：SPA 回退路由 ============
+/**
+ * 除了 /api 和 /uploads 开头的请求外，其它所有 GET 请求，都返回 dist/index.html，
+ * 让 React Router 自己在前端接管路由。
+ */
+app.get('/{*splat}', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+    return next(); // 交给上面的路由或 404 处理
+  }
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
+// ============ 启动服务 ============
+const PORT = 52367; // 或 process.env.PORT || 52367;
 app.listen(PORT, () => {
-  console.log(`API server listening on port ${PORT}`);
+  console.log(`API & Web server listening on http://localhost:${PORT}`);
 });
