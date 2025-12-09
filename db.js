@@ -1,19 +1,27 @@
 // db.js
 const mysql = require('mysql2/promise');
+const keys = require('./config/keys');
+
+const DB_HOST = keys.DB_HOST || '127.0.0.1';
+const DB_PORT = parseInt(keys.DB_PORT || '3306', 10) || 3306;
+const DB_USER = keys.DB_USER || 'root';
+const DB_PASSWORD = keys.DB_PASSWORD || '';
+const DB_NAME = keys.DB_NAME || 'mamage';
+
 console.log('[db] runtime mysql config =', {
-  host: '127.0.0.1',
-  port: 3306,
-  user: 'root',
-  password: '320911',
-  database: 'mamage'
+  host: DB_HOST,
+  port: DB_PORT,
+  user: DB_USER,
+  password: DB_PASSWORD ? '********' : '(empty)',
+  database: DB_NAME
 });
 
 const pool = mysql.createPool({
-  host: '127.0.0.1',
-  port: 3306,
-  user: 'root',
-  password: '320911',
-  database: 'mamage',
+  host: DB_HOST,
+  port: DB_PORT,
+  user: DB_USER,
+  password: DB_PASSWORD,
+  database: DB_NAME,
   charset: 'utf8mb4',
   waitForConnections: true,
   connectionLimit: 10,
@@ -36,7 +44,6 @@ if (typeof pool.on === 'function') {
 // 你在一个地方手动修改这个常量就行：
 // - 开发环境示例： 'http://localhost:3000'
 // - 部署时可改成你的域名 'https://cdn.example.com'
-const keys = require('./config/keys');
 // 也可以通过环境变量或 config/keys 覆盖：
 const UPLOAD_BASE_URL = keys.UPLOAD_BASE_URL || 'https://mamage-img-1325439253.cos.ap-beijing.myqcloud.com';
 

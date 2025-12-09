@@ -2,6 +2,15 @@
 // Load local .env in development (optional). Ensure .env is in .gitignore.
 try { require('dotenv').config(); } catch (e) {}
 
+// 在应用启动前验证环境变量
+const { validateEnvironment } = require('./lib/validateEnv');
+try {
+  validateEnvironment(true); // true 表示开启严格模式（推荐配置也会检查）
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
+
 const express = require('express');
 const path = require('path');
 const projectsRouter = require('./routes/projects');
@@ -78,7 +87,7 @@ app.get('/{*splat}', (req, res, next) => {
 });
 
 // ============ 启动服务 ============
-const PORT = 52367; // 或 process.env.PORT || 52367;
+const PORT = 3000; // 或 process.env.PORT || 52367;
 app.listen(PORT, () => {
   console.log(`API & Web server listening on http://localhost:${PORT}`);
 });

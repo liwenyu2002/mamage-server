@@ -48,8 +48,8 @@ jobs:
             -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage-server/
 
-      # 7. SSH 登录 ECS，安装依赖并重启 pm2
-      - name: Install & restart on server
+      # 7. SSH 登录 ECS，安装依赖、验证环境变量并重启 pm2
+      - name: Install, validate env & restart on server
         run: |
           ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
@@ -58,6 +58,13 @@ jobs:
 
           # 在服务器上安装生产依赖
           npm ci --omit=dev || npm install --omit=dev
+
+          # 验证环境变量已配置（这会在应用启动前检查）
+          echo "✅ 环境变量验证..."
+          node -e "require('./lib/validateEnv').validateEnvironment(true)" || {
+            echo "❌ 环境变量检查失败，应用不会启动"
+            exit 1
+          }
 
           # 重启 pm2 进程，第一次没有就 start
           pm2 restart mamage-server || pm2 start app.js --name mamage-server

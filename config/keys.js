@@ -21,4 +21,11 @@ module.exports = {
   COS_BUCKET: get('COS_BUCKET', null),
   COS_REGION: get('COS_REGION', null),
   COS_BASE_URL: get('COS_BASE_URL', null)
+  ,
+  // Database (MySQL)
+  DB_HOST: get('DB_HOST', '127.0.0.1'),
+  DB_PORT: get('DB_PORT', '3306'),
+  DB_USER: get('DB_USER', 'root'),
+  DB_PASSWORD: get('DB_PASSWORD', ''),
+  DB_NAME: get('DB_NAME', 'mamage')
 };
