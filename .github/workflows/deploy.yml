@@ -46,7 +46,7 @@ jobs:
             --exclude "node_modules/" \
             --exclude ".github/" \
             -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
-            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage-server/
+            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
 
       # 7. SSH 登录 ECS，安装依赖、验证环境变量并重启 pm2
       - name: Install, validate env & restart on server
