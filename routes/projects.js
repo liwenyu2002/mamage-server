@@ -469,6 +469,20 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
     project.meta = parseMeta(project.meta);
     project.tags = parseTags(project.tags);
 
+    // 计算封面（如果有照片）并填充为可访问的完整 URL
+    try {
+      const [photos] = await pool.query(
+        `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
+        [newId]
+      );
+      const cover = chooseCoverFromPhotos(photos);
+      project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
+      project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+    } catch (e) {
+      project.coverFullUrl = null;
+      project.coverFullThumbUrl = null;
+    }
+
     res.json(project);
   } catch (err) {
     console.error('[POST /api/projects] error:', err);
@@ -538,6 +552,20 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
     const project = rows[0];
     project.meta = parseMeta(project.meta);
     project.tags = parseTags(project.tags);
+
+    // 计算封面（保持与列表/详情一致的行为）
+    try {
+      const [photos] = await pool.query(
+        `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
+        [id]
+      );
+      const cover = chooseCoverFromPhotos(photos);
+      project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
+      project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+    } catch (e) {
+      project.coverFullUrl = null;
+      project.coverFullThumbUrl = null;
+    }
 
     res.json(project);
   } catch (err) {
