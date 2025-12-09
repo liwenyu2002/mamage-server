@@ -54,7 +54,7 @@ jobs:
           ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
           set -e
-          cd /home/liwy/mamage-server
+          cd /home/liwy/mamage_server
 
           # 在服务器上安装生产依赖
           npm ci --omit=dev || npm install --omit=dev
