@@ -41,10 +41,12 @@ jobs:
       # 6. 用 rsync 将当前仓库内容同步到 ECS（替代原来的 git fetch/reset）
       - name: Sync code to server via rsync
         run: |
+          # 注意：排除 .env，防止 --delete 删除服务器上的配置文件
           rsync -avz --delete \
             --exclude ".git/" \
             --exclude "node_modules/" \
             --exclude ".github/" \
+            --exclude ".env" \
             -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
 
