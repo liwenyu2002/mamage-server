@@ -87,7 +87,7 @@ app.get('/{*splat}', (req, res, next) => {
 });
 
 // ============ 启动服务 ============
-const PORT = 3000; // 或 process.env.PORT || 52367;
+const PORT = 8000; // 或 process.env.PORT || 52367;
 app.listen(PORT, () => {
   console.log(`API & Web server listening on http://localhost:${PORT}`);
 });
