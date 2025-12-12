@@ -37,7 +37,10 @@ const CURRENT_PHOTOGRAPHER_ID = 2; // 暂时没在本文件里用，将来上传
 
 // ========= 1) 照片列表接口：支持 projectId + random =========
 // 如果挂在 /api/photos 下：GET /api/photos?projectId=1&limit=4&random=1&type=normal(可选)
-router.get('/', async (req, res) => {
+const { requirePermission, requireAdmin } = require('../lib/permissions');
+
+// GET /api/photos - require permission and organization scope
+router.get('/', requirePermission('photos.view'), async (req, res) => {
   try {
     let limit = parseInt(req.query.limit, 10);
     if (Number.isNaN(limit) || limit <= 0 || limit > 100) {
@@ -52,19 +55,21 @@ router.get('/', async (req, res) => {
 
     let sql = `
       SELECT
-        id,
-        uuid,
-        project_id      AS projectId,
-        url,
-        thumb_url       AS thumbUrl,
-        title,
-        description,
-        tags,
-        type,
-        photographer_id AS photographerId,   -- ✅ 新增：把摄影师 id 查出来
-        created_at      AS createdAt,
-        updated_at      AS updatedAt
-      FROM photos
+        p.id,
+        p.uuid,
+        p.project_id      AS projectId,
+        p.url,
+        p.thumb_url       AS thumbUrl,
+        p.title,
+        p.description,
+        p.tags,
+        p.type,
+        p.photographer_id AS photographerId,
+        u.name            AS photographerName,
+        p.created_at      AS createdAt,
+        p.updated_at      AS updatedAt
+      FROM photos p
+      LEFT JOIN users u ON p.photographer_id = u.id
     `;
     const conds = [];
     const params = [];
@@ -76,6 +81,15 @@ router.get('/', async (req, res) => {
     if (!Number.isNaN(projectId) && projectId) {
       conds.push('project_id = ?');
       params.push(projectId);
+    }
+
+    // organization scoping: only return photos for user's organization
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    if (orgId === null) {
+      conds.push('p.organization_id IS NULL');
+    } else {
+      conds.push('p.organization_id = ?');
+      params.push(orgId);
     }
 
     if (conds.length > 0) {
@@ -145,7 +159,6 @@ router.get('/', async (req, res) => {
 });
 
 // 基于数据库的权限检查（使用 role_permissions 表）
-const { requirePermission, requireAdmin } = require('../lib/permissions');
 
 // 照片删除（仅 admin）
 router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
@@ -167,12 +180,17 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
       return res.status(400).json({ error: 'no valid photo id' });
     }
 
-    const [rows] = await pool.query(
-      `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl
-       FROM photos
-       WHERE id IN (?)`,
-      [ids]
-    );
+    // enforce organization scoping on delete
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let selSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl FROM photos WHERE id IN (?)`;
+    const selParams = [ids];
+    if (orgId === null) {
+      selSql += ' AND organization_id IS NULL';
+    } else {
+      selSql += ' AND organization_id = ?';
+      selParams.push(orgId);
+    }
+    const [rows] = await pool.query(selSql, selParams);
 
     if (rows.length === 0) {
       return res.json({ deletedIds: [], notFoundIds: ids });
@@ -183,11 +201,12 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
     const foundIds = rows.map((r) => r.id);
     const notFoundIds = ids.filter((id) => !foundIds.includes(id));
 
-    await pool.query(
-      `DELETE FROM photos
-       WHERE id IN (?)`,
-      [foundIds]
-    );
+    // delete only within same organization (foundIds already filtered)
+    if (foundIds.length > 0) {
+      let delSql = 'DELETE FROM photos WHERE id IN (?)';
+      const delParams = [foundIds];
+      await pool.query(delSql, delParams);
+    }
 
     // 同步更新 projects.photo_ids：对每个受影响的 project，移除这些 photo id
     const byProject = {};
@@ -286,7 +305,7 @@ module.exports = router;
 // POST /api/photos/zip
 // 请求 body: { photoIds: [1,2,3], zipName: 'my-photos' }
 // 返回: application/zip attachment
-router.post('/zip', async (req, res) => {
+router.post('/zip', requirePermission('photos.view'), async (req, res) => {
   try {
     const ids = Array.isArray(req.body.photoIds) ? req.body.photoIds.map(n => parseInt(n, 10)).filter(n => !Number.isNaN(n)) : [];
     if (ids.length === 0) return res.status(400).json({ error: 'photoIds must be a non-empty array' });
@@ -301,10 +320,17 @@ router.post('/zip', async (req, res) => {
     }
 
     // 查询照片及其 project_id
-    const [rows] = await pool.query(
-      `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, title FROM photos WHERE id IN (?)`,
-      [ids]
-    );
+    // enforce organization scoping for zip
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let zipSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, title FROM photos WHERE id IN (?)`;
+    const zipParams = [ids];
+    if (orgId === null) {
+      zipSql += ' AND organization_id IS NULL';
+    } else {
+      zipSql += ' AND organization_id = ?';
+      zipParams.push(orgId);
+    }
+    const [rows] = await pool.query(zipSql, zipParams);
 
     if (!rows || rows.length === 0) return res.status(404).json({ error: 'no photos found' });
 
@@ -400,10 +426,83 @@ router.post('/zip', async (req, res) => {
   }
 });
 
+// 获取单张照片（包含 photographerName）
+// GET /api/photos/:id
+router.get('/:id', requirePermission('photos.view'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
+
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let sql = `
+      SELECT
+        p.id,
+        p.uuid,
+        p.project_id AS projectId,
+        p.url,
+        p.thumb_url AS thumbUrl,
+        p.title,
+        p.description,
+        p.tags,
+        p.type,
+        p.photographer_id AS photographerId,
+        u.name AS photographerName,
+        p.created_at AS createdAt,
+        p.updated_at AS updatedAt
+      FROM photos p
+      LEFT JOIN users u ON p.photographer_id = u.id
+      WHERE p.id = ?`;
+
+    // apply organization scoping for single photo
+    const params = [id];
+    if (orgId === null) {
+      sql += ' AND p.organization_id IS NULL';
+    } else {
+      sql += ' AND p.organization_id = ?';
+      params.push(orgId);
+    }
+    sql += ' LIMIT 1';
+
+    const [rows] = await pool.query(sql, params);
+    if (!rows || rows.length === 0) return res.status(404).json({ error: 'photo not found' });
+
+    const p = rows[0];
+
+    function resolveUrl(raw) {
+      if (!raw) return null;
+      const str = String(raw);
+      if (/^https?:\/\//i.test(str)) return str;
+      return buildUploadUrl(str);
+    }
+
+    let parsedTags = null;
+    try { parsedTags = p.tags ? JSON.parse(p.tags) : null; } catch (e) { parsedTags = null; }
+
+    res.json({
+      id: p.id,
+      uuid: p.uuid,
+      projectId: p.projectId,
+      url: resolveUrl(p.url),
+      thumbUrl: resolveUrl(p.thumbUrl),
+      title: p.title,
+      description: p.description || null,
+      tags: parsedTags,
+      type: p.type,
+      photographerId: p.photographerId || null,
+      photographerName: p.photographerName || null,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt
+    });
+  } catch (err) {
+    console.error('GET /api/photos/:id error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 // 更新单张照片的 description 与 tags
 // PATCH /api/photos/:id
-router.patch('/:id', requireAdmin(), async (req, res) => {
+router.patch('/:id', requirePermission('photos.update'), async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
@@ -442,6 +541,19 @@ router.patch('/:id', requireAdmin(), async (req, res) => {
     }
 
     if (updates.length === 0) return res.status(400).json({ error: 'nothing to update' });
+
+    // enforce organization scoping: ensure photo belongs to user's organization
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let ownershipSql = 'SELECT id FROM photos WHERE id = ?';
+    const ownershipParams = [id];
+    if (orgId === null) {
+      ownershipSql += ' AND organization_id IS NULL';
+    } else {
+      ownershipSql += ' AND organization_id = ?';
+      ownershipParams.push(orgId);
+    }
+    const [ownRows] = await pool.query(ownershipSql, ownershipParams);
+    if (!ownRows || ownRows.length === 0) return res.status(404).json({ error: 'photo not found' });
 
     params.push(id);
     const sql = `UPDATE photos SET ${updates.join(', ')} WHERE id = ?`;

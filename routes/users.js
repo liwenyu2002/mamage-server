@@ -28,12 +28,10 @@ function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 }
 
-// 简单 RBAC 中间件构建器：需在使用前保证 authMiddleware 已把 req.user 填充
-// NOTE: Role checks are replaced with table-driven permissions using `role_permissions`.
-// Use `requirePermission(permission)` from `lib/permissions.js` for route protection.
-
+// permissions helper
 const { getPermissionsForRole } = require('../lib/permissions');
 
+// auth middleware
 async function authMiddleware(req, res, next) {
   const auth = req.get('authorization') || '';
   const m = auth.match(/^Bearer\s+(.*)$/i);
@@ -41,58 +39,57 @@ async function authMiddleware(req, res, next) {
   const token = m[1];
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const [rows] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [payload.id]);
-    if (!rows || rows.length === 0) return res.status(401).json({ error: 'Invalid token (user not found)' });
-    const user = rows[0];
+    let user = null;
+    try {
+      const [rows] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname, organization_id FROM users WHERE id = ?', [payload.id]);
+      if (!rows || rows.length === 0) return res.status(401).json({ error: 'Invalid token (user not found)' });
+      user = rows[0];
+    } catch (e) {
+      // If DB doesn't have organization_id column, fallback to selecting without it
+      const msg = e && e.message ? e.message : '';
+      if (msg.indexOf("Unknown column 'organization_id'") !== -1 || (e && e.code === 'ER_BAD_FIELD_ERROR')) {
+        const [rows2] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [payload.id]);
+        if (!rows2 || rows2.length === 0) return res.status(401).json({ error: 'Invalid token (user not found)' });
+        user = rows2[0];
+        user.organization_id = null;
+      } else {
+        throw e;
+      }
+    }
     // convert avatar_url to full URL if present
+    try { user.avatar_url = user.avatar_url ? buildUploadUrl(user.avatar_url) : null; } catch (e) { user.avatar_url = user.avatar_url || null; }
+    // normalize organization_id to integer or null
     try {
-      user.avatar_url = user.avatar_url ? buildUploadUrl(user.avatar_url) : null;
+      if (user.organization_id !== undefined && user.organization_id !== null) {
+        user.organization_id = Number(user.organization_id);
+        if (Number.isNaN(user.organization_id)) user.organization_id = null;
+      } else {
+        user.organization_id = null;
+      }
     } catch (e) {
-      user.avatar_url = user.avatar_url || null;
+      user.organization_id = null;
     }
-    // attach permissions fetched from role_permissions table
-    try {
-      user.permissions = await getPermissionsForRole(user.role);
-    } catch (e) {
-      console.error('[authMiddleware] failed to load permissions for role', user.role, e && e.message ? e.message : e);
-      user.permissions = [];
-    }
+    // load permissions for this role
+    try { user.permissions = await getPermissionsForRole(user.role); } catch (e) { user.permissions = []; }
     req.user = user;
     next();
   } catch (err) {
+    console.error('[authMiddleware]', err && err.stack ? err.stack : err);
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
 
 // 注册
-// 注册（支持 invite_code）
 router.post('/register', async (req, res) => {
   try {
-    if (!await hasPasswordColumn()) {
-      return res.status(400).json({
-        error: 'Database missing column `password_hash`. Run the following SQL to add it before using password registration.',
-        sql: "ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL;"
-      });
-    }
+    const { name, password, student_no, email, department, invite_code, organization_id } = req.body || {};
 
-    const { student_no, name, department, role: roleInput, email, password, invite_code } = req.body;
-    // 我们在系统中使用三类角色：visitor, photographer, admin
-    const allowedRoles = new Set(['visitor','photographer','admin']);
-    // 默认自助注册为 visitor，除非消费 invite_code 后设为其他
-    let role = 'visitor';
+    // basic validation
     if (!name || !password) return res.status(400).json({ error: 'MISSING_FIELDS', message: 'name 和 password 为必填项' });
+    if (!pwdRegex.test(password)) return res.status(400).json({ error: 'INVALID_PASSWORD', message: '密码须为8-16位，且为字母和数字的组合' });
+    if (email && !emailRegex.test(email)) return res.status(400).json({ error: 'INVALID_EMAIL', message: '邮箱格式不正确' });
 
-    // validate password
-    if (!pwdRegex.test(password)) {
-      return res.status(400).json({ error: 'INVALID_PASSWORD', message: '密码须为8-16位，且为字母和数字的组合' });
-    }
-
-    // validate email if provided
-    if (email && !emailRegex.test(email)) {
-      return res.status(400).json({ error: 'INVALID_EMAIL', message: '邮箱格式不正确' });
-    }
-
-    // 可选的唯一性检查（按 student_no 或 email）
+    // uniqueness checks
     if (student_no) {
       const [existing] = await pool.query('SELECT id FROM users WHERE student_no = ?', [student_no]);
       if (existing.length) return res.status(409).json({ error: 'student_no already exists' });
@@ -101,47 +98,68 @@ router.post('/register', async (req, res) => {
       const [existing] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
       if (existing.length) return res.status(409).json({ error: 'email already exists' });
     }
+
     const password_hash = await bcrypt.hash(password, 10);
     const now = new Date();
 
-    // 如果有 invite_code，尝试在事务中校验并消费（原子化）
+    // allowed roles
+    const allowedRoles = new Set(['visitor','photographer','admin']);
+    let role = 'visitor';
+
+    // If invite_code provided, use transactional flow to consume it
     let conn = null;
     try {
       if (invite_code) {
         conn = await pool.getConnection();
         await conn.beginTransaction();
         const [rows] = await conn.query('SELECT * FROM invitations WHERE code = ? FOR UPDATE', [invite_code]);
-        if (!rows || rows.length === 0) {
-          await conn.rollback();
-          conn.release();
-          return res.status(400).json({ error: 'INVALID_INVITE', message: '邀请码无效' });
-        }
+        if (!rows || rows.length === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_INVITE', message: '邀请码无效' }); }
         const inv = rows[0];
         if (inv.revoked) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_INVITE', message: '邀请码已被撤销' }); }
         if (inv.expires_at && new Date(inv.expires_at) <= new Date()) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_INVITE', message: '邀请码已过期' }); }
         if (inv.max_uses !== null && inv.uses >= inv.max_uses) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_INVITE', message: '邀请码已使用完' }); }
-        // invite 有效，采纳其 role
         if (allowedRoles.has(inv.role)) role = inv.role;
-        // 准备插入用户
+
         const finalStudentNo = (student_no !== undefined && student_no !== null && String(student_no).trim() !== '')
           ? String(student_no)
           : ('auto' + Date.now().toString(36) + uuidv4().replace(/-/g, '').slice(0,8));
+
         const cols = ['student_no','name','role','password_hash','created_at','updated_at'];
         const placeholders = ['?','?','?','?','?','?'];
         const params = [finalStudentNo, name, role, password_hash, now, now];
+
+        if (organization_id !== undefined && organization_id !== null) {
+          // validate organization exists and is public (with fallback if is_public missing)
+          try {
+            const [orgRows] = await conn.query('SELECT id, is_public FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
+            if (!orgRows || orgRows.length === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' }); }
+            if (orgRows[0].is_public === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'ORG_NOT_PUBLIC', message: 'organization is not open for public registration' }); }
+          } catch (e) {
+            const msg = e && e.message ? e.message : '';
+            if (msg.indexOf("Unknown column 'is_public'") !== -1 || (e && e.code === 'ER_BAD_FIELD_ERROR')) {
+              // fallback: check existence only
+              const [orgRows2] = await conn.query('SELECT id FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
+              if (!orgRows2 || orgRows2.length === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' }); }
+            } else {
+              console.error('[users.register] organization validation error', e && e.stack ? e.stack : e);
+              await conn.rollback(); conn.release();
+              return res.status(500).json({ error: 'server error' });
+            }
+          }
+          cols.push('organization_id'); placeholders.push('?'); params.push(organization_id);
+        }
         if (department !== undefined) { cols.push('department'); placeholders.push('?'); params.push(department); }
         if (email !== undefined) { cols.push('email'); placeholders.push('?'); params.push(email); }
+
         const sql = `INSERT INTO users (${cols.join(',')}) VALUES (${placeholders.join(',')})`;
         const [result] = await conn.query(sql, params);
         const userId = result.insertId;
-        // consume invite
         await conn.query('UPDATE invitations SET uses = uses + 1 WHERE id = ?', [inv.id]);
-        await conn.commit();
-        conn.release();
+        await conn.commit(); conn.release();
         const token = signToken({ id: userId, role });
         return res.json({ id: userId, token });
       } else {
-        // 普通注册（无需事务）
+        // normal registration
         const finalStudentNo = (student_no !== undefined && student_no !== null && String(student_no).trim() !== '')
           ? String(student_no)
           : ('auto' + Date.now().toString(36) + uuidv4().replace(/-/g, '').slice(0,8));
@@ -156,6 +174,25 @@ router.post('/register', async (req, res) => {
         cols.push('password_hash'); placeholders.push('?'); params.push(password_hash);
         cols.push('created_at'); placeholders.push('?'); params.push(now);
         cols.push('updated_at'); placeholders.push('?'); params.push(now);
+
+        if (organization_id !== undefined && organization_id !== null) {
+          try {
+            const [orgRows] = await pool.query('SELECT id, is_public FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
+            if (!orgRows || orgRows.length === 0) return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' });
+            if (orgRows[0].is_public === 0) return res.status(400).json({ error: 'ORG_NOT_PUBLIC', message: 'organization is not open for public registration' });
+          } catch (e) {
+            const msg = e && e.message ? e.message : '';
+            if (msg.indexOf("Unknown column 'is_public'") !== -1 || (e && e.code === 'ER_BAD_FIELD_ERROR')) {
+              const [orgRows2] = await pool.query('SELECT id FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
+              if (!orgRows2 || orgRows2.length === 0) return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' });
+            } else {
+              console.error('[users.register] organization validation error', e && e.stack ? e.stack : e);
+              return res.status(500).json({ error: 'server error' });
+            }
+          }
+          cols.push('organization_id'); placeholders.push('?'); params.push(organization_id);
+        }
+
         const sql = `INSERT INTO users (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`;
         const [result] = await pool.query(sql, params);
         const userId = result.insertId;
@@ -165,6 +202,13 @@ router.post('/register', async (req, res) => {
     } catch (e) {
       if (conn) { try { await conn.rollback(); conn.release(); } catch(_){} }
       console.error('[users.register] transaction error', e && e.stack ? e.stack : e);
+      if (e && (e.code === 'ER_NO_DEFAULT_FOR_FIELD' || (e.message && e.message.indexOf("organization_id") !== -1))) {
+        return res.status(500).json({
+          error: 'DB_SCHEMA_ORG_FIELD',
+          message: "Database users.organization_id column requires a value or default. Run: ALTER TABLE users MODIFY COLUMN organization_id INT UNSIGNED NULL;",
+          sql: "ALTER TABLE users MODIFY COLUMN organization_id INT UNSIGNED NULL;"
+        });
+      }
       return res.status(500).json({ error: 'server error' });
     }
   } catch (err) {
@@ -238,7 +282,7 @@ router.put('/me', authMiddleware, async (req, res) => {
     params.push(req.user.id);
     const sql = `UPDATE users SET ${updates.join(', ')}, updated_at = ? WHERE id = ?`;
     await pool.query(sql, params);
-    const [rows] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [req.user.id]);
+    const [rows] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname, organization_id FROM users WHERE id = ?', [req.user.id]);
     if (rows && rows[0]) {
       try { rows[0].avatar_url = rows[0].avatar_url ? buildUploadUrl(rows[0].avatar_url) : null; } catch (e) { rows[0].avatar_url = rows[0].avatar_url || null; }
     }
@@ -323,7 +367,7 @@ router.post('/me/invite', authMiddleware, async (req, res) => {
     await conn.query('UPDATE invitations SET uses = uses + 1 WHERE id = ?', [inv.id]);
     await conn.commit();
     conn.release();
-    const [rows2] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname FROM users WHERE id = ?', [req.user.id]);
+    const [rows2] = await pool.query('SELECT id, student_no, name, department, role, email, avatar_url, nickname, organization_id FROM users WHERE id = ?', [req.user.id]);
     if (rows2 && rows2[0]) {
       try { rows2[0].avatar_url = rows2[0].avatar_url ? buildUploadUrl(rows2[0].avatar_url) : null; } catch (e) { rows2[0].avatar_url = rows2[0].avatar_url || null; }
     }

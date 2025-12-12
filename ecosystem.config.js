@@ -42,7 +42,7 @@ module.exports = {
         // AI 配置（可选）
         DASHSCOPE_API_KEY: process.env.DASHSCOPE_API_KEY || '',
         OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
-        VISION_MODEL: process.env.VISION_MODEL || 'qwen2-vl-72b-instruct',
+        AI_VISION_MODEL: process.env.AI_VISION_MODEL || 'qwen2-vl-72b-instruct',
         
         // CORS
         CORS_ORIGIN: process.env.CORS_ORIGIN || 'http://localhost:5173'

@@ -152,7 +152,7 @@ COS_BASE_URL=
 # AI
 DASHSCOPE_API_KEY=
 OPENAI_API_KEY=
-VISION_MODEL=
+AI_VISION_MODEL=
 ```
 
 注意：不要将真实密钥提交到仓库；生产环境建议使用 Secret Manager 或进程管理器注入环境变量。

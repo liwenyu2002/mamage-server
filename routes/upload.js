@@ -225,22 +225,69 @@ async function processUpload(req, res) {
       console.log('[upload] COS client not available, storing local paths');
     }
 
-    const [result] = await pool.query(
-      `INSERT INTO photos
-        (uuid, project_id, url, thumb_url, title, description, tags, type)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        projectId || null,
-        relPath,
-        thumbRel,
-        title,
-        description,
-        tags ? JSON.stringify(tags) : null,
-        type
-      ]
-    );
+    // photographerId MUST come from the authenticated token (req.user).
+    // Do NOT trust client-supplied photographerId to avoid spoofing.
+    const photographerId = (req.user && req.user.id) ? req.user.id : null;
+    const orgId = (req.user && req.user.organization_id !== undefined && req.user.organization_id !== null) ? Number(req.user.organization_id) : null;
+
+    let result;
+    try {
+      [result] = await pool.query(
+        `INSERT INTO photos
+          (uuid, project_id, url, thumb_url, title, description, tags, type, photographer_id, organization_id)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          projectId || null,
+          relPath,
+          thumbRel,
+          title,
+          description,
+          tags ? JSON.stringify(tags) : null,
+          type,
+          photographerId || null,
+          orgId
+        ]
+      );
+    } catch (e) {
+      if (e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.message && e.message.indexOf('Unknown column') !== -1))) {
+        // photos.organization_id column doesn't exist; retry without it for compatibility
+        [result] = await pool.query(
+          `INSERT INTO photos
+            (uuid, project_id, url, thumb_url, title, description, tags, type, photographer_id)
+           VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            projectId || null,
+            relPath,
+            thumbRel,
+            title,
+            description,
+            tags ? JSON.stringify(tags) : null,
+            type,
+            photographerId || null
+          ]
+        );
+      } else if (e && (e.code === 'ER_NO_DEFAULT_FOR_FIELD' || (e.message && e.message.indexOf("doesn't have a default value") !== -1))) {
+        return res.status(400).json({
+          error: 'DB_SCHEMA_PHOTO_ORG_REQUIRED',
+          message: 'Database column photos.organization_id is NOT NULL and has no default. Assign organization to the uploading user or make the column nullable.',
+          sql: 'ALTER TABLE photos MODIFY COLUMN organization_id INT UNSIGNED NULL;'
+        });
+      } else {
+        throw e;
+      }
+    }
 
     const insertedId = result.insertId;
+    // 查询摄影师名字以便返回给前端（如果 photographerId 为 null 则返回 null）
+    let photographerName = null;
+    if (photographerId) {
+      try {
+        const [userRows] = await pool.query(`SELECT name FROM users WHERE id = ? LIMIT 1`, [photographerId]);
+        if (userRows && userRows.length) photographerName = userRows[0].name || null;
+      } catch (e) {
+        console.warn('[upload] fetch photographer name failed', e && e.message ? e.message : e);
+      }
+    }
 
     if (projectId) {
       try {
@@ -270,10 +317,7 @@ async function processUpload(req, res) {
           if (!arr.includes(insertedId)) arr.push(insertedId);
 
           const newVal = arr.length ? JSON.stringify(arr) : null;
-          await pool.query(
-            `UPDATE projects SET photo_ids = ? WHERE id = ?`,
-            [newVal, projectId]
-          );
+          await pool.query(`UPDATE projects SET photo_ids = ? WHERE id = ?`, [newVal, projectId]);
         }
       } catch (e) {
         console.error('append photo id to project failed:', e.message);
@@ -286,7 +330,9 @@ async function processUpload(req, res) {
       url: buildUploadUrl(relPath),
       thumbUrl: buildUploadUrl(thumbRel),
       title,
-      type
+      type,
+      photographerId: photographerId || null,
+      photographerName: photographerName || null
     };
 
     // 异步入队 AI 分析（不阻塞上传响应）

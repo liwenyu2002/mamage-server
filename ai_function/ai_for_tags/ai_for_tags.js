@@ -10,7 +10,7 @@ const fs = require("fs");
 // 模块不会在加载时要求 API Key；在实际调用分析时会按需读取环境变量。
 
 // 视觉模型（根据你账号实际支持情况修改）
-const VISION_MODEL = "qwen2-vl-72b-instruct";
+const VISION_MODEL = process.env.AI_VISION_MODEL || "qwen2-vl-72b-instruct";
 
 // 清理可能干扰的环境变量
 try {

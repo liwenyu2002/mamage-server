@@ -9,6 +9,35 @@ const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
 const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
 
+// 如果请求没有运行全量 authMiddleware，但前端仍然携带了 Bearer token，
+// 我们需要一个轻量的解析器来把用户 id 与 organization_id 加载进 req.user，
+// 以便公开的列表/详情路由在有 token 时能按照用户组织返回数据。
+async function populateReqUserFromAuthIfPresent(req) {
+  try {
+    if (req.user && req.user.id !== undefined) return; // already filled
+    const auth = req.get('authorization') || '';
+    const m = auth.match(/^Bearer\s+(.*)$/i);
+    if (!m) return;
+    const token = m[1];
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); } catch (e) { return; }
+    if (!payload || !payload.id) return;
+    try {
+      const [rows] = await pool.query('SELECT id, organization_id, role FROM users WHERE id = ? LIMIT 1', [payload.id]);
+      if (!rows || rows.length === 0) return;
+      const u = rows[0];
+      const org = (u.organization_id !== undefined && u.organization_id !== null) ? Number(u.organization_id) : null;
+      req.user = { id: u.id, role: u.role || null, organization_id: org };
+    } catch (e) {
+      // ignore DB errors here; leave req.user unset
+      return;
+    }
+  } catch (e) {
+    // swallow any unexpected errors; this helper must not break public routes
+    return;
+  }
+}
+
 // 上传根目录（和 upload.js 保持一致）
 const uploadRoot = path.join(__dirname, '..', 'uploads');
 
@@ -120,8 +149,13 @@ router.get('/', async (req, res) => {
       limit = 10;
     }
 
-    const [rows] = await pool.query(
-      `
+    // If frontend provided a Bearer token but this route wasn't protected by authMiddleware,
+    // try to populate req.user from the token so organization scoping works.
+    await populateReqUserFromAuthIfPresent(req);
+    // organization scoping: only show projects for user's organization
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+
+    let mainSql = `
       SELECT
         p.id,
         p.uuid,
@@ -149,11 +183,18 @@ router.get('/', async (req, res) => {
           LIMIT 1
         ) AS coverUrl
       FROM projects p
-      ORDER BY p.created_at DESC
-      LIMIT ?
-      `,
-      [limit]
-    );
+    `;
+    const mainParams = [];
+    if (orgId === null) {
+      mainSql += ' WHERE p.organization_id IS NULL';
+    } else {
+      mainSql += ' WHERE p.organization_id = ?';
+      mainParams.push(orgId);
+    }
+    mainSql += ' ORDER BY p.created_at DESC LIMIT ?';
+    mainParams.push(limit);
+
+    const [rows] = await pool.query(mainSql, mainParams);
 
     const list = rows.map((r) => ({
       ...r,
@@ -168,10 +209,17 @@ router.get('/', async (req, res) => {
     try {
       const projIds = rows.map(r => r.id).filter(Boolean);
       if (projIds.length) {
-        const [photos] = await pool.query(
-          `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?) ORDER BY created_at DESC, id DESC`,
-          [projIds]
-        );
+        // fetch photos within user's organization only
+        let photoSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?)`;
+        const photoParams = [projIds];
+        if (orgId === null) {
+          photoSql += ' AND organization_id IS NULL';
+        } else {
+          photoSql += ' AND organization_id = ?';
+          photoParams.push(orgId);
+        }
+        photoSql += ' ORDER BY created_at DESC, id DESC';
+        const [photos] = await pool.query(photoSql, photoParams);
 
         const byProj = {};
         for (const ph of photos) {
@@ -193,6 +241,115 @@ router.get('/', async (req, res) => {
     res.json(list);
   } catch (err) {
     console.error('[GET /api/projects] error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==============================
+// Scenery projects for current user's organization
+// GET /api/projects/scenery
+// Returns an array of projects of type 'scenery' (if any), each populated with its photos.
+// If the DB lacks a `type` column on projects, falls back to searching name/tags for 'scenery'.
+router.get('/scenery', async (req, res) => {
+  try {
+    // allow optional Bearer token even on this public route
+    await populateReqUserFromAuthIfPresent(req);
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+
+    // attempt to query by projects.type first
+    let projSql = `
+      SELECT
+        p.id,
+        p.uuid,
+        p.name AS projectName,
+        p.description,
+        p.event_date AS eventDate,
+        p.meta,
+        p.photo_ids AS photoIds,
+        p.tags,
+        p.admin_id AS adminId,
+        p.created_at AS createdAt,
+        p.updated_at AS updatedAt
+      FROM projects p
+      WHERE p.type = 'scenery'
+    `;
+    const projParams = [];
+    if (orgId === null) {
+      projSql += ' AND p.organization_id IS NULL';
+    } else {
+      projSql += ' AND p.organization_id = ?';
+      projParams.push(orgId);
+    }
+    projSql += ' ORDER BY p.created_at DESC';
+
+    let projRows;
+    try {
+      const [rows] = await pool.query(projSql, projParams);
+      projRows = rows || [];
+    } catch (e) {
+      // fallback: maybe projects.type column doesn't exist — search by name or tags
+      const fallbackSql = `
+        SELECT
+          p.id,
+          p.uuid,
+          p.name AS projectName,
+          p.description,
+          p.event_date AS eventDate,
+          p.meta,
+          p.photo_ids AS photoIds,
+          p.tags,
+          p.admin_id AS adminId,
+          p.created_at AS createdAt,
+          p.updated_at AS updatedAt
+        FROM projects p
+        WHERE (p.name LIKE ? OR p.tags LIKE ?)
+      `;
+      const like = '%scenery%';
+      const fbParams = [like, like];
+      if (orgId === null) {
+        projRows = (await pool.query(fallbackSql + ' AND p.organization_id IS NULL', fbParams))[0] || [];
+      } else {
+        projRows = (await pool.query(fallbackSql + ' AND p.organization_id = ?', fbParams.concat([orgId])))[0] || [];
+      }
+    }
+
+    // For each project, fetch photos (respecting org scoping)
+    const projIds = projRows.map(r => r.id).filter(Boolean);
+    let photos = [];
+    if (projIds.length) {
+      let photoSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, title, type, tags, photographer_id AS photographerId, created_at FROM photos WHERE project_id IN (?)`;
+      const photoParams = [projIds];
+      if (orgId === null) {
+        photoSql += ' AND organization_id IS NULL';
+      } else {
+        photoSql += ' AND organization_id = ?';
+        photoParams.push(orgId);
+      }
+      photoSql += ' ORDER BY created_at DESC, id DESC';
+      const [rows] = await pool.query(photoSql, photoParams);
+      photos = rows || [];
+    }
+
+    const byProj = {};
+    for (const ph of photos) {
+      byProj[ph.projectId] = byProj[ph.projectId] || [];
+      byProj[ph.projectId].push(ph);
+    }
+
+    const result = projRows.map(p => ({
+      ...p,
+      meta: parseMeta(p.meta),
+      tags: parseTags(p.tags),
+      photos: (byProj[p.id] || []).map(ph => ({
+        ...ph,
+        url: ph.url ? buildUploadUrl(ph.url) : null,
+        thumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null
+      }))
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('[GET /api/projects/scenery] error:', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -222,6 +379,16 @@ router.get('/list', async (req, res) => {
       params.push(like, like, like, like, like);
     }
 
+    // add organization scoping to whereClauses
+    await populateReqUserFromAuthIfPresent(req);
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    if (orgId === null) {
+      whereClauses.push('p.organization_id IS NULL');
+    } else {
+      whereClauses.push('p.organization_id = ?');
+      params.push(orgId);
+    }
+
     const whereSql = whereClauses.length
       ? `WHERE ${whereClauses.join(' AND ')}`
       : '';
@@ -246,8 +413,7 @@ router.get('/list', async (req, res) => {
     const offset = (page - 1) * pageSize;
 
     // 2) 再查当前页
-    const [rows] = await pool.query(
-      `
+    const selectSql = `
       SELECT
         p.id,
         p.uuid,
@@ -264,6 +430,7 @@ router.get('/list', async (req, res) => {
           SELECT ph.thumb_url
           FROM photos ph
           WHERE ph.project_id = p.id
+          ${orgId === null ? 'AND ph.organization_id IS NULL' : 'AND ph.organization_id = ?'}
           ORDER BY ph.created_at DESC, ph.id DESC
           LIMIT 1
         ) AS coverThumbUrl,
@@ -271,6 +438,7 @@ router.get('/list', async (req, res) => {
           SELECT ph.url
           FROM photos ph
           WHERE ph.project_id = p.id
+          ${orgId === null ? 'AND ph.organization_id IS NULL' : 'AND ph.organization_id = ?'}
           ORDER BY ph.created_at DESC, ph.id DESC
           LIMIT 1
         ) AS coverUrl
@@ -278,9 +446,14 @@ router.get('/list', async (req, res) => {
       ${whereSql}
       ORDER BY p.created_at DESC
       LIMIT ? OFFSET ?
-      `,
-      [...params, pageSize, offset]
-    );
+    `;
+
+    const selectParams = [...params];
+    if (orgId !== null) {
+      selectParams.push(orgId, orgId);
+    }
+    selectParams.push(pageSize, offset);
+    const [rows] = await pool.query(selectSql, selectParams);
 
     const list = rows.map((r) => ({
       ...r,
@@ -333,8 +506,9 @@ router.get('/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid project id' });
     }
 
-    const [projRows] = await pool.query(
-      `
+    await populateReqUserFromAuthIfPresent(req);
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let projSql = `
       SELECT
         p.id,
         p.uuid,
@@ -349,9 +523,15 @@ router.get('/:id', async (req, res) => {
         p.updated_at AS updatedAt
       FROM projects p
       WHERE p.id = ?
-      `,
-      [id]
-    );
+    `;
+    const projParams = [id];
+    if (orgId === null) {
+      projSql += ' AND p.organization_id IS NULL';
+    } else {
+      projSql += ' AND p.organization_id = ?';
+      projParams.push(orgId);
+    }
+    const [projRows] = await pool.query(projSql, projParams);
 
     if (!projRows.length) {
       return res.status(404).json({ error: 'Project not found' });
@@ -362,8 +542,7 @@ router.get('/:id', async (req, res) => {
     project.tags = parseTags(project.tags);
 
     // 查该项目的所有照片
-    const [photoRows] = await pool.query(
-      `
+    let photoSql = `
       SELECT
         ph.id,
         ph.uuid,
@@ -376,14 +555,22 @@ router.get('/:id', async (req, res) => {
         ph.tags,
         ph.type,
         ph.photographer_id AS photographerId,
+        u.name AS photographerName,
         ph.created_at AS createdAt,
         ph.updated_at AS updatedAt
       FROM photos ph
+      LEFT JOIN users u ON ph.photographer_id = u.id
       WHERE ph.project_id = ?
-      ORDER BY ph.created_at ASC, ph.id ASC
-      `,
-      [id]
-    );
+    `;
+    const photoParams = [id];
+    if (orgId === null) {
+      photoSql += ' AND ph.organization_id IS NULL';
+    } else {
+      photoSql += ' AND ph.organization_id = ?';
+      photoParams.push(orgId);
+    }
+    photoSql += ' ORDER BY ph.created_at ASC, ph.id ASC';
+    const [photoRows] = await pool.query(photoSql, photoParams);
 
     project.photos = photoRows.map((p) => ({
       ...p,
@@ -427,21 +614,39 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
 
     const uuid = uuidv4();
     const adminId = req.user && req.user.id ? req.user.id : null;
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
 
     const metaObj = {};
     if (rawEventDate) {
       metaObj.eventDate = rawEventDate;
     }
 
-    const [result] = await pool.query(
-      `
-      INSERT INTO projects
-        (uuid, name, description, event_date, meta, tags, admin_id, created_at, updated_at)
-      VALUES
-        (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-      `,
-      [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId]
-    );
+    // 强制要求创建项目的用户属于某个组织（projects.organization_id 为 NOT NULL 的情形）
+    if (orgId === null) {
+      return res.status(400).json({
+        error: 'ORG_REQUIRED',
+        message: '创建项目需要用户所属组织（organization_id）。请为该用户分配组织，或在注册时选择组织。'
+      });
+    }
+
+    // 尝试写入包含 organization_id 的记录；如果数据库根本没有该列（旧 schema），则兼容重试不带该列的插入。
+    let result;
+    try {
+      [result] = await pool.query(
+        `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, organization_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId, orgId]
+      );
+    } catch (e) {
+      if (e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.message && e.message.indexOf('Unknown column') !== -1))) {
+        // projects.organization_id column doesn't exist; retry without it for compatibility with older DB schemas
+        [result] = await pool.query(
+          `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId]
+        );
+      } else {
+        throw e;
+      }
+    }
 
     const newId = result.insertId;
 
@@ -511,6 +716,19 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
       return res.status(400).json({ error: 'projectName is required' });
     }
 
+    // ensure project belongs to user's organization
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let ownershipSql = 'SELECT id FROM projects WHERE id = ?';
+    const ownershipParams = [id];
+    if (orgId === null) {
+      ownershipSql += ' AND organization_id IS NULL';
+    } else {
+      ownershipSql += ' AND organization_id = ?';
+      ownershipParams.push(orgId);
+    }
+    const [ownRows] = await pool.query(ownershipSql, ownershipParams);
+    if (!ownRows || ownRows.length === 0) return res.status(404).json({ error: 'Project not found' });
+
     const [result] = await pool.query(
       `
       UPDATE projects
@@ -524,10 +742,6 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
       `,
       [finalName, finalDesc, rawEventDate, tagsArr ? JSON.stringify(tagsArr) : null, id]
     );
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Project not found' });
-    }
 
     const [rows] = await pool.query(
       `
@@ -584,6 +798,19 @@ router.delete('/:id', requirePermission('projects.delete'), async (req, res) => 
   }
 
   try {
+    // ensure project belongs to user's organization
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let ownSql = 'SELECT id FROM projects WHERE id = ?';
+    const ownParams = [id];
+    if (orgId === null) {
+      ownSql += ' AND organization_id IS NULL';
+    } else {
+      ownSql += ' AND organization_id = ?';
+      ownParams.push(orgId);
+    }
+    const [ownRows] = await pool.query(ownSql, ownParams);
+    if (!ownRows || ownRows.length === 0) return res.status(404).json({ error: 'project not found' });
+
     // 1. 查询该项目下所有照片（不再包含已删除的 local_path 列）
     const [photos] = await pool.query(
       `SELECT id, url, thumb_url AS thumbUrl
