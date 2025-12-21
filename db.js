@@ -1,4 +1,11 @@
 // db.js
+// Ensure environment variables are loaded even when this module is imported
+// directly by standalone scripts.
+try {
+  const path = require('path');
+  require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+} catch (e) {}
+
 const mysql = require('mysql2/promise');
 const keys = require('./config/keys');
 
