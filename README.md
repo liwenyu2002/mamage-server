@@ -27,6 +27,45 @@ cmd /c '"C:\\Program Files\\MySQL\\MySQL Server 8.4\\bin\\mysql.exe" -u root -p 
 
 说明：不要把 MySQL 的实际数据目录加入 Git。项目已在 `.gitignore` 中忽略常见的数据目录（如 `data/`）。
 
+## 提交时同步数据库结构与 role_permissions
+
+目标：每次提交代码时，同时把 **数据库表结构（schema）** 和 **`role_permissions` 的初始化数据** 一起更新并提交到仓库，便于团队同步。
+
+本项目提供了导出脚本，会生成/更新两个文件：
+
+- `db/mamage_schema_only.sql`（全库 schema-only）
+- `db/role_permissions_seed.sql`（仅 `role_permissions` 表的数据）
+
+### 方式 A：手动（推荐先用这个验证一次）
+
+确保本机已安装 MySQL Client 工具，并且 `mysqldump` 在 PATH 里（或设置 `MYSQLDUMP_PATH` 为 mysqldump.exe 的完整路径）。然后运行：
+
+```bash
+npm run db:export
+```
+
+之后正常提交即可：
+
+```bash
+git add db/mamage_schema_only.sql db/role_permissions_seed.sql
+git commit -m "..."
+```
+
+### 方式 B：自动（pre-commit hook，每次 commit 自动导出并 stage）
+
+在项目根目录运行一次（Windows PowerShell）：
+
+```powershell
+.\scripts\install-git-hooks.ps1
+```
+
+安装完成后，每次 `git commit` 都会自动执行：
+
+1) `node scripts/export_db_artifacts.js`
+2) `git add db/mamage_schema_only.sql db/role_permissions_seed.sql`
+
+> 注意：导出脚本依赖你本地能连上数据库（使用 `.env` 里的 `DB_*` 变量）。
+
 ## 默认管理员账号
 
 - 邮箱：`admin@example.com`
@@ -59,7 +98,7 @@ cmd /c '"C:\\Program Files\\MySQL\\MySQL Server 8.4\\bin\\mysql.exe" -u root -p 
 - projects.js
 - ai_news.js
 - organizations.js
-- mamage_schema_only.sql
+- db/mamage_schema_only.sql
 - mamage_db_20251208.sql
 - run_create_ai_tables.js
 - create_ai_tables.sql
@@ -82,7 +121,7 @@ cmd /c '"C:\\Program Files\\MySQL\\MySQL Server 8.4\\bin\\mysql.exe" -u root -p 
 
 - ⚠️ 未找到任何 `.env` / `.env.example` 文件（但代码强依赖 `.env`，启动前会校验变量）。本文提供可直接复制的 `.env` 模板，变量来源于代码读取点（`process.env.*`）。
 - ⚠️ `docs/DEPLOYMENT.md` 中示例出现 `3000` 端口，但真实服务端口在 `app.js` 硬编码为 `8000`（本文以 `8000` 为准）。
-- ⚠️ `db/README.md` 与旧版 README 提到 `scripts/restore-db.ps1`，但当前 `scripts/` 目录中不存在该脚本；本文给出等价的手动导入 SQL 方式。
+- ⚠️ 旧文档里提到 `scripts/restore-db.ps1`，但当前 `scripts/` 目录中不存在该脚本；本文给出等价的手动导入 SQL 方式。
 
 ---
 
@@ -181,11 +220,11 @@ mysql -h 127.0.0.1 -P 3306 -u root -p mamage < mamage_db_20251208.sql
 
 #### 方式 B：只导入表结构（更“干净”）
 
-文件：`mamage_schema_only.sql`
+文件：`db/mamage_schema_only.sql`
 
 ```bash
 mysql -h 127.0.0.1 -P 3306 -u root -p -e "CREATE DATABASE IF NOT EXISTS mamage DEFAULT CHARACTER SET utf8mb4;"
-mysql -h 127.0.0.1 -P 3306 -u root -p mamage < mamage_schema_only.sql
+mysql -h 127.0.0.1 -P 3306 -u root -p mamage < db/mamage_schema_only.sql
 ```
 
 > 注意：schema-only 不包含 `role_permissions` 初始化数据，部分接口会因权限不足而返回 `403 forbidden`。建议随后从 `mamage_db_20251208.sql` 中复制 `role_permissions` 的 INSERT 语句执行，或手动补齐权限表。
@@ -235,7 +274,7 @@ curl http://localhost:8000/api/health
 
 ### MySQL
 
-- schema dump 标识来自 MySQL `8.0.44`（见 `mamage_schema_only.sql` 头部），建议使用 **MySQL 8.0**。
+- schema dump 标识来自 MySQL `8.0.44`（见 `db/mamage_schema_only.sql` 头部），建议使用 **MySQL 8.0**。
 - 代码使用 `mysql2/promise`。
 
 ### 其他可选依赖
@@ -292,14 +331,20 @@ curl http://localhost:8000/api/health
 
 当前项目不使用 ORM/迁移框架（无 Sequelize/Prisma 等），采用 SQL 文件导入/手动执行：
 
-- 表结构（schema-only）：`mamage_schema_only.sql`
+- 表结构（schema-only）：`db/mamage_schema_only.sql`
 - 全量数据（含权限等 seed）：`mamage_db_20251208.sql`
 - AI 表创建脚本：`scripts/create_ai_tables.sql` + `scripts/run_create_ai_tables.js`
 - 迁移示例（仅包含 projects 的一个迁移）：`db/migrations/20251212_make_projects_org_nullable.sql`
 
+### db 目录约定
+
+- `db/` 用于存放 SQL 文件与导出产物，便于团队同步。
+- `npm run db:export` 会更新：`db/mamage_schema_only.sql` 与 `db/role_permissions_seed.sql`。
+- 如有备份文件，可放到 `db/backup.sql`（或按你自己的命名），再用 README 里的 `mysql` 导入方式恢复。
+
 ### 核心表（5~10 个）与关系
 
-来自 `mamage_schema_only.sql` 与代码查询：
+来自 `db/mamage_schema_only.sql` 与代码查询：
 
 - `users`：用户表，`role` 决定权限；接口登录/注册使用该表（`users.js`）
 - `role_permissions`：RBAC 权限表，按 `role + permission` 授权（`permissions.js`）
@@ -308,7 +353,7 @@ curl http://localhost:8000/api/health
 - `photos`：照片，关联 `projects.id`；上传后生成缩略图并写入（`upload.js` / `photos.js`）
 - `invitations`：邀请码，用于给用户提升角色（`users.js`）
 - `ai_jobs` / `ai_results`：AI 新闻稿生成异步任务与结果（`ai_news.js`、`ai_job_worker.js`）
-- `ai_templates` / `ai_audit_log`：AI 模板与审计（`create_ai_tables.sql`；说明文档见 `ai_tables_documentation.md`）
+- `ai_templates` / `ai_audit_log`：AI 模板与审计（`create_ai_tables.sql`；前者存 Prompt 模板，后者做调用审计/排查）
 
 ### 多环境连接方式
 

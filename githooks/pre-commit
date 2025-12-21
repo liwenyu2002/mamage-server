@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+echo "[pre-commit] exporting DB schema + role_permissions..."
+
+node scripts/export_db_artifacts.js
+
+git add db/mamage_schema_only.sql db/role_permissions_seed.sql
+
+echo "[pre-commit] staged DB artifacts"

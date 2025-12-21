@@ -502,7 +502,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
 
 // 更新单张照片的 description 与 tags
 // PATCH /api/photos/:id
-router.patch('/:id', requirePermission('photos.update'), async (req, res) => {
+router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
