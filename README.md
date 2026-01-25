@@ -11,8 +11,7 @@ Node.js + Express + MySQL 的图库管理后端：提供登录鉴权（JWT）、
 
 ### 1) 环境要求
 - Node.js：建议 18+（LTS）
-- MySQL：建议 8.0+
-
+- MySQL：建议 8.0+（Windows可以在官网下载https://dev.mysql.com/downloads/mysql/，需要注册登录）
 ### 2) 安装依赖
 ```bash
 npm install

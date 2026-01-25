@@ -24,7 +24,7 @@ const skipLocalFileCheck = (() => {
   try {
     const base = (keys.UPLOAD_BASE_URL || '').trim();
     if (base && /^https?:\/\//i.test(base) && !/localhost|127\.0\.0\.1/.test(base)) return true;
-  } catch (e) {}
+  } catch (e) { }
   // 如果没有配置 UPLOAD_ABS_DIR，说明没有本地 uploads 目录，跳过本地检查
   if (!keys.UPLOAD_ABS_DIR) return true;
   return false;
@@ -75,11 +75,11 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
     const params = [];
 
     if (type) {
-      conds.push('type = ?');
+      conds.push('p.type = ?');
       params.push(type);
     }
     if (!Number.isNaN(projectId) && projectId) {
-      conds.push('project_id = ?');
+      conds.push('p.project_id = ?');
       params.push(projectId);
     }
 
@@ -99,7 +99,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
     if (random) {
       sql += ' ORDER BY RAND()';
     } else {
-      sql += ' ORDER BY created_at DESC';
+      sql += ' ORDER BY p.created_at DESC';
     }
 
     sql += ' LIMIT ?';
@@ -158,6 +158,102 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
   }
 });
 
+// 获取随机风景（scenery 项目）照片
+// GET /api/photos/scenery/random?limit=4&random=1
+// 说明：风景由 projects.type = 'scenery' 决定
+router.get('/scenery/random', requirePermission('photos.view'), async (req, res) => {
+  try {
+    let limit = parseInt(req.query.limit, 10);
+    if (Number.isNaN(limit) || limit <= 0 || limit > 100) {
+      limit = 4;
+    }
+    const random = req.query.random === '1' || req.query.random === 'true' || req.query.random === undefined;
+
+    // organization scoping: only return photos for user's organization
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+
+    let sql = `
+      SELECT
+        p.id,
+        p.uuid,
+        p.project_id      AS projectId,
+        p.url,
+        p.thumb_url       AS thumbUrl,
+        p.title,
+        p.description,
+        p.tags,
+        p.type,
+        p.photographer_id AS photographerId,
+        u.name            AS photographerName,
+        p.created_at      AS createdAt,
+        p.updated_at      AS updatedAt
+      FROM photos p
+      LEFT JOIN users u ON p.photographer_id = u.id
+      INNER JOIN projects pr ON p.project_id = pr.id
+      WHERE pr.type = 'scenery'
+    `;
+
+    const params = [];
+    if (orgId === null) {
+      sql += ' AND p.organization_id IS NULL';
+    } else {
+      sql += ' AND p.organization_id = ?';
+      params.push(orgId);
+    }
+
+    if (random) {
+      sql += ' ORDER BY RAND()';
+    } else {
+      sql += ' ORDER BY p.created_at DESC';
+    }
+
+    sql += ' LIMIT ?';
+    params.push(limit);
+
+    const [rows] = await pool.query(sql, params);
+
+    const mapped = (rows || []).map((p) => {
+      function resolveUrl(raw) {
+        if (!raw) return null;
+        const str = String(raw);
+        if (/^https?:\/\//i.test(str)) return str;
+
+        const finalUrl = buildUploadUrl(str);
+        if (skipLocalFileCheck) return finalUrl;
+
+        try {
+          let rel = str;
+          if (rel.startsWith('/uploads/')) {
+            rel = rel.replace(/^\/uploads[\\/]/, '');
+          } else if (rel.startsWith('uploads/')) {
+            rel = rel.replace(/^uploads[\\/]/, '');
+          }
+          rel = rel.split('/').join(path.sep);
+          const abs = path.join(uploadRoot, rel);
+          if (fs.existsSync(abs)) return finalUrl;
+        } catch (e) {
+          // ignore
+        }
+
+        const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='300' height='200'><rect width='100%' height='100%' fill='%23f3f3f3'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='20' fill='%23999'>占位图</text></svg>`;
+        return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+      }
+
+      return {
+        ...p,
+        url: resolveUrl(p.url),
+        thumbUrl: resolveUrl(p.thumbUrl),
+        description: p.description || null
+      };
+    });
+
+    res.json(mapped);
+  } catch (err) {
+    console.error('GET /api/photos/scenery/random error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // 基于数据库的权限检查（使用 role_permissions 表）
 
 // 照片删除（仅 admin）
@@ -174,7 +270,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
       .filter((n) => !Number.isNaN(n));
 
     // debug log: who requested deletion and which ids
-    try { console.log('[photos.delete] requested by user=%s ids=%o', req.user && req.user.id, ids); } catch (e) {}
+    try { console.log('[photos.delete] requested by user=%s ids=%o', req.user && req.user.id, ids); } catch (e) { }
 
     if (ids.length === 0) {
       return res.status(400).json({ error: 'no valid photo id' });
@@ -195,7 +291,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
     if (rows.length === 0) {
       return res.json({ deletedIds: [], notFoundIds: ids });
 
-    
+
     }
 
     const foundIds = rows.map((r) => r.id);
@@ -289,7 +385,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
     try {
       console.info('[photos.delete] user=%s deletedPhotoIds=%o deletedFiles=%d notFoundFiles=%d', req.user && req.user.id, foundIds, deletedFiles.length, notFoundFiles.length);
       console.debug && console.debug('[photos.delete] deletedFiles=%o notFoundFiles=%o', deletedFiles, notFoundFiles);
-    } catch (e) {}
+    } catch (e) { }
 
     res.json({ deletedIds: foundIds, notFoundIds });
   } catch (err) {
@@ -352,7 +448,7 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     const archive = archiver('zip', { zlib: { level: 9 } });
     archive.on('error', (err) => {
       console.error('archive error:', err.message);
-      try { res.status(500).end(); } catch (e) {}
+      try { res.status(500).end(); } catch (e) { }
     });
 
     // pipe archive to response
