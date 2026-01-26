@@ -169,7 +169,7 @@ CREATE TABLE `photos` (
   KEY `idx_photos_created_at` (`created_at`),
   KEY `idx_photos_org` (`organization_id`),
   CONSTRAINT `fk_photos_project` FOREIGN KEY (`project_id`) REFERENCES `projects` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
-) ENGINE=InnoDB AUTO_INCREMENT=242 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=269 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -214,6 +214,61 @@ CREATE TABLE `role_permissions` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_role_permission` (`role`,`permission`)
 ) ENGINE=InnoDB AUTO_INCREMENT=44 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `share_link_items`
+--
+
+DROP TABLE IF EXISTS `share_link_items`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `share_link_items` (
+  `id` int unsigned NOT NULL AUTO_INCREMENT,
+  `share_id` int unsigned NOT NULL,
+  `photo_id` int unsigned NOT NULL,
+  `sort_order` int unsigned NOT NULL DEFAULT '0',
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_share_link_items_share_photo` (`share_id`,`photo_id`),
+  KEY `idx_share_link_items_share_id` (`share_id`),
+  KEY `idx_share_link_items_photo_id` (`photo_id`),
+  CONSTRAINT `fk_share_link_items_photo` FOREIGN KEY (`photo_id`) REFERENCES `photos` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `fk_share_link_items_share` FOREIGN KEY (`share_id`) REFERENCES `share_links` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `share_links`
+--
+
+DROP TABLE IF EXISTS `share_links`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `share_links` (
+  `id` int unsigned NOT NULL AUTO_INCREMENT,
+  `code` varchar(64) NOT NULL,
+  `share_type` varchar(32) NOT NULL COMMENT 'project | collection',
+  `project_id` int unsigned DEFAULT NULL COMMENT 'share_type=project 时填写',
+  `title` varchar(255) DEFAULT NULL,
+  `note` varchar(255) DEFAULT NULL,
+  `created_by` int unsigned NOT NULL,
+  `organization_id` int unsigned NOT NULL,
+  `expires_at` datetime DEFAULT NULL,
+  `revoked_at` datetime DEFAULT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_share_links_code` (`code`),
+  KEY `idx_share_links_org` (`organization_id`),
+  KEY `idx_share_links_created_by` (`created_by`),
+  KEY `idx_share_links_project_id` (`project_id`),
+  KEY `idx_share_links_expires_at` (`expires_at`),
+  KEY `idx_share_links_revoked_at` (`revoked_at`),
+  CONSTRAINT `fk_share_links_created_by` FOREIGN KEY (`created_by`) REFERENCES `users` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+  CONSTRAINT `fk_share_links_org` FOREIGN KEY (`organization_id`) REFERENCES `organizations` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+  CONSTRAINT `fk_share_links_project` FOREIGN KEY (`project_id`) REFERENCES `projects` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --

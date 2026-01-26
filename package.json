@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "db:export": "node scripts/export_db_artifacts.js",
+    "db:share": "node scripts/run_create_share_tables.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

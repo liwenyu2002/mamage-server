@@ -1,6 +1,6 @@
 // backend/app.js（完整示例）
 // Load local .env in development (optional). Ensure .env is in .gitignore.
-try { require('dotenv').config(); } catch (e) {}
+try { require('dotenv').config(); } catch (e) { }
 // 临时调试：对 process.exit 进行轻量包装，打印调用栈以定位谁触发了退出。
 // 调试完成后会移除此代码。
 // (Removed temporary process.exit wrapper used for debugging)
@@ -51,6 +51,7 @@ const uploadRouter = require('./routes/upload');
 const usersRouter = require('./routes/users');
 const aiNewsRouter = require('./routes/ai_news');
 const orgsRouter = require('./routes/organizations');
+const shareRouter = require('./routes/share');
 
 const app = express();
 
@@ -87,7 +88,7 @@ app.use('/uploads', express.static(staticUploadsDir));
  *     backend/app.js  （当前文件）
  *     dist/           （npm run build 生成）
  */
-const distPath = path.join(__dirname, '..',  'MaMage_Web', 'dist');
+const distPath = path.join(__dirname, '..', 'MaMage_Web', 'dist');
 
 // 1）把 dist 里的静态文件暴露出来：/index.html、/bundle.js、/favicon.ico 等
 app.use(express.static(distPath));
@@ -105,6 +106,7 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/organizations', orgsRouter);
+app.use('/api/share', shareRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
