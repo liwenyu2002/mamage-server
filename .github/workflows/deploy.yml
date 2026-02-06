@@ -46,7 +46,7 @@ jobs:
             --exclude "node_modules/" \
             --exclude ".github/" \
             --exclude ".env" \
-            --exclude "Miniconda3-*" \\
+            --exclude "Miniconda3-*" \
             -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
 
