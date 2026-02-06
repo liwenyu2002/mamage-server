@@ -8,3 +8,4 @@ uploads/
 data/
 mysql-data/
 *.sql.gz
+Miniconda3-*.exe

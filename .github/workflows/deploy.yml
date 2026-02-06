@@ -2,7 +2,7 @@ name: Deploy mamage-server
 
 on:
   push:
-    branches: [ "main" ]    # 推 main 时自动部署
+    branches: ["main"] # 推 main 时自动部署
 
 jobs:
   build-and-deploy:
@@ -46,6 +46,7 @@ jobs:
             --exclude "node_modules/" \
             --exclude ".github/" \
             --exclude ".env" \
+            --exclude "Miniconda3-*" \\
             -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
 
