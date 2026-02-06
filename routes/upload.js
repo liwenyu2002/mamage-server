@@ -90,58 +90,17 @@ function uploadFileToCOS(localFilePath, key) {
   });
 }
 
-// 上传根目录：优先使用环境变量 UPLOAD_ABS_DIR，否则回退到仓库内的 uploads
+// note: we will avoid writing files to local disk when COS is enabled.
+// uploadRoot kept for backward compatibility but not used when using memory storage.
 const uploadsAbsDir = keys.UPLOAD_ABS_DIR || path.join(__dirname, '..', 'uploads');
-// 如果传入的是父目录（例如 C:/ALL/MaMage/Photo_Base），实际文件通常在其下的 'uploads' 子目录
 const uploadRoot = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWith('/uploads')
   ? uploadsAbsDir
   : path.join(uploadsAbsDir, 'uploads');
 
 // === multer 配置：按日期分目录，文件名用 uuid ===
-const storage = multer.diskStorage({
-  destination(req, file, cb) {
-    // 注意：projectId 来自前端 wx.uploadFile 的 formData.projectId
-    const projectId = req.body && req.body.projectId;
-    let dir;
-
-    if (projectId === '1') {
-      // 特殊项目：校园风光
-      // 实际目录：.../uploads/scenery
-      dir = path.join(uploadRoot, 'scenery');
-    } else {
-      // 其它项目还是按日期分目录
-      const now = new Date();
-      const year = now.getFullYear().toString();
-      const month = String(now.getMonth() + 1).padStart(2, '0');
-      const day = String(now.getDate()).padStart(2, '0');
-      dir = path.join(uploadRoot, year, month, day);
-    }
-
-    fs.mkdirSync(dir, { recursive: true });
-    console.log('[upload] destination dir:', dir);
-    cb(null, dir);
-  },
-
-  filename(req, file, cb) {
-    const projectId = req.body && req.body.projectId;
-
-    // 保留后缀：优先用原始后缀
-    let ext = path.extname(file.originalname).toLowerCase();
-
-    // 如果没后缀，就根据项目类型兜底
-    if (!ext) {
-      // 你现在校园风光用的是 png，这里强制一下也无妨
-      ext = projectId === '1' ? '.png' : '.jpg';
-    }
-
-    const filename = uuidv4() + ext; // 至于 111.png/444.png 那些只是你手动起的名字，这里用 uuid 就能保证不冲突
-    cb(null, filename);
-  }
-});
-const upload = multer({
-  storage,
-  // 你也可以在这里加文件大小限制、类型过滤等
-});
+// Use memory storage to avoid writing uploaded files to disk when COS is enabled.
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
 
 // === 单张照片上传接口 ===
 // POST /api/upload/photo
@@ -168,61 +127,77 @@ async function processUpload(req, res) {
       }
     }
 
-    // 原图绝对路径
-    const absPath = req.file.path;
-    console.log('[upload] saved absPath:', absPath, ' uploadRoot:', uploadRoot);
+    // If multer.memoryStorage is used, file buffer is available at req.file.buffer
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded' });
+    const originalBuffer = req.file.buffer;
 
-    // 相对路径（给前端用）：把 uploadRoot 去掉，然后统一换成 /uploads/...
-    let relPath = absPath.replace(uploadRoot, '');
-    relPath = relPath.split(path.sep).join('/');
-    relPath = '/uploads' + relPath;
+    // Build object keys (relative paths) similar to previous disk layout
+    let keyPrefix;
+    if (projectId === 1) {
+      keyPrefix = 'scenery';
+    } else {
+      const now = new Date();
+      const year = now.getFullYear().toString();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const day = String(now.getDate()).padStart(2, '0');
+      keyPrefix = `${year}/${month}/${day}`;
+    }
 
-    // === 生成缩略图 ===
-    const dirName = path.dirname(absPath);
-    const thumbDir = path.join(dirName, 'thumbs');
-    fs.mkdirSync(thumbDir, { recursive: true });
+    // filename
+    let ext = path.extname(req.file.originalname).toLowerCase();
+    if (!ext) ext = projectId === 1 ? '.png' : '.jpg';
+    const filename = uuidv4() + ext;
+    let relPath = `/uploads/${keyPrefix}/${filename}`.replace(/\\/g, '/');
 
-    const baseName = path.basename(absPath);
-    const thumbName = 'thumb_' + baseName;
-    const thumbAbsPath = path.join(thumbDir, thumbName);
+    // generate thumbnail buffer
+    const thumbBuffer = await sharp(originalBuffer).resize(800).jpeg({ quality: 80 }).toBuffer();
+    const thumbName = 'thumb_' + filename;
+    let thumbRel = `/uploads/${keyPrefix}/thumbs/${thumbName}`.replace(/\\/g, '/');
 
-    await sharp(absPath)
-      .resize(800)
-      .jpeg({ quality: 80 })
-      .toFile(thumbAbsPath);
+    // upload buffers to COS
+    ensureCosClient();
+    if (!cosClient) {
+      console.error('[upload] COS client not configured - rejecting upload to avoid local storage');
+      return res.status(503).json({ error: 'COS_NOT_CONFIGURED', message: 'Server is not configured to upload to object storage. Configure COS_SECRET_ID/COS_SECRET_KEY/COS_BUCKET/COS_REGION.' });
+    }
 
-    let thumbRel = thumbAbsPath.replace(uploadRoot, '');
-    thumbRel = thumbRel.split(path.sep).join('/');
-    thumbRel = '/uploads' + thumbRel;
+    // helper to upload buffer directly
+    async function uploadBufferToCOS(buffer, key) {
+      return new Promise((resolve, reject) => {
+        const bucket = keys.COS_BUCKET || COS_BUCKET;
+        const region = keys.COS_REGION || COS_REGION;
+        cosClient.putObject(
+          {
+            Bucket: bucket,
+            Region: region,
+            Key: key,
+            Body: buffer,
+            ContentLength: buffer.length
+          },
+          (err, data) => {
+            if (err) return reject(err);
+            const base = (keys.COS_BASE_URL || COS_BASE_URL) ? (keys.COS_BASE_URL || COS_BASE_URL).replace(/\/$/, '') : `https://${bucket}.cos.${region}.myqcloud.com`;
+            resolve(base + '/' + key);
+          }
+        );
+      });
+    }
 
-    // 如果配置了 COS 客户端，尝试上传原图和缩略图到 COS，并在成功后删除本地文件
     let remoteUrl = null;
     let remoteThumbUrl = null;
-    // 确保尝试延迟初始化 COS 客户端（允许在进程启动后通过环境变量配置）
-    ensureCosClient();
-    if (cosClient) {
-      try {
-        // 使用相对 uploads/... 作为对象 Key（去掉前导 '/'
-        const key = relPath.replace(/^\/+/g, '');
-        const thumbKey = thumbRel.replace(/^\/+/g, '');
-
-        remoteUrl = await uploadFileToCOS(absPath, key);
-        remoteThumbUrl = await uploadFileToCOS(thumbAbsPath, thumbKey);
-
-        // 删除本地文件（异步）
-        try { fs.unlink(absPath, () => { }); } catch (e) { }
-        try { fs.unlink(thumbAbsPath, () => { }); } catch (e) { }
-
-        // 把将要写入 DB 的路径替换为远程 URL（完整地址）
-        relPath = remoteUrl;
-        thumbRel = remoteThumbUrl;
-        console.log('[upload] uploaded to COS', remoteUrl, remoteThumbUrl);
-      } catch (e) {
-        console.error('[upload] upload to COS failed, falling back to local paths', e && e.message ? e.message : e);
-        // keep local relPath/thumbRel
-      }
-    } else {
-      console.log('[upload] COS client not available, storing local paths');
+    try {
+      const key = relPath.replace(/^\/+/, '');
+      const thumbKey = thumbRel.replace(/^\/+/, '');
+      remoteUrl = await uploadBufferToCOS(originalBuffer, key);
+      remoteThumbUrl = await uploadBufferToCOS(thumbBuffer, thumbKey);
+      // use remote URLs for DB
+      console.log('[upload] uploaded to COS', remoteUrl, remoteThumbUrl);
+      // override relPath/thumbRel to be remote URLs so DB and response point to COS
+      relPath = remoteUrl;
+      thumbRel = remoteThumbUrl;
+    } catch (e) {
+      console.error('[upload] upload to COS failed', e && e.message ? e.message : e);
+      return res.status(502).json({ error: 'COS_UPLOAD_FAILED', message: String(e && e.message ? e.message : e) });
     }
 
     // photographerId MUST come from the authenticated token (req.user).
@@ -339,9 +314,9 @@ async function processUpload(req, res) {
     // 我们排队的是缩略图（thumbRel），模型读取缩略图即可生成 description/tags
     try {
       const aiWorker = require('../lib/ai_tags_worker');
-      // 传入 relPath 为缩略图的相对 URL，和缩略图的绝对路径以备需要
-      aiWorker.enqueue({ id: insertedId, relPath: thumbRel, absPath: thumbAbsPath });
-      console.log('[upload] enqueued thumbnail for ai analyze', insertedId, thumbRel);
+      // 传入 relPath（缩略图的 URL），无需本地绝对路径
+      aiWorker.enqueue({ id: insertedId, relPath: remoteThumbUrl });
+      console.log('[upload] enqueued thumbnail for ai analyze', insertedId, remoteThumbUrl);
     } catch (e) {
       console.error('[upload] enqueue ai analyze failed:', e && e.message ? e.message : e);
     }
@@ -349,8 +324,8 @@ async function processUpload(req, res) {
     // 异步生成并保存 image embedding（非阻塞）
     try {
       const imageSim = require('../lib/image_similarity');
-      const buf = await fs.promises.readFile(thumbAbsPath);
-      imageSim.encodeImageFromBuffer(buf).then((emb) => {
+      // thumbBuffer exists in this scope (generated earlier); encode directly from buffer
+      imageSim.encodeImageFromBuffer(thumbBuffer).then((emb) => {
         return imageSim.saveEmbedding(insertedId, emb).catch((err) => console.error('[image_similarity] save failed', err && err.message ? err.message : err));
       }).catch((err) => console.error('[image_similarity] encode failed', err && err.message ? err.message : err));
       console.log('[upload] enqueued embedding generation', insertedId);
