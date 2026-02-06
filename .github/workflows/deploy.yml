@@ -56,10 +56,38 @@ jobs:
           ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
           set -e
-          cd /home/liwy/mamage_server
+          set -x
+          cd /home/liwy/mamage_server || exit 2
 
-          echo "==> Install dependencies on ECS..."
-          npm ci --omit=dev || npm install --omit=dev
+          echo "==> Remote: print node & npm versions"
+          node -v || true
+          npm -v || true
+
+          echo "==> Remote: pwd & ls"
+          pwd
+          ls -la
+
+          echo "==> Remote: npm registry"
+          npm config get registry || true
+
+          echo "==> Install dependencies on ECS (verbose)..."
+          # try npm ci first; if fails, show npm debug log for investigation
+          if npm ci --omit=dev --verbose ; then
+            echo "npm ci succeeded"
+          else
+            echo "npm ci failed, attempting npm install..."
+            npm install --omit=dev --verbose || true
+            echo "=== npm debug logs ==="
+            # show recent npm debug logs if present
+            ls -la ~/.npm/_logs || true
+            for f in ~/.npm/_logs/*debug*; do
+              echo "---- cat $f ----"; cat "$f" || true
+            done
+            # also try to show any other npm log
+            tail -n +1 ~/.npm/_logs/*.log || true
+            # fail the job after printing logs
+            exit 1
+          fi
 
           echo "==> Validate environment variables..."
           node -e "require('./lib/validateEnv').validateEnvironment(true)" || {
