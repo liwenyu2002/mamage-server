@@ -210,8 +210,8 @@ async function processUpload(req, res) {
         remoteThumbUrl = await uploadFileToCOS(thumbAbsPath, thumbKey);
 
         // 删除本地文件（异步）
-        try { fs.unlink(absPath, () => {}); } catch (e) {}
-        try { fs.unlink(thumbAbsPath, () => {}); } catch (e) {}
+        try { fs.unlink(absPath, () => { }); } catch (e) { }
+        try { fs.unlink(thumbAbsPath, () => { }); } catch (e) { }
 
         // 把将要写入 DB 的路径替换为远程 URL（完整地址）
         relPath = remoteUrl;
@@ -344,6 +344,18 @@ async function processUpload(req, res) {
       console.log('[upload] enqueued thumbnail for ai analyze', insertedId, thumbRel);
     } catch (e) {
       console.error('[upload] enqueue ai analyze failed:', e && e.message ? e.message : e);
+    }
+
+    // 异步生成并保存 image embedding（非阻塞）
+    try {
+      const imageSim = require('../lib/image_similarity');
+      const buf = await fs.promises.readFile(thumbAbsPath);
+      imageSim.encodeImageFromBuffer(buf).then((emb) => {
+        return imageSim.saveEmbedding(insertedId, emb).catch((err) => console.error('[image_similarity] save failed', err && err.message ? err.message : err));
+      }).catch((err) => console.error('[image_similarity] encode failed', err && err.message ? err.message : err));
+      console.log('[upload] enqueued embedding generation', insertedId);
+    } catch (e) {
+      console.error('[upload] enqueue embedding failed:', e && e.message ? e.message : e);
     }
 
     res.json(respPayload);

@@ -522,6 +522,8 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
   }
 });
 
+
+
 // 获取单张照片（包含 photographerName）
 // GET /api/photos/:id
 router.get('/:id', requirePermission('photos.view'), async (req, res) => {
