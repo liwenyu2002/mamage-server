@@ -52,6 +52,7 @@ const usersRouter = require('./routes/users');
 const aiNewsRouter = require('./routes/ai_news');
 const orgsRouter = require('./routes/organizations');
 const shareRouter = require('./routes/share');
+const similarityRouter = require('./routes/similarity_groups');
 
 const app = express();
 
@@ -107,6 +108,7 @@ app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/share', shareRouter);
+app.use('/api/similarity', similarityRouter);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
