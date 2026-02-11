@@ -45,7 +45,7 @@ router.get('/groups', requirePermission('photos.view'), async (req, res) => {
         const projectId = req.query.projectId ? Number(req.query.projectId) : null;
         if (!projectId) return res.status(400).json({ error: 'projectId is required' });
 
-        const threshold = req.query.threshold ? Number(req.query.threshold) : 0.8;
+        const threshold = req.query.threshold ? Number(req.query.threshold) : 0.6;
         const minSize = req.query.minSize ? Math.max(1, Number(req.query.minSize)) : 2;
         const mode = (req.query.mode || 'connected').toLowerCase();
         const minInternal = req.query.minInternal ? Number(req.query.minInternal) : 0.0;
@@ -227,7 +227,7 @@ router.get('/groups/simple', requirePermission('photos.view'), async (req, res) 
 
         // 推荐默认值
         const modelName = 'resnet50';
-        const threshold = 0.8;
+        const threshold = 0.6;
         const minSize = 2;
         const mode = 'clique';
 

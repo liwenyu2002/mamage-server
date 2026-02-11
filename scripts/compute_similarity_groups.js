@@ -143,7 +143,7 @@ async function compute(projectId, threshold = 0.8, minSize = 2, mode = 'connecte
 async function main() {
     const argv = require('minimist')(process.argv.slice(2));
     const projectId = argv.projectId ? Number(argv.projectId) : null;
-    if (!projectId) { console.error('Usage: node scripts/compute_similarity_groups.js --projectId 12 [--threshold 0.8] [--minSize 2] [--mode connected|clique]'); process.exit(2); }
+    if (!projectId) { console.error('Usage: node scripts/compute_similarity_groups.js --projectId 12 [--threshold 0.7] [--minSize 2] [--mode connected|clique]'); process.exit(2); }
     const threshold = argv.threshold ? Number(argv.threshold) : 0.8;
     const minSize = argv.minSize ? Number(argv.minSize) : 2;
     const mode = argv.mode || 'connected';
