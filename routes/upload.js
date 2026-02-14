@@ -190,11 +190,11 @@ async function processUpload(req, res) {
       const thumbKey = thumbRel.replace(/^\/+/, '');
       remoteUrl = await uploadBufferToCOS(originalBuffer, key);
       remoteThumbUrl = await uploadBufferToCOS(thumbBuffer, thumbKey);
-      // use remote URLs for DB
+      // use remote URLs only for logging; keep DB values as relative paths
       console.log('[upload] uploaded to COS', remoteUrl, remoteThumbUrl);
-      // override relPath/thumbRel to be remote URLs so DB and response point to COS
-      relPath = remoteUrl;
-      thumbRel = remoteThumbUrl;
+      // keep relative DB paths (leading slash)
+      relPath = '/' + key;
+      thumbRel = '/' + thumbKey;
     } catch (e) {
       console.error('[upload] upload to COS failed', e && e.message ? e.message : e);
       return res.status(502).json({ error: 'COS_UPLOAD_FAILED', message: String(e && e.message ? e.message : e) });
@@ -314,9 +314,9 @@ async function processUpload(req, res) {
     // 我们排队的是缩略图（thumbRel），模型读取缩略图即可生成 description/tags
     try {
       const aiWorker = require('../lib/ai_tags_worker');
-      // 传入 relPath（缩略图的 URL），无需本地绝对路径
-      aiWorker.enqueue({ id: insertedId, relPath: remoteThumbUrl });
-      console.log('[upload] enqueued thumbnail for ai analyze', insertedId, remoteThumbUrl);
+      // 传入相对路径（缩略图的 URL），后台会用 buildUploadUrl 拼接完整地址
+      aiWorker.enqueue({ id: insertedId, relPath: thumbRel });
+      console.log('[upload] enqueued thumbnail for ai analyze', insertedId, thumbRel);
     } catch (e) {
       console.error('[upload] enqueue ai analyze failed:', e && e.message ? e.message : e);
     }

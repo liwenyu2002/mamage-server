@@ -48,7 +48,7 @@ const skipLocalFileCheck = (() => {
   try {
     const base = (keys.UPLOAD_BASE_URL || '').trim();
     if (base && /^https?:\/\//i.test(base) && !/localhost|127\.0\.0\.1/.test(base)) return true;
-  } catch (e) {}
+  } catch (e) { }
   if (!keys.UPLOAD_ABS_DIR) return true;
   return false;
 })();
@@ -574,6 +574,8 @@ router.get('/:id', async (req, res) => {
 
     project.photos = photoRows.map((p) => ({
       ...p,
+      url: p.url ? buildUploadUrl(p.url) : null,
+      thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
       fullUrl: p.url ? buildUploadUrl(p.url) : null,
       fullThumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
       description: p.description || null
