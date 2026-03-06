@@ -84,6 +84,11 @@ router.post('/register', async (req, res) => {
   try {
     const { name, password, student_no, email, department, invite_code, organization_id } = req.body || {};
 
+    // 临时禁用注册：设置环境变量 `DISABLE_USER_REGISTRATION=1` 可重新开启
+    if (process.env.DISABLE_USER_REGISTRATION === '1') {
+      return res.status(503).json({ error: 'REGISTRATION_DISABLED', message: '注册已被临时关闭' });
+    }
+
     // basic validation
     if (!name || !password) return res.status(400).json({ error: 'MISSING_FIELDS', message: 'name 和 password 为必填项' });
     if (!pwdRegex.test(password)) return res.status(400).json({ error: 'INVALID_PASSWORD', message: '密码须为8-16位，且为字母和数字的组合' });
@@ -103,7 +108,7 @@ router.post('/register', async (req, res) => {
     const now = new Date();
 
     // allowed roles
-    const allowedRoles = new Set(['visitor','photographer','admin']);
+    const allowedRoles = new Set(['visitor', 'photographer', 'admin']);
     let role = 'visitor';
 
     // If invite_code provided, use transactional flow to consume it
@@ -122,10 +127,10 @@ router.post('/register', async (req, res) => {
 
         const finalStudentNo = (student_no !== undefined && student_no !== null && String(student_no).trim() !== '')
           ? String(student_no)
-          : ('auto' + Date.now().toString(36) + uuidv4().replace(/-/g, '').slice(0,8));
+          : ('auto' + Date.now().toString(36) + uuidv4().replace(/-/g, '').slice(0, 8));
 
-        const cols = ['student_no','name','role','password_hash','created_at','updated_at'];
-        const placeholders = ['?','?','?','?','?','?'];
+        const cols = ['student_no', 'name', 'role', 'password_hash', 'created_at', 'updated_at'];
+        const placeholders = ['?', '?', '?', '?', '?', '?'];
         const params = [finalStudentNo, name, role, password_hash, now, now];
 
         if (organization_id !== undefined && organization_id !== null) {
@@ -162,7 +167,7 @@ router.post('/register', async (req, res) => {
         // normal registration
         const finalStudentNo = (student_no !== undefined && student_no !== null && String(student_no).trim() !== '')
           ? String(student_no)
-          : ('auto' + Date.now().toString(36) + uuidv4().replace(/-/g, '').slice(0,8));
+          : ('auto' + Date.now().toString(36) + uuidv4().replace(/-/g, '').slice(0, 8));
         const cols = [];
         const placeholders = [];
         const params = [];
@@ -200,7 +205,7 @@ router.post('/register', async (req, res) => {
         return res.json({ id: userId, token });
       }
     } catch (e) {
-      if (conn) { try { await conn.rollback(); conn.release(); } catch(_){} }
+      if (conn) { try { await conn.rollback(); conn.release(); } catch (_) { } }
       console.error('[users.register] transaction error', e && e.stack ? e.stack : e);
       if (e && (e.code === 'ER_NO_DEFAULT_FOR_FIELD' || (e.message && e.message.indexOf("organization_id") !== -1))) {
         return res.status(500).json({
@@ -337,7 +342,7 @@ const { requirePermission } = require('../lib/permissions');
 router.post('/invitations', authMiddleware, requirePermission('users.invitations.create'), async (req, res) => {
   try {
     const { role, expires_at, max_uses = 1, note } = req.body;
-    const allowed = new Set(['visitor','photographer','admin']);
+    const allowed = new Set(['visitor', 'photographer', 'admin']);
     if (!allowed.has(role)) return res.status(400).json({ error: 'INVALID_ROLE' });
     const code = crypto.randomBytes(20).toString('hex');
     const [result] = await pool.query('INSERT INTO invitations (code, role, created_by, expires_at, max_uses, note) VALUES (?, ?, ?, ?, ?, ?)', [code, role, req.user.id, expires_at || null, max_uses || 1, note || null]);
@@ -373,7 +378,7 @@ router.post('/me/invite', authMiddleware, async (req, res) => {
     }
     res.json(rows2[0]);
   } catch (err) {
-    if (conn) { try { await conn.rollback(); conn.release(); } catch(_){} }
+    if (conn) { try { await conn.rollback(); conn.release(); } catch (_) { } }
     console.error('[users.applyInvite]', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'server error' });
   }
