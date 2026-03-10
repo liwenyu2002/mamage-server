@@ -95,6 +95,9 @@ jobs:
             exit 1
           }
 
+          echo "==> Run DB migrations..."
+          npm run db:migrate
+
           echo "==> Restart pm2 process..."
           pm2 restart mamage-server || pm2 start app.js --name mamage-server
 
