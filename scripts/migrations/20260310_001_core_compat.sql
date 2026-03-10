@@ -50,6 +50,24 @@ CREATE TABLE IF NOT EXISTS share_link_items (
   KEY idx_share_link_items_photo_id (photo_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255) NULL;
-
+SET @has_users_table := (
+  SELECT COUNT(*)
+  FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'users'
+);
+SET @has_password_hash := (
+  SELECT COUNT(*)
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'users'
+    AND COLUMN_NAME = 'password_hash'
+);
+SET @ddl := IF(
+  @has_users_table = 1 AND @has_password_hash = 0,
+  'ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL',
+  'SELECT 1'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
