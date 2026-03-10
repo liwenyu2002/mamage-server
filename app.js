@@ -99,12 +99,14 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 app.get('/', (req, res) => {
-  res.json({
-    service: 'mamage-server',
-    status: 'ok',
-    health: '/api/health',
-    apiPrefix: '/api'
-  });
+  const webUrl = process.env.FRONTEND_URL || process.env.CORS_ORIGIN;
+  if (webUrl) {
+    return res.redirect(webUrl);
+  }
+
+  res.type('html').send(
+    "<!doctype html><html><head><meta charset='utf-8'><title>MaMage API</title></head><body><h1>MaMage API Server</h1><p>Frontend URL not configured.</p><p>Health: <a href='/api/health'>/api/health</a></p></body></html>"
+  );
 });
 // ============ 启动服务 ============
 const PORT = 8000; // �?process.env.PORT || 52367;
@@ -123,5 +125,7 @@ async function startup() {
 }
 
 startup();
+
+
 
 
