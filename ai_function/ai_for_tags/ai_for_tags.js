@@ -21,9 +21,9 @@ try {
 
 // 按需创建 OpenAI 客户端，避免模块加载阶段依赖环境变量或抛出错误
 function getOpenAIClient() {
-  const key = process.env.DASHSCOPE_API_KEY || "sk-11fe87f4c96a4c7b920532724d77eef6";
+  const key = process.env.AI_VISION_API_KEY || process.env.DASHSCOPE_API_KEY;
   if (!key) {
-    throw new Error('Missing DASHSCOPE_API_KEY or OPENAI_API_KEY in environment');
+    throw new Error('Missing AI_VISION_API_KEY or DASHSCOPE_API_KEY in environment');
   }
   return new OpenAI({ apiKey: key, baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1' });
 }
@@ -216,6 +216,4 @@ async function analyze(imageUrl) {
 }
 
 // 模块导出：保留核心分析函数供其他模块调用（例如 ai_tags_worker）
-module.exports = { analyze, headRequest, fetchBinary };
-
 module.exports = { analyze, headRequest, fetchBinary };
