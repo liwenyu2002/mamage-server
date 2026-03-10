@@ -63,7 +63,6 @@ DB_NAME=
 
 ```env
 CORS_ORIGIN=http://localhost:5173
-FRONTEND_URL=http://localhost:5173
 UPLOAD_BASE_URL=https://<your-cos-domain>
 ```
 
