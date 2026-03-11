@@ -104,7 +104,7 @@ app.get('/', (req, res) => {
   );
 });
 // ============ 启动服务 ============
-const PORT = 8000; // �?process.env.PORT || 52367;
+const PORT = Number(process.env.PORT) || 8000; // �?process.env.PORT || 52367;
 
 async function startup() {
   // perform AI validations and then start server

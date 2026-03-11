@@ -104,7 +104,7 @@ jobs:
           if pm2 describe mamage-server >/dev/null 2>&1; then
             pm2 restart mamage-server --update-env
           else
-            pm2 start index.js --name mamage-server --update-env
+            pm2 start app.js --name mamage-server --update-env
           fi
 
           pm2 save
