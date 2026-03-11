@@ -1,29 +1,25 @@
-name: Deploy mamage-server
+﻿name: Deploy mamage-server
 
 on:
   push:
-    branches: ["main"] # 推 main 时自动部署
+    branches: ["main"]
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 在 GitHub Runner 上拉代码
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. 准备 Node 环境（提前发现依赖问题）
       - name: Use Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # 3. 在 CI 上先装一遍依赖，能早点暴露问题
       - name: Install dependencies
         run: npm ci || npm install
 
-      # 4. （可选）跑测试，没有测试会直接 continue
       - name: Run tests (optional)
         run: |
           if npm test ; then
@@ -32,13 +28,11 @@ jobs:
             echo "no tests or tests failed, continue anyway"
           fi
 
-      # 5. 配置 SSH agent，加载你在仓库 Secrets 里的 DEPLOY_SSH_KEY
       - name: Setup SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      # 6. 用 rsync 将当前仓库内容同步到 ECS（服务器不再访问 GitHub）
       - name: Sync code to server via rsync
         run: |
           rsync -avz --delete \
@@ -50,57 +44,21 @@ jobs:
             -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
 
-      # 7. 在服务器上安装依赖、验证环境变量并重启 pm2
       - name: Install, validate env & restart on server
         run: |
           ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
           set -e
-          set -x
-          cd /home/liwy/mamage_server || exit 2
+          cd /home/liwy/mamage_server
 
-          echo "==> Remote: print node & npm versions"
-          node -v || true
-          npm -v || true
+          npm ci --omit=dev --verbose || npm install --omit=dev --verbose
 
-          echo "==> Remote: pwd & ls"
-          pwd
-          ls -la
-
-          echo "==> Remote: npm registry"
-          npm config get registry || true
-
-          echo "==> Install dependencies on ECS (verbose)..."
-          # try npm ci first; if fails, show npm debug log for investigation
-          if npm ci --omit=dev --verbose ; then
-            echo "npm ci succeeded"
-          else
-            echo "npm ci failed, attempting npm install..."
-            npm install --omit=dev --verbose || true
-            echo "=== npm debug logs ==="
-            # show recent npm debug logs if present
-            ls -la ~/.npm/_logs || true
-            for f in ~/.npm/_logs/*debug*; do
-              echo "---- cat $f ----"; cat "$f" || true
-            done
-            # also try to show any other npm log
-            tail -n +1 ~/.npm/_logs/*.log || true
-            # fail the job after printing logs
-            exit 1
-          fi
-
-          echo "==> Validate environment variables..."
-          node -e "require('./lib/validateEnv').validateEnvironment(true)" || {
-            echo '❌ 环境变量检查失败，应用不会启动'
-            exit 1
-          }
-
-          echo "==> Run DB migrations..."
+          node -e "require('./lib/validateEnv').validateEnvironment(true)"
           npm run db:migrate
 
-          echo "==> Restart pm2 process..."
           export NODE_ENV=production
           export PORT=3000
+
           if pm2 describe mamage-server >/dev/null 2>&1; then
             pm2 restart mamage-server --update-env
           else
