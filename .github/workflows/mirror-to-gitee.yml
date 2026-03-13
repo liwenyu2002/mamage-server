@@ -1,0 +1,36 @@
+name: Mirror to Gitee
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push main branch to Gitee
+        env:
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GITEE_USERNAME:-}" ] || [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "Missing required secrets: GITEE_USERNAME and/or GITEE_TOKEN"
+            exit 1
+          fi
+
+          git remote remove gitee 2>/dev/null || true
+          git remote add gitee "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/liwenyu2002/mamage-server.git"
+          git push gitee main:main --force
