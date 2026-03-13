@@ -1,69 +1,114 @@
-﻿name: Deploy mamage-server
+name: Deploy mamage-server
 
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    env:
+      GIT_TERMINAL_PROMPT: "0"
+      GCM_INTERACTIVE: "Never"
+      GIT_ASKPASS: /bin/echo
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Use Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install dependencies
-        run: npm ci || npm install
-
-      - name: Run tests (optional)
+      - name: Network precheck
+        timeout-minutes: 2
         run: |
-          if npm test ; then
-            echo "tests ok"
+          set -euo pipefail
+          timeout --foreground 20s curl -I https://gitee.com >/dev/null
+          timeout --foreground 20s git ls-remote --heads https://gitee.com/liwenyu2002/mamage-server.git >/dev/null
+          timeout --foreground 20s curl -I https://github.com >/dev/null
+
+      - name: Fetch source (gitee first, github fallback)
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          SRC_DIR="${RUNNER_TEMP}/mamage-server-src"
+          ARCHIVE="${RUNNER_TEMP}/mamage-server-src.tgz"
+          URL_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_SHA}"
+          rm -rf "${SRC_DIR}" "${ARCHIVE}"
+          mkdir -p "${SRC_DIR}"
+
+          if [ -n "${GITEE_TOKEN:-}" ]; then
+            GITEE_URL="https://${GITEE_TOKEN}@gitee.com/liwenyu2002/mamage-server.git"
           else
-            echo "no tests or tests failed, continue anyway"
+            GITEE_URL="https://gitee.com/liwenyu2002/mamage-server.git"
           fi
 
-      - name: Setup SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          if timeout --foreground 60s git clone --depth=1 -b main "${GITEE_URL}" "${SRC_DIR}"; then
+            rsync -a --delete --exclude ".git/" "${SRC_DIR}/" "${GITHUB_WORKSPACE}/"
+          else
+            timeout --foreground 45s curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              --retry 1 --retry-delay 2 \
+              -o "${ARCHIVE}" "${URL_API}"
+            rm -rf "${SRC_DIR}"
+            mkdir -p "${SRC_DIR}"
+            tar -xzf "${ARCHIVE}" -C "${SRC_DIR}" --strip-components=1
+            rsync -a --delete "${SRC_DIR}/" "${GITHUB_WORKSPACE}/"
+          fi
 
-      - name: Sync code to server via rsync
+      - name: Sync workspace to deploy directory
         run: |
-          rsync -avz --delete \
+          set -euo pipefail
+          DEPLOY_DIR="/home/liwy/mamage_server"
+          mkdir -p "${DEPLOY_DIR}"
+          rsync -a --delete \
             --exclude ".git/" \
-            --exclude "node_modules/" \
             --exclude ".github/" \
             --exclude ".env" \
-            --exclude "Miniconda3-*" \
-            -e "ssh -p ${{ secrets.DEPLOY_PORT }} -o StrictHostKeyChecking=no" \
-            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/home/liwy/mamage_server/
+            "${GITHUB_WORKSPACE}/" "${DEPLOY_DIR}/"
 
-      - name: Install, validate env & restart on server
+      - name: Verify local Node.js
         run: |
-          ssh -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_PORT }} \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
-          set -e
+          set -euo pipefail
+          node -v
+          npm -v
+
+      - name: Install production dependencies
+        run: |
+          set -euo pipefail
           cd /home/liwy/mamage_server
+          npm config set registry https://registry.npmmirror.com
+          npm config set fetch-retries 2
+          npm config set fetch-retry-factor 2
+          npm config set fetch-retry-mintimeout 5000
+          npm config set fetch-retry-maxtimeout 20000
+          npm config set audit false
+          npm config set fund false
+          if ! timeout --foreground 8m npm ci --omit=dev --prefer-online --no-audit --no-fund --loglevel=verbose; then
+            timeout --foreground 8m npm install --omit=dev --prefer-online --no-audit --no-fund --loglevel=verbose
+          fi
 
-          npm ci --omit=dev --verbose || npm install --omit=dev --verbose
-
+      - name: Validate env and migrate
+        run: |
+          set -euo pipefail
+          cd /home/liwy/mamage_server
           node -e "require('./lib/validateEnv').validateEnvironment(true)"
           npm run db:migrate
 
+      - name: Restart server with pm2
+        run: |
+          set -euo pipefail
+          cd /home/liwy/mamage_server
           export NODE_ENV=production
           export PORT=3000
-
           if pm2 describe mamage-server >/dev/null 2>&1; then
             pm2 restart mamage-server --update-env
           else
             pm2 start app.js --name mamage-server --update-env
           fi
-
           pm2 save
-          EOF
