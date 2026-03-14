@@ -28,6 +28,38 @@ jobs:
           timeout --foreground 20s git ls-remote --heads https://gitee.com/liwenyu2002/mamage-server.git >/dev/null
           timeout --foreground 20s curl -I https://github.com >/dev/null
 
+      - name: Wait for current commit mirrored to Gitee
+        timeout-minutes: 5
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_SHA="${GITHUB_SHA}"
+          if [ -n "${GITEE_TOKEN:-}" ]; then
+            GITEE_URL="https://${GITEE_TOKEN}@gitee.com/liwenyu2002/mamage-server.git"
+          else
+            GITEE_URL="https://gitee.com/liwenyu2002/mamage-server.git"
+          fi
+
+          echo "Waiting for gitee main to reach ${TARGET_SHA} ..."
+          deadline=$((SECONDS + 240))
+          while true; do
+            REMOTE_SHA="$(timeout --foreground 20s git ls-remote --heads "${GITEE_URL}" main | awk '{print $1}' | tr -d '\r' || true)"
+            if [ -n "${REMOTE_SHA}" ]; then
+              echo "Current gitee/main: ${REMOTE_SHA}"
+              if [ "${REMOTE_SHA}" = "${TARGET_SHA}" ]; then
+                echo "Gitee mirror is up-to-date for this deployment."
+                break
+              fi
+            fi
+
+            if [ "${SECONDS}" -ge "${deadline}" ]; then
+              echo "Timed out waiting for gitee mirror. expected=${TARGET_SHA}, current=${REMOTE_SHA:-unknown}"
+              exit 1
+            fi
+            sleep 5
+          done
+
       - name: Fetch source (gitee first, github fallback)
         timeout-minutes: 3
         env:
