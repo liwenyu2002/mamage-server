@@ -26,7 +26,6 @@ jobs:
           set -euo pipefail
           timeout --foreground 20s curl -I https://gitee.com >/dev/null
           timeout --foreground 20s git ls-remote --heads https://gitee.com/liwenyu2002/mamage-server.git >/dev/null
-          timeout --foreground 20s curl -I https://github.com >/dev/null
 
       - name: Wait for current commit mirrored to Gitee
         timeout-minutes: 5
@@ -60,17 +59,14 @@ jobs:
             sleep 5
           done
 
-      - name: Fetch source (gitee first, github fallback)
+      - name: Fetch source from Gitee
         timeout-minutes: 3
         env:
-          GH_TOKEN: ${{ github.token }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           set -euo pipefail
           SRC_DIR="${RUNNER_TEMP}/mamage-server-src"
-          ARCHIVE="${RUNNER_TEMP}/mamage-server-src.tgz"
-          URL_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_SHA}"
-          rm -rf "${SRC_DIR}" "${ARCHIVE}"
+          rm -rf "${SRC_DIR}"
           mkdir -p "${SRC_DIR}"
 
           if [ -n "${GITEE_TOKEN:-}" ]; then
@@ -79,19 +75,8 @@ jobs:
             GITEE_URL="https://gitee.com/liwenyu2002/mamage-server.git"
           fi
 
-          if timeout --foreground 60s git clone --depth=1 -b main "${GITEE_URL}" "${SRC_DIR}"; then
-            rsync -a --delete --exclude ".git/" "${SRC_DIR}/" "${GITHUB_WORKSPACE}/"
-          else
-            timeout --foreground 45s curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              --retry 1 --retry-delay 2 \
-              -o "${ARCHIVE}" "${URL_API}"
-            rm -rf "${SRC_DIR}"
-            mkdir -p "${SRC_DIR}"
-            tar -xzf "${ARCHIVE}" -C "${SRC_DIR}" --strip-components=1
-            rsync -a --delete "${SRC_DIR}/" "${GITHUB_WORKSPACE}/"
-          fi
+          timeout --foreground 60s git clone --depth=1 -b main "${GITEE_URL}" "${SRC_DIR}"
+          rsync -a --delete --exclude ".git/" "${SRC_DIR}/" "${GITHUB_WORKSPACE}/"
 
       - name: Sync workspace to deploy directory
         run: |
