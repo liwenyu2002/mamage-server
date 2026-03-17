@@ -38,6 +38,38 @@ const CURRENT_PHOTOGRAPHER_ID = 2; // 暂时没在本文件里用，将来上传
 // ========= 1) 照片列表接口：支持 projectId + random =========
 // 如果挂在 /api/photos 下：GET /api/photos?projectId=1&limit=4&random=1&type=normal(可选)
 const { requirePermission, requireAdmin } = require('../lib/permissions');
+const MAX_SEARCH_PAGE_SIZE = 100;
+const MAX_SEARCH_TOKENS = 5;
+const MAX_SEARCH_QUERY_LEN = 64;
+
+function escapeLikeToken(input) {
+  return String(input || '').replace(/[#%_]/g, '#$&');
+}
+
+function tokenizeSearchQuery(query) {
+  const normalized = String(query || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_SEARCH_QUERY_LEN);
+  if (!normalized) return [];
+  return normalized
+    .split(' ')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, MAX_SEARCH_TOKENS);
+}
+
+function parsePhotoTags(rawTags) {
+  if (!rawTags) return null;
+  if (Array.isArray(rawTags)) return rawTags;
+  try {
+    const parsed = typeof rawTags === 'string' ? JSON.parse(rawTags) : rawTags;
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
 
 // GET /api/photos - require permission and organization scope
 router.get('/', requirePermission('photos.view'), async (req, res) => {
@@ -257,6 +289,186 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
 // 基于数据库的权限检查（使用 role_permissions 表）
 
 // 照片删除（仅 admin）
+// GET /api/photos/search?q=xxx&page=1&pageSize=20&projectId=1&sort=relevance|newest
+router.get('/search', requirePermission('photos.view'), async (req, res) => {
+  try {
+    let page = parseInt(req.query.page, 10);
+    let pageSize = parseInt(req.query.pageSize, 10);
+    const rawSort = String(req.query.sort || '').toLowerCase();
+    const sort = rawSort === 'newest' ? 'newest' : 'relevance';
+    const tokens = tokenizeSearchQuery(req.query.q || '');
+
+    if (!Number.isFinite(page) || page <= 0) page = 1;
+    if (!Number.isFinite(pageSize) || pageSize <= 0 || pageSize > MAX_SEARCH_PAGE_SIZE) {
+      pageSize = 20;
+    }
+
+    const hasProjectIdParam = req.query.projectId !== undefined && req.query.projectId !== null && String(req.query.projectId).trim() !== '';
+    let projectId = null;
+    if (hasProjectIdParam) {
+      projectId = parseInt(req.query.projectId, 10);
+      if (!Number.isFinite(projectId) || projectId <= 0) {
+        return res.status(400).json({ error: 'invalid projectId' });
+      }
+    }
+
+    const whereClauses = [];
+    const whereParams = [];
+
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null)
+      ? parseInt(req.user.organization_id, 10)
+      : null;
+    if (orgId === null) {
+      whereClauses.push('p.organization_id IS NULL');
+    } else {
+      whereClauses.push('p.organization_id = ?');
+      whereParams.push(orgId);
+    }
+
+    if (projectId) {
+      whereClauses.push('p.project_id = ?');
+      whereParams.push(projectId);
+    }
+
+    if (tokens.length > 0) {
+      tokens.forEach((token) => {
+        const escaped = escapeLikeToken(token);
+        const like = `%${escaped}%`;
+        whereClauses.push(`(
+          LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(p.description, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(CAST(p.tags AS CHAR), '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(p.url, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(p.thumb_url, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(u.student_no, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(CAST(p.photographer_id AS CHAR), '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#'
+        )`);
+        whereParams.push(like, like, like, like, like, like, like, like, like, like, like);
+      });
+    }
+
+    const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const baseFromSql = `
+      FROM photos p
+      LEFT JOIN users u ON p.photographer_id = u.id
+      LEFT JOIN projects pr ON p.project_id = pr.id
+    `;
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total ${baseFromSql} ${whereSql}`,
+      whereParams
+    );
+    const total = (countRows && countRows[0] && Number(countRows[0].total)) || 0;
+    const offset = (page - 1) * pageSize;
+
+    const scoreParts = [];
+    const scoreParams = [];
+    if (tokens.length > 0) {
+      tokens.forEach((token) => {
+        const escaped = escapeLikeToken(token);
+        const prefixLike = `${escaped}%`;
+        const containLike = `%${escaped}%`;
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#' THEN 30 ELSE 0 END`);
+        scoreParams.push(prefixLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#' THEN 26 ELSE 0 END`);
+        scoreParams.push(prefixLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#' THEN 24 ELSE 0 END`);
+        scoreParams.push(prefixLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#' THEN 24 ELSE 0 END`);
+        scoreParams.push(prefixLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#' THEN 16 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#' THEN 14 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#' THEN 12 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#' THEN 12 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.student_no, '')) LIKE ? ESCAPE '#' THEN 8 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(CAST(p.photographer_id AS CHAR), '')) LIKE ? ESCAPE '#' THEN 6 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#' THEN 6 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.description, '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(CAST(p.tags AS CHAR), '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.url, '')) LIKE ? ESCAPE '#' THEN 4 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.thumb_url, '')) LIKE ? ESCAPE '#' THEN 4 ELSE 0 END`);
+        scoreParams.push(containLike);
+      });
+    }
+    const relevanceScoreSql = scoreParts.length ? scoreParts.join(' + ') : '0';
+    const orderBySql = sort === 'relevance' && tokens.length > 0
+      ? 'ORDER BY relevanceScore DESC, p.created_at DESC, p.id DESC'
+      : 'ORDER BY p.created_at DESC, p.id DESC';
+
+    const selectSql = `
+      SELECT
+        p.id,
+        p.uuid,
+        p.project_id AS projectId,
+        pr.name AS projectName,
+        p.url,
+        p.thumb_url AS thumbUrl,
+        p.title,
+        p.description,
+        p.tags,
+        p.type,
+        p.photographer_id AS photographerId,
+        COALESCE(NULLIF(u.name, ''), NULLIF(u.nickname, '')) AS photographerName,
+        p.created_at AS createdAt,
+        p.updated_at AS updatedAt,
+        ${relevanceScoreSql} AS relevanceScore
+      ${baseFromSql}
+      ${whereSql}
+      ${orderBySql}
+      LIMIT ? OFFSET ?
+    `;
+    const selectParams = [...scoreParams, ...whereParams, pageSize, offset];
+    const [rows] = await pool.query(selectSql, selectParams);
+
+    const list = (rows || []).map((p) => ({
+      id: p.id,
+      uuid: p.uuid,
+      projectId: p.projectId,
+      projectName: p.projectName || null,
+      url: p.url ? buildUploadUrl(p.url) : null,
+      thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
+      title: p.title || null,
+      description: p.description || null,
+      tags: parsePhotoTags(p.tags),
+      type: p.type,
+      photographerId: p.photographerId || null,
+      photographerName: p.photographerName || null,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+      relevanceScore: Number(p.relevanceScore) || 0,
+    }));
+
+    const hasMore = page * pageSize < total;
+    res.json({
+      list,
+      page,
+      pageSize,
+      total,
+      hasMore,
+      q: String(req.query.q || '').trim(),
+      tokens,
+      sort,
+    });
+  } catch (err) {
+    console.error('GET /api/photos/search error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
   try {
     let ids = req.body.photoIds;
@@ -456,12 +668,48 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
 
     // counters per project
     const counters = {};
+    let addedFileCount = 0;
+
+    const getExtFromUrl = (u) => {
+      try {
+        return path.extname(new URL(u).pathname) || '';
+      } catch (e) {
+        return path.extname(String(u || '')) || '';
+      }
+    };
+
+    const appendRemoteFileToArchive = async (remoteUrl, nameInZip) => {
+      try {
+        const client = remoteUrl.startsWith('https') ? require('https') : require('http');
+        return await new Promise((resolve) => {
+          const req = client.get(remoteUrl, (response) => {
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+              archive.append(response, { name: nameInZip });
+              addedFileCount += 1;
+              resolve(true);
+              return;
+            }
+            console.warn('[photos.zip] remote file not available, skip:', remoteUrl, response.statusCode);
+            response.resume();
+            resolve(false);
+          });
+          req.on('error', (err) => {
+            console.error('[photos.zip] remote download error:', remoteUrl, err && err.message ? err.message : err);
+            resolve(false);
+          });
+        });
+      } catch (e) {
+        console.error('[photos.zip] append remote file failed:', e && e.message ? e.message : e);
+        return false;
+      }
+    };
 
     // add files with project-based sequential naming
     for (const r of rows) {
       try {
         if (!r.url) continue;
-        const urlStr = String(r.url);
+        const rawPath = String(r.url).trim();
+        if (!rawPath) continue;
 
         const projId = r.projectId || 0;
         const rawProjName = projMap[projId] || `project-${projId}`;
@@ -472,46 +720,40 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
         const seq = counters[projId];
 
         // 如果是远程 URL（例如 COS 上的图片），通过 HTTP(S) 下载并把响应流追加到 zip
-        if (/^https?:\/\//i.test(urlStr)) {
-          const ext = path.extname(urlStr) || '';
+        if (/^https?:\/\//i.test(rawPath)) {
+          const ext = getExtFromUrl(rawPath);
           const nameInZip = `${safeProjName}-${seq}${ext}`;
-          try {
-            const client = urlStr.startsWith('https') ? require('https') : require('http');
-            await new Promise((resolve) => {
-              const req = client.get(urlStr, (response) => {
-                if (response.statusCode >= 200 && response.statusCode < 300) {
-                  archive.append(response, { name: nameInZip });
-                } else {
-                  console.warn('[photos.zip] remote file not available, skip:', urlStr, response.statusCode);
-                  response.resume();
-                }
-                resolve();
-              });
-              req.on('error', (err) => {
-                console.error('[photos.zip] remote download error:', urlStr, err && err.message ? err.message : err);
-                resolve();
-              });
-            });
-          } catch (e) {
-            console.error('[photos.zip] append remote file failed:', e && e.message ? e.message : e);
-          }
+          await appendRemoteFileToArchive(rawPath, nameInZip);
         } else {
           // 本地文件处理（保留原有行为）
-          let rel = r.url.replace(/^\/uploads[\\\/]/, '');
+          let rel = rawPath.replace(/^\/?uploads[\\\/]/i, '');
           rel = rel.split('/').join(path.sep);
           const abs = path.join(uploadRoot, rel);
           if (!fs.existsSync(abs)) {
-            console.warn('[photos.zip] file not found, skip:', abs);
+            // local miss -> fallback to remote original URL
+            const fallbackRemoteUrl = buildUploadUrl(rawPath);
+            if (/^https?:\/\//i.test(String(fallbackRemoteUrl || ''))) {
+              const ext = getExtFromUrl(fallbackRemoteUrl);
+              const nameInZip = `${safeProjName}-${seq}${ext}`;
+              await appendRemoteFileToArchive(fallbackRemoteUrl, nameInZip);
+              continue;
+            }
+            console.warn('[photos.zip] file not found and no remote fallback URL:', rawPath);
             continue;
           }
 
           const ext = path.extname(abs) || '';
           const nameInZip = `${safeProjName}-${seq}${ext}`;
           archive.file(abs, { name: nameInZip });
+          addedFileCount += 1;
         }
       } catch (e) {
         console.error('add file to zip error:', e && e.message ? e.message : e);
       }
+    }
+
+    if (addedFileCount === 0) {
+      console.warn('[photos.zip] no files were added to archive, check photo urls and upload config');
     }
 
     // finalize

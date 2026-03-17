@@ -149,8 +149,6 @@ async function processUpload(req, res) {
     const filename = uuidv4() + ext;
     let relPath = `/uploads/${keyPrefix}/${filename}`.replace(/\\/g, '/');
 
-    // generate thumbnail buffer
-    const thumbBuffer = await sharp(originalBuffer).resize(800).jpeg({ quality: 80 }).toBuffer();
     const thumbName = 'thumb_' + filename;
     let thumbRel = `/uploads/${keyPrefix}/thumbs/${thumbName}`.replace(/\\/g, '/');
 
@@ -185,11 +183,19 @@ async function processUpload(req, res) {
 
     let remoteUrl = null;
     let remoteThumbUrl = null;
+    let thumbBuffer = null;
     try {
       const key = relPath.replace(/^\/+/, '');
       const thumbKey = thumbRel.replace(/^\/+/, '');
-      remoteUrl = await uploadBufferToCOS(originalBuffer, key);
-      remoteThumbUrl = await uploadBufferToCOS(thumbBuffer, thumbKey);
+
+      // Performance: upload original + generate/upload thumb concurrently.
+      const originalUploadPromise = uploadBufferToCOS(originalBuffer, key);
+      const thumbBufferPromise = sharp(originalBuffer).resize(800).jpeg({ quality: 80 }).toBuffer();
+      thumbBuffer = await thumbBufferPromise;
+      const thumbUploadPromise = uploadBufferToCOS(thumbBuffer, thumbKey);
+
+      [remoteUrl, remoteThumbUrl] = await Promise.all([originalUploadPromise, thumbUploadPromise]);
+
       // use remote URLs only for logging; keep DB values as relative paths
       console.log('[upload] uploaded to COS', remoteUrl, remoteThumbUrl);
       // keep relative DB paths (leading slash)
@@ -331,6 +337,18 @@ async function processUpload(req, res) {
       console.log('[upload] enqueued embedding generation', insertedId);
     } catch (e) {
       console.error('[upload] enqueue embedding failed:', e && e.message ? e.message : e);
+    }
+
+    // 异步执行人脸检测与聚类匹配（不阻塞上传响应）
+    try {
+      const faceAutoWorker = require('../lib/face_auto_worker');
+      faceAutoWorker.enqueueFaceAutoJob({
+        photoId: insertedId,
+        uploaderId: photographerId || null
+      });
+      console.log('[upload] enqueued face auto detect/cluster', insertedId);
+    } catch (e) {
+      console.error('[upload] enqueue face auto detect failed:', e && e.message ? e.message : e);
     }
 
     res.json(respPayload);

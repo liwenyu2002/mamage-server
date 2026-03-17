@@ -33,12 +33,33 @@ Node.js + Express + MySQL 的图片管理后端服务。
 可选（不影响服务启动）：
 
 - Python 3（用于相似图 embedding 的本地提取脚本）
+- Python 依赖（用于人脸检测自动推理）
 
 ## 2.2 安装依赖
 
 ```bash
 npm install
 ```
+
+如需启用后端自动人脸检测（`POST /api/faces/detect` 在不传 `faces` 时自动检测）：
+
+```bash
+npm run face:deps
+```
+
+如需把历史照片批量分析并写入 `photo_faces`：
+
+```bash
+npm run face:backfill -- --limit=100 --orgId=1
+```
+
+说明：
+- 上传新照片后，会自动异步执行人脸检测与聚类匹配（写入 `photo_faces` 和 `person_id`）。
+- 历史照片回填默认开启聚类匹配；如只想写框不做匹配，可加 `--withCluster=0`。
+- 同人容易被拆分时，可调低 `FACE_CLUSTER_MATCH_THRESHOLD`（例如 `0.32~0.40`）。
+- 若历史聚类结果已混乱，可用 `--resetOrg=1` 先清空该组织的人脸结果再全量重建。
+- 支持手动人物合并：`POST /api/persons/merge`。
+- 支持按组织在线调阈值（持久化 DB）：`GET/POST /api/faces/cluster/config`。
 
 ## 2.3 配置环境变量
 
