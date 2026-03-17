@@ -110,6 +110,18 @@ jobs:
             timeout --foreground 8m npm install --omit=dev --prefer-online --no-audit --no-fund --loglevel=verbose
           fi
 
+      - name: Install Python dependencies for face service
+        run: |
+          set -euo pipefail
+          cd /home/liwy/mamage_server
+          PY_BIN="$(command -v python3 || command -v python || true)"
+          if [ -z "${PY_BIN}" ]; then
+            echo "python interpreter not found"
+            exit 1
+          fi
+          "${PY_BIN}" -m pip install --user -U pip setuptools wheel
+          "${PY_BIN}" -m pip install --user -r scripts/requirements-face.txt
+
       - name: Validate env and migrate
         run: |
           set -euo pipefail
@@ -117,12 +129,28 @@ jobs:
           node -e "require('./lib/validateEnv').validateEnvironment(true)"
           npm run db:migrate
 
-      - name: Restart server with pm2
+      - name: Restart server and face service with pm2
         run: |
           set -euo pipefail
           cd /home/liwy/mamage_server
+          PY_BIN="$(command -v python3 || command -v python || true)"
+          if [ -z "${PY_BIN}" ]; then
+            echo "python interpreter not found"
+            exit 1
+          fi
           export NODE_ENV=production
           export PORT=3000
+          export FACE_DETECTOR_USE_SERVICE=1
+          export FACE_DETECTOR_SERVICE_URL=http://127.0.0.1:8009
+          export FACE_DETECTOR_SERVICE_REQUIRED=1
+
+          FACE_CMD="${PY_BIN} -m uvicorn scripts.face_embed_service:app --host 127.0.0.1 --port 8009"
+          if pm2 describe mamage-face-service >/dev/null 2>&1; then
+            pm2 restart mamage-face-service --update-env
+          else
+            pm2 start "${FACE_CMD}" --name mamage-face-service --cwd /home/liwy/mamage_server --update-env
+          fi
+
           if pm2 describe mamage-server >/dev/null 2>&1; then
             pm2 restart mamage-server --update-env
           else
