@@ -228,7 +228,7 @@ UPDATE users SET role = 'admin' WHERE email = 'dev@example.com';
 
 ## 5.4 分享/项目/照片查不到数据
 
-现象：数据库明明有数据，但接口返回空。
+现象：数据库明明有数据，但接口返回空1。
 
 处理：检查当前用户 `organization_id` 与数据的 `organization_id` 是否一致。
 
