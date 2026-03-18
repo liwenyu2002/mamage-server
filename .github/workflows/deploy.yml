@@ -110,6 +110,32 @@ jobs:
             timeout --foreground 8m npm install --omit=dev --prefer-online --no-audit --no-fund --loglevel=verbose
           fi
 
+      - name: Ensure CJK fonts for server-side screenshot
+        run: |
+          set -euo pipefail
+          has_cjk_font() {
+            fc-list | grep -Eqi 'Noto Sans CJK|Noto Serif CJK|WenQuanYi|Source Han Sans'
+          }
+
+          if has_cjk_font; then
+            echo "CJK font already available."
+          else
+            if sudo -n true 2>/dev/null; then
+              sudo -n apt-get update
+              sudo -n apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-color-emoji
+            else
+              echo "CJK fonts missing and passwordless sudo is unavailable."
+              exit 1
+            fi
+          fi
+
+          fc-cache -f
+          if ! has_cjk_font; then
+            echo "CJK fonts still missing after installation."
+            exit 1
+          fi
+          echo "CJK fonts ready for screenshot renderer."
+
       - name: Install Playwright Chromium
         run: |
           set -euo pipefail
