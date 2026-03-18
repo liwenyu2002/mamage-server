@@ -137,7 +137,7 @@ jobs:
           fi
 
           echo "Verifying preview renderer launch..."
-          node -e "const { renderNewsPreviewPng } = require('./lib/news_preview_renderer'); (async () => { const png = await renderNewsPreviewPng({ html: '<h1>ok</h1>', width: 640, height: 420, baseHref: 'http://127.0.0.1/' }); console.log('preview renderer ok, bytes=', png.length); })().catch((e)=>{ console.error(e && e.stack ? e.stack : e); process.exit(1); });"
+          timeout --foreground 90s node -e "const { renderNewsPreviewPng } = require('./lib/news_preview_renderer'); (async () => { const png = await renderNewsPreviewPng({ html: '<h1>ok</h1>', width: 640, height: 420, baseHref: 'http://127.0.0.1/' }); console.log('preview renderer ok, bytes=', png.length); process.exit(0); })().catch((e)=>{ console.error(e && e.stack ? e.stack : e); process.exit(1); });"
 
       - name: Install Python dependencies for face service
         run: |

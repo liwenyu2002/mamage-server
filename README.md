@@ -254,7 +254,7 @@ UPDATE users SET role = 'admin' WHERE email = 'dev@example.com';
 
 ## 7. 目录说明
 
-```txt
+```txt![1773827659866](image/README/1773827659866.png)![1773827662212](image/README/1773827662212.png)![1773827663915](image/README/1773827663915.png)
 app.js                    # 服务入口
 routes/                   # 路由层
 lib/                      # 权限/AI worker/相似度工具
