@@ -55,8 +55,8 @@ const facesRouter = require('./routes/faces');
 
 const app = express();
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 // ============ CORS锛堜繚鐣欎綘鐨勯€昏緫锛?============
 const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';

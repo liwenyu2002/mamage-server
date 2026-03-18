@@ -505,6 +505,8 @@ router.get('/:id', async (req, res) => {
     if (!Number.isFinite(id)) {
       return res.status(400).json({ error: 'Invalid project id' });
     }
+    const includeFaces = String(req.query.includeFaces || '').trim().toLowerCase();
+    const shouldIncludeFaces = includeFaces === '1' || includeFaces === 'true' || includeFaces === 'yes';
 
     await populateReqUserFromAuthIfPresent(req);
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
@@ -580,6 +582,58 @@ router.get('/:id', async (req, res) => {
       fullThumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
       description: p.description || null
     }));
+
+    if (shouldIncludeFaces && project.photos.length > 0) {
+      try {
+        let faceSql = `
+          SELECT
+            pf.photo_id AS photoId,
+            pf.person_id AS personId,
+            fp.name AS personName
+          FROM photo_faces pf
+          LEFT JOIN face_persons fp ON pf.person_id = fp.id
+          WHERE pf.project_id = ?
+        `;
+        const faceParams = [id];
+        if (orgId === null) {
+          faceSql += ' AND pf.organization_id IS NULL';
+        } else {
+          faceSql += ' AND pf.organization_id = ?';
+          faceParams.push(orgId);
+        }
+        faceSql += ' ORDER BY pf.photo_id ASC, pf.id ASC';
+
+        const [faceRows] = await pool.query(faceSql, faceParams);
+        const namesByPhotoId = {};
+
+        (faceRows || []).forEach((row) => {
+          const pid = row && row.photoId ? String(row.photoId) : '';
+          if (!pid) return;
+
+          let name = row && row.personName ? String(row.personName).trim() : '';
+          if (!name && row && row.personId) {
+            name = `人物#${row.personId}`;
+          }
+          if (!name) return;
+
+          if (!namesByPhotoId[pid]) namesByPhotoId[pid] = [];
+          if (!namesByPhotoId[pid].includes(name)) {
+            namesByPhotoId[pid].push(name);
+          }
+        });
+
+        project.photos = project.photos.map((p) => {
+          const names = namesByPhotoId[String(p.id)] || [];
+          return {
+            ...p,
+            faceNames: names,
+            personNames: names,
+          };
+        });
+      } catch (e) {
+        console.warn('[GET /api/projects/:id] includeFaces failed:', e && e.message ? e.message : e);
+      }
+    }
 
     // 根据照片列表选封面：优先 '合影' 且 被 AI 推荐('推荐') 的最新照片
     try {
