@@ -7,6 +7,8 @@
     "start": "node app.js",
     "db:export": "node scripts/export_db_artifacts.js",
     "db:migrate": "node scripts/run_migrations.js",
+    "db:seed": "node scripts/run_seed_minimal.js",
+    "db:bootstrap": "npm run db:migrate && npm run db:seed",
     "db:share": "node scripts/run_create_share_tables.js",
     "face:deps": "python -m pip install -r scripts/requirements-face.txt",
     "face:service": "python -m uvicorn scripts.face_embed_service:app --host 127.0.0.1 --port 8009",

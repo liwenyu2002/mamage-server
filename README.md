@@ -109,27 +109,25 @@ AI_VISION_API_KEY= 或 DASHSCOPE_API_KEY=
 AI_VISION_MODEL=qwen2-vl-72b-instruct
 ```
 
-## 2.4 初始化数据库
+## 2.4 初始化数据库（推荐：迁移 + 最小 Seed）
 
-1) 创建数据库：
+1. 创建数据库：
 
 ```bash
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS mamage DEFAULT CHARACTER SET utf8mb4;"
 ```
 
-2) 导入表结构：
+2. 一键执行迁移与最小开发数据注入：
 
 ```bash
-mysql -u root -p mamage < db/mamage_schema_only.sql
+npm run db:bootstrap
 ```
 
-3) 导入权限种子数据（必须）：
+这一步会执行：
+- `npm run db:migrate`：按 `scripts/migrations/*.sql` 做幂等迁移
+- `npm run db:seed`：注入最小开发数据（默认组织 + 默认开发管理员 + 角色权限）
 
-```bash
-mysql -u root -p mamage < db/role_permissions_seed.sql
-```
-
-如果不导入第 3 步，很多接口会返回 `403 forbidden`。
+如只想单独执行 seed，可运行：`npm run db:seed`
 
 ## 2.5 启动服务
 
@@ -157,39 +155,30 @@ curl http://localhost:8000/api/health
 
 ---
 
-## 3. 新开发者第一天建议流程
+## 3. 开发机快速调试（推荐）
 
-## 3.1 创建组织（若数据库为空）
+执行：
 
-`users.organization_id` 在当前 schema 为必填，建议先建组织：
-
-```sql
-INSERT INTO organizations(name, slug) VALUES ('默认组织', 'default-org');
+```bash
+npm run db:bootstrap
 ```
 
-## 3.2 注册一个账号
+默认会准备以下开发账号（可直接登录）：
+- `student_no`: `devadmin`
+- `email`: `dev-admin@example.com`
+- `password`: `Dev123456`
+- `role`: `admin`
 
-调用：`POST /api/users/register`，带上 `organization_id`。
+可通过环境变量覆盖：
+- `DEV_SEED_ORG_NAME`
+- `DEV_SEED_ORG_SLUG`
+- `DEV_SEED_ADMIN_NAME`
+- `DEV_SEED_ADMIN_STUDENT_NO`
+- `DEV_SEED_ADMIN_EMAIL`
+- `DEV_SEED_ADMIN_PASSWORD`
+- `DEV_SEED_ADMIN_RESET_PASSWORD=1`（已存在账号时重置密码）
 
-示例：
-
-```json
-{
-  "name": "dev-admin",
-  "password": "abc12345",
-  "student_no": "20260001",
-  "email": "dev@example.com",
-  "organization_id": 1
-}
-```
-
-## 3.3 开发期提升为管理员（可选）
-
-```sql
-UPDATE users SET role = 'admin' WHERE email = 'dev@example.com';
-```
-
-然后重新登录拿新 token。
+注意：`db:seed` 默认在 `NODE_ENV=production` 下拒绝执行；如确需执行，需显式设置 `SEED_ALLOW_IN_PROD=1`。
 
 ---
 
