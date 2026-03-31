@@ -37,10 +37,47 @@ const CURRENT_PHOTOGRAPHER_ID = 2; // 暂时没在本文件里用，将来上传
 
 // ========= 1) 照片列表接口：支持 projectId + random =========
 // 如果挂在 /api/photos 下：GET /api/photos?projectId=1&limit=4&random=1&type=normal(可选)
-const { requirePermission, requireAdmin } = require('../lib/permissions');
+const { requirePermission, requireAdmin, hasPermissionForUserId } = require('../lib/permissions');
 const MAX_SEARCH_PAGE_SIZE = 100;
 const MAX_SEARCH_TOKENS = 5;
 const MAX_SEARCH_QUERY_LEN = 64;
+
+async function populateReqUserFromAuthIfPresent(req) {
+  try {
+    if (req.user && req.user.id !== undefined) return;
+    const auth = req.get('authorization') || '';
+    const m = auth.match(/^Bearer\s+(.*)$/i);
+    if (!m) return;
+    const token = m[1];
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); } catch (e) { return; }
+    if (!payload || !payload.id) return;
+    const [rows] = await pool.query('SELECT id, organization_id, role FROM users WHERE id = ? LIMIT 1', [payload.id]);
+    if (!rows || rows.length === 0) return;
+    const u = rows[0];
+    const org = (u.organization_id !== undefined && u.organization_id !== null) ? Number(u.organization_id) : null;
+    req.user = { id: u.id, role: u.role || null, organization_id: org };
+  } catch (e) {
+    return;
+  }
+}
+
+function isDemoRequest(req) {
+  const raw = req && req.query ? String(req.query.demo || '').trim().toLowerCase() : '';
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'y';
+}
+
+function getScopedOrgIdFromReq(req) {
+  const authOrgId = req && req.user && req.user.organization_id !== undefined && req.user.organization_id !== null
+    ? parseInt(req.user.organization_id, 10)
+    : null;
+  if (authOrgId !== null && Number.isFinite(authOrgId)) return authOrgId;
+  if (!isDemoRequest(req)) return null;
+  const demoOrgRaw = process.env.DEMO_ORGANIZATION_ID || process.env.PUBLIC_ORGANIZATION_ID || '';
+  const demoOrgId = parseInt(String(demoOrgRaw).trim(), 10);
+  if (!Number.isFinite(demoOrgId) || demoOrgId <= 0) return null;
+  return demoOrgId;
+}
 
 function escapeLikeToken(input) {
   return String(input || '').replace(/[#%_]/g, '#$&');
@@ -290,8 +327,17 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
 
 // 照片删除（仅 admin）
 // GET /api/photos/search?q=xxx&page=1&pageSize=20&projectId=1&sort=relevance|newest
-router.get('/search', requirePermission('photos.view'), async (req, res) => {
+router.get('/search', async (req, res) => {
   try {
+    await populateReqUserFromAuthIfPresent(req);
+    const userId = req && req.user && req.user.id ? Number(req.user.id) : null;
+    if (userId) {
+      const ok = await hasPermissionForUserId(userId, 'photos.view');
+      if (!ok) return res.status(403).json({ error: 'forbidden' });
+    } else if (!isDemoRequest(req)) {
+      return res.status(401).json({ error: 'Missing Authorization Bearer token' });
+    }
+
     let page = parseInt(req.query.page, 10);
     let pageSize = parseInt(req.query.pageSize, 10);
     const rawSort = String(req.query.sort || '').toLowerCase();
@@ -315,9 +361,7 @@ router.get('/search', requirePermission('photos.view'), async (req, res) => {
     const whereClauses = [];
     const whereParams = [];
 
-    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null)
-      ? parseInt(req.user.organization_id, 10)
-      : null;
+    const orgId = getScopedOrgIdFromReq(req);
     if (orgId === null) {
       whereClauses.push('p.organization_id IS NULL');
     } else {
