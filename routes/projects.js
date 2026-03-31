@@ -485,10 +485,16 @@ router.get('/list', async (req, res) => {
     try {
       const projIds = rows.map(r => r.id).filter(Boolean);
       if (projIds.length) {
-        const [photos] = await pool.query(
-          `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?) ORDER BY created_at DESC, id DESC`,
-          [projIds]
-        );
+        let photoSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?)`;
+        const photoParams = [projIds];
+        if (orgId === null) {
+          photoSql += ' AND organization_id IS NULL';
+        } else {
+          photoSql += ' AND organization_id = ?';
+          photoParams.push(orgId);
+        }
+        photoSql += ' ORDER BY created_at DESC, id DESC';
+        const [photos] = await pool.query(photoSql, photoParams);
 
         const byProj = {};
         for (const ph of photos) {
@@ -501,6 +507,12 @@ router.get('/list', async (req, res) => {
           const cover = chooseCoverFromPhotos(pRows);
           item.coverUrl = cover.url ? buildUploadUrl(cover.url) : null;
           item.coverThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+          item.previewImages = pRows.slice(0, 6).map((ph) => ({
+            id: ph.id,
+            url: ph.url ? buildUploadUrl(ph.url) : null,
+            thumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null,
+            fullThumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null,
+          })).filter((ph) => ph && (ph.url || ph.thumbUrl));
         }
       }
     } catch (e) {
