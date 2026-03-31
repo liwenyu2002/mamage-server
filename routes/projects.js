@@ -38,6 +38,24 @@ async function populateReqUserFromAuthIfPresent(req) {
   }
 }
 
+function isDemoRequest(req) {
+  const raw = req && req.query ? String(req.query.demo || '').trim().toLowerCase() : '';
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'y';
+}
+
+function getScopedOrgIdFromReq(req) {
+  const authOrgId = req && req.user && req.user.organization_id !== undefined && req.user.organization_id !== null
+    ? parseInt(req.user.organization_id, 10)
+    : null;
+  if (authOrgId !== null && Number.isFinite(authOrgId)) return authOrgId;
+
+  if (!isDemoRequest(req)) return null;
+  const demoOrgRaw = process.env.DEMO_ORGANIZATION_ID || process.env.PUBLIC_ORGANIZATION_ID || '';
+  const demoOrgId = parseInt(String(demoOrgRaw).trim(), 10);
+  if (!Number.isFinite(demoOrgId) || demoOrgId <= 0) return null;
+  return demoOrgId;
+}
+
 // 上传根目录（和 upload.js 保持一致）
 const uploadRoot = path.join(__dirname, '..', 'uploads');
 
@@ -153,7 +171,7 @@ router.get('/', async (req, res) => {
     // try to populate req.user from the token so organization scoping works.
     await populateReqUserFromAuthIfPresent(req);
     // organization scoping: only show projects for user's organization
-    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const orgId = getScopedOrgIdFromReq(req);
 
     let mainSql = `
       SELECT
@@ -254,7 +272,7 @@ router.get('/scenery', async (req, res) => {
   try {
     // allow optional Bearer token even on this public route
     await populateReqUserFromAuthIfPresent(req);
-    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const orgId = getScopedOrgIdFromReq(req);
 
     // attempt to query by projects.type first
     let projSql = `
@@ -381,7 +399,7 @@ router.get('/list', async (req, res) => {
 
     // add organization scoping to whereClauses
     await populateReqUserFromAuthIfPresent(req);
-    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const orgId = getScopedOrgIdFromReq(req);
     if (orgId === null) {
       whereClauses.push('p.organization_id IS NULL');
     } else {
@@ -509,7 +527,7 @@ router.get('/:id', async (req, res) => {
     const shouldIncludeFaces = includeFaces === '1' || includeFaces === 'true' || includeFaces === 'yes';
 
     await populateReqUserFromAuthIfPresent(req);
-    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const orgId = getScopedOrgIdFromReq(req);
     let projSql = `
       SELECT
         p.id,
