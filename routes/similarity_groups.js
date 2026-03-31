@@ -1,7 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
-const { requirePermission } = require('../lib/permissions');
+const jwt = require('jsonwebtoken');
+const keys = require('../config/keys');
+const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
+const { requirePermission, hasPermissionForUserId } = require('../lib/permissions');
 
 function l2Normalize(arr) {
     let s = 0;
@@ -37,6 +40,44 @@ function tryParseEmbedding(raw) {
     const nums = parts.map(p => { const n = Number(p); return Number.isNaN(n) ? null : n; }).filter(x => x !== null);
     if (nums.length > 0) return nums;
     return null;
+}
+
+async function populateReqUserFromAuthIfPresent(req) {
+    try {
+        if (req.user && req.user.id !== undefined) return;
+        const auth = req.get('authorization') || '';
+        const m = auth.match(/^Bearer\s+(.*)$/i);
+        if (!m) return;
+        const token = m[1];
+        let payload;
+        try { payload = jwt.verify(token, JWT_SECRET); } catch (e) { return; }
+        if (!payload || !payload.id) return;
+        const [rows] = await pool.query('SELECT id, organization_id, role FROM users WHERE id = ? LIMIT 1', [payload.id]);
+        if (!rows || rows.length === 0) return;
+        const u = rows[0];
+        const org = (u.organization_id !== undefined && u.organization_id !== null) ? Number(u.organization_id) : null;
+        req.user = { id: u.id, role: u.role || null, organization_id: org };
+    } catch (e) {
+        return;
+    }
+}
+
+function isDemoRequest(req) {
+    const raw = req && req.query ? String(req.query.demo || '').trim().toLowerCase() : '';
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'y';
+}
+
+function getScopedOrgIdFromReq(req) {
+    const authOrgId = req && req.user && req.user.organization_id !== undefined && req.user.organization_id !== null
+        ? parseInt(req.user.organization_id, 10)
+        : null;
+    if (authOrgId !== null && Number.isFinite(authOrgId)) return authOrgId;
+
+    if (!isDemoRequest(req)) return null;
+    const demoOrgRaw = process.env.DEMO_ORGANIZATION_ID || process.env.PUBLIC_ORGANIZATION_ID || '';
+    const demoOrgId = parseInt(String(demoOrgRaw).trim(), 10);
+    if (!Number.isFinite(demoOrgId) || demoOrgId <= 0) return null;
+    return demoOrgId;
 }
 
 // GET /api/similarity/groups?projectId=12&threshold=0.8&minSize=2&mode=connected|clique&modelName=resnet50
@@ -220,10 +261,22 @@ module.exports = router;
 
 // 简化路由：只需 projectId，使用推荐默认参数
 // GET /api/similarity/groups/simple?projectId=12
-router.get('/groups/simple', requirePermission('photos.view'), async (req, res) => {
+router.get('/groups/simple', async (req, res) => {
     try {
+        await populateReqUserFromAuthIfPresent(req);
+        const demo = isDemoRequest(req);
+        const isAuthed = !!(req.user && req.user.id);
+        if (!isAuthed && !demo) {
+            return res.status(401).json({ error: 'Missing Authorization Bearer token' });
+        }
+        if (isAuthed) {
+            const ok = await hasPermissionForUserId(req.user.id, 'photos.view');
+            if (!ok) return res.status(403).json({ error: 'forbidden' });
+        }
+
         const projectId = req.query.projectId ? Number(req.query.projectId) : null;
         if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+        const orgId = getScopedOrgIdFromReq(req);
 
         // 推荐默认值
         const modelName = 'resnet50';
@@ -231,13 +284,20 @@ router.get('/groups/simple', requirePermission('photos.view'), async (req, res) 
         const minSize = 2;
         const mode = 'clique';
 
-        const sql = `
+        let sql = `
             SELECT p.id AS photo_id, e.embedding
             FROM ai_image_embeddings e
             JOIN photos p ON e.photo_id = p.id
             WHERE p.project_id = ? AND e.model_name = ?
         `;
-        const [rows] = await pool.query(sql, [projectId, modelName]);
+        const params = [projectId, modelName];
+        if (orgId === null) {
+            sql += ' AND p.organization_id IS NULL';
+        } else {
+            sql += ' AND p.organization_id = ?';
+            params.push(orgId);
+        }
+        const [rows] = await pool.query(sql, params);
         // DEBUG: log row count to help diagnose empty results
         try {
             console.log('[similarity_groups] projectId=', projectId, 'modelName=', modelName, 'rows=', rows && rows.length ? rows.length : 0);
