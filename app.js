@@ -58,16 +58,27 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
-// ============ CORS锛堜繚鐣欎綘鐨勯€昏緫锛?============
-const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+// ============ CORS ============
+const configuredCorsOrigins = String(process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const allowedCorsOrigins = new Set(configuredCorsOrigins.length
+  ? configuredCorsOrigins
+  : ['http://localhost:5173', 'http://127.0.0.1:5173']);
 app.use((req, res, next) => {
   const origin = req.get('origin');
-  const allow = process.env.CORS_ORIGIN || origin || corsOrigin;
-  if (allow) res.setHeader('Access-Control-Allow-Origin', allow);
+  const originAllowed = origin && allowedCorsOrigins.has(origin);
+  if (originAllowed) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') return res.status(204).end();
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
+  if (req.method === 'OPTIONS') {
+    return originAllowed || !origin ? res.status(204).end() : res.status(403).end();
+  }
   next();
 });
 
@@ -82,7 +93,7 @@ const staticUploadsDir = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWit
 app.use('/uploads', express.static(staticUploadsDir));
 // ============ 鏃ュ織 ============
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
+  if (process.env.REQUEST_LOGS !== '0') console.log(`${req.method} ${req.url}`);
   next();
 });
 
@@ -122,7 +133,6 @@ async function startup() {
 }
 
 startup();
-
 
 
 

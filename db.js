@@ -15,13 +15,18 @@ const DB_USER = keys.DB_USER || 'root';
 const DB_PASSWORD = keys.DB_PASSWORD || '';
 const DB_NAME = keys.DB_NAME || 'mamage';
 
-console.log('[db] runtime mysql config =', {
-  host: DB_HOST,
-  port: DB_PORT,
-  user: DB_USER,
-  password: DB_PASSWORD ? '********' : '(empty)',
-  database: DB_NAME
-});
+if (process.env.LOG_DB_CONFIG === '1' || process.env.NODE_ENV !== 'production') {
+  console.log('[db] runtime mysql config =', {
+    host: DB_HOST,
+    port: DB_PORT,
+    user: DB_USER,
+    password: DB_PASSWORD ? '********' : '(empty)',
+    database: DB_NAME
+  });
+}
+
+const DB_CONNECTION_LIMIT = Math.max(1, Number(process.env.DB_CONNECTION_LIMIT || 20));
+const DB_QUEUE_LIMIT = Math.max(0, Number(process.env.DB_QUEUE_LIMIT || 200));
 
 const pool = mysql.createPool({
   host: DB_HOST,
@@ -31,8 +36,10 @@ const pool = mysql.createPool({
   database: DB_NAME,
   charset: 'utf8mb4',
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+  connectionLimit: DB_CONNECTION_LIMIT,
+  queueLimit: DB_QUEUE_LIMIT,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0
 });
 
 // Ensure each new connection uses utf8mb4 character set at session level.
@@ -52,7 +59,7 @@ if (typeof pool.on === 'function') {
 // - 开发环境示例： 'http://localhost:3000'
 // - 部署时可改成你的域名 'https://cdn.example.com'
 // 也可以通过环境变量或 config/keys 覆盖：
-const UPLOAD_BASE_URL = keys.UPLOAD_BASE_URL || 'https://mamage-img-1325439253.cos.ap-beijing.myqcloud.com';
+const UPLOAD_BASE_URL = keys.UPLOAD_BASE_URL || keys.COS_BASE_URL || `http://localhost:${process.env.PORT || 8000}`;
 
 // 简化版 buildUploadUrl：
 // - 如果传入的是 http(s) 地址则直接返回

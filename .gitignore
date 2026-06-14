@@ -5,6 +5,8 @@ uploads/
 .env.example
 *.log
 .DS_Store
+__pycache__/
+*.pyc
 data/
 mysql-data/
 *.sql.gz

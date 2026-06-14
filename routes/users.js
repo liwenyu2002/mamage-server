@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 
 const keys = require('../config/keys');
-const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
+const JWT_SECRET = keys.JWT_SECRET;
 const crypto = require('crypto');
 
 // validation

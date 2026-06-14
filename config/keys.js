@@ -9,7 +9,7 @@ const get = (name, fallback = null) => {
 
 module.exports = {
   // JWT
-  JWT_SECRET: get('JWT_SECRET', 'please-change-this-secret'),
+  JWT_SECRET: get('JWT_SECRET', null),
 
   // Upload paths
   UPLOAD_ABS_DIR: get('UPLOAD_ABS_DIR', null),

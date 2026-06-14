@@ -1,13 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const { pool, buildUploadUrl } = require('../db');
-const uploadModule = require('./upload');
 const fs = require('fs');
 const path = require('path');
-const { v4: uuidv4 } = require('uuid');
 const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
-const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
+const cosStorage = require('../lib/cos_storage');
+const JWT_SECRET = keys.JWT_SECRET;
 // 与 upload.js/app.js 保持一致：优先使用 UPLOAD_ABS_DIR 环境变量（从 config/keys 读取）
 const uploadsAbsDir = keys.UPLOAD_ABS_DIR || path.join(__dirname, '..', 'uploads');
 const uploadRoot = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWith('/uploads')
@@ -30,17 +29,16 @@ const skipLocalFileCheck = (() => {
   return false;
 })();
 
-// 根据 users 表里实际的 id 改这两个值
-// 例如：你自己的 admin 用户 id = 1，测试摄影师 id = 2
-const CURRENT_ADMIN_ID = 1;
-const CURRENT_PHOTOGRAPHER_ID = 2; // 暂时没在本文件里用，将来上传照片时会用上
-
 // ========= 1) 照片列表接口：支持 projectId + random =========
 // 如果挂在 /api/photos 下：GET /api/photos?projectId=1&limit=4&random=1&type=normal(可选)
 const { requirePermission, requireAdmin, hasPermissionForUserId } = require('../lib/permissions');
 const MAX_SEARCH_PAGE_SIZE = 100;
 const MAX_SEARCH_TOKENS = 5;
 const MAX_SEARCH_QUERY_LEN = 64;
+const MAX_DELETE_PHOTOS = Math.max(1, Number(process.env.PHOTO_DELETE_MAX_IDS || 200));
+const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 50));
+const ZIP_REMOTE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_ZIP_REMOTE_TIMEOUT_MS || 20000));
+const ZIP_MAX_REMOTE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_MAX_REMOTE_BYTES || 1024 * 1024 * 1024));
 
 async function populateReqUserFromAuthIfPresent(req) {
   try {
@@ -106,6 +104,21 @@ function parsePhotoTags(rawTags) {
   } catch (e) {
     return null;
   }
+}
+
+function parseProjectPhotoIds(existing) {
+  if (!existing) return [];
+  if (Array.isArray(existing)) return existing.map(Number).filter(Number.isFinite);
+  if (typeof existing === 'string') {
+    try {
+      const parsed = JSON.parse(existing);
+      if (Array.isArray(parsed)) return parsed.map(Number).filter(Number.isFinite);
+    } catch (e) {
+      // fall back below
+    }
+    return existing.split(',').map((s) => Number(String(s).trim())).filter(Number.isFinite);
+  }
+  return [];
 }
 
 // GET /api/photos - require permission and organization scope
@@ -514,6 +527,9 @@ router.get('/search', async (req, res) => {
 });
 
 router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
+  let rows = [];
+  let foundIds = [];
+  let notFoundIds = [];
   try {
     let ids = req.body.photoIds;
 
@@ -525,77 +541,65 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
       .map((n) => parseInt(n, 10))
       .filter((n) => !Number.isNaN(n));
 
+    ids = Array.from(new Set(ids));
+
     // debug log: who requested deletion and which ids
     try { console.log('[photos.delete] requested by user=%s ids=%o', req.user && req.user.id, ids); } catch (e) { }
 
     if (ids.length === 0) {
       return res.status(400).json({ error: 'no valid photo id' });
     }
+    if (ids.length > MAX_DELETE_PHOTOS) {
+      return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_DELETE_PHOTOS });
+    }
 
-    // enforce organization scoping on delete
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-    let selSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl FROM photos WHERE id IN (?)`;
-    const selParams = [ids];
-    if (orgId === null) {
-      selSql += ' AND organization_id IS NULL';
-    } else {
-      selSql += ' AND organization_id = ?';
-      selParams.push(orgId);
-    }
-    const [rows] = await pool.query(selSql, selParams);
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
 
-    if (rows.length === 0) {
-      return res.json({ deletedIds: [], notFoundIds: ids });
-
-
-    }
-
-    const foundIds = rows.map((r) => r.id);
-    const notFoundIds = ids.filter((id) => !foundIds.includes(id));
-
-    // delete only within same organization (foundIds already filtered)
-    if (foundIds.length > 0) {
-      let delSql = 'DELETE FROM photos WHERE id IN (?)';
-      const delParams = [foundIds];
-      await pool.query(delSql, delParams);
-    }
-
-    // 同步更新 projects.photo_ids：对每个受影响的 project，移除这些 photo id
-    const byProject = {};
-    for (const r of rows) {
-      if (!r.projectId) continue;
-      byProject[r.projectId] = byProject[r.projectId] || [];
-      byProject[r.projectId].push(r.id);
-    }
-
-    for (const [projIdStr, removedIds] of Object.entries(byProject)) {
-      const projId = Number(projIdStr);
-      try {
-        const [projRows] = await pool.query(`SELECT photo_ids FROM projects WHERE id = ?`, [projId]);
-        if (projRows && projRows.length) {
-          let existing = projRows[0].photo_ids;
-          let arr = [];
-          if (existing) {
-            if (typeof existing === 'string') {
-              try {
-                const parsed = JSON.parse(existing);
-                if (Array.isArray(parsed)) arr = parsed.map(Number);
-                else arr = String(existing).split(',').map(s => s.trim()).filter(Boolean).map(Number);
-              } catch (e) {
-                arr = String(existing).split(',').map(s => s.trim()).filter(Boolean).map(Number);
-              }
-            } else if (Array.isArray(existing)) {
-              arr = existing.map(Number);
-            }
-          }
-
-          arr = arr.filter(id => !removedIds.includes(id));
-          const newVal = arr.length ? JSON.stringify(arr) : null;
-          await pool.query(`UPDATE projects SET photo_ids = ? WHERE id = ?`, [newVal, projId]);
-        }
-      } catch (e) {
-        console.error('failed to remove photo ids from project', projId, e.message);
+      let selSql = 'SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl FROM photos WHERE id IN (?)';
+      const selParams = [ids];
+      if (orgId === null) {
+        selSql += ' AND organization_id IS NULL';
+      } else {
+        selSql += ' AND organization_id = ?';
+        selParams.push(orgId);
       }
+      const [selectedRows] = await conn.query(selSql, selParams);
+      rows = selectedRows || [];
+
+      if (rows.length === 0) {
+        await conn.rollback();
+        return res.json({ deletedIds: [], notFoundIds: ids });
+      }
+
+      foundIds = rows.map((r) => r.id);
+      notFoundIds = ids.filter((id) => !foundIds.includes(id));
+
+      await conn.query('DELETE FROM photos WHERE id IN (?)', [foundIds]);
+
+      const byProject = {};
+      for (const r of rows) {
+        if (!r.projectId) continue;
+        byProject[r.projectId] = byProject[r.projectId] || [];
+        byProject[r.projectId].push(r.id);
+      }
+
+      for (const [projIdStr, removedIds] of Object.entries(byProject)) {
+        const projId = Number(projIdStr);
+        const [projRows] = await conn.query('SELECT photo_ids FROM projects WHERE id = ? FOR UPDATE', [projId]);
+        if (!projRows || !projRows.length) continue;
+        const arr = parseProjectPhotoIds(projRows[0].photo_ids).filter((id) => !removedIds.includes(id));
+        await conn.query('UPDATE projects SET photo_ids = ? WHERE id = ?', [arr.length ? JSON.stringify(arr) : null, projId]);
+      }
+
+      await conn.commit();
+    } catch (err) {
+      try { await conn.rollback(); } catch (e) { }
+      throw err;
+    } finally {
+      try { conn.release(); } catch (e) { }
     }
 
     // 删除文件（使用 promises 并汇总结果，避免大量逐文件日志）
@@ -616,9 +620,14 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
       }
     }
 
+    const storageDeleteResult = await cosStorage.deleteObjectsForPhotoRows(rows);
+    if (storageDeleteResult.errors && storageDeleteResult.errors.length) {
+      console.error('[photos.delete] COS delete errors:', storageDeleteResult.errors);
+    }
+
     for (const row of rows) {
       try {
-        if (row.url) {
+        if (row.url && !skipLocalFileCheck && !/^https?:\/\//i.test(String(row.url))) {
           let rel = row.url.replace(/^\/uploads[\\/]/, '');
           rel = rel.split('/').join(path.sep);
           const abs = path.join(uploadRoot, rel);
@@ -626,7 +635,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
           await tryUnlink(abs);
         }
 
-        if (row.thumbUrl) {
+        if (row.thumbUrl && !skipLocalFileCheck && !/^https?:\/\//i.test(String(row.thumbUrl))) {
           let relt = row.thumbUrl.replace(/^\/uploads[\\/]/, '');
           relt = relt.split('/').join(path.sep);
           const absThumb = path.join(uploadRoot, relt);
@@ -639,11 +648,16 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
 
     // 输出一条摘要日志；详细列表为 debug
     try {
-      console.info('[photos.delete] user=%s deletedPhotoIds=%o deletedFiles=%d notFoundFiles=%d', req.user && req.user.id, foundIds, deletedFiles.length, notFoundFiles.length);
+      console.info('[photos.delete] user=%s deletedPhotoIds=%o deletedFiles=%d notFoundFiles=%d storageDeleted=%d storageErrors=%d', req.user && req.user.id, foundIds, deletedFiles.length, notFoundFiles.length, (storageDeleteResult.deleted || []).length, (storageDeleteResult.errors || []).length);
       console.debug && console.debug('[photos.delete] deletedFiles=%o notFoundFiles=%o', deletedFiles, notFoundFiles);
     } catch (e) { }
 
-    res.json({ deletedIds: foundIds, notFoundIds });
+    res.json({
+      deletedIds: foundIds,
+      notFoundIds,
+      storageDeleted: storageDeleteResult.deleted || [],
+      storageErrors: storageDeleteResult.errors || [],
+    });
   } catch (err) {
     console.error('POST /api/photos/delete error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -651,16 +665,18 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
 });
 
 
-
-module.exports = router;
-
 // POST /api/photos/zip
 // 请求 body: { photoIds: [1,2,3], zipName: 'my-photos' }
 // 返回: application/zip attachment
 router.post('/zip', requirePermission('photos.view'), async (req, res) => {
   try {
-    const ids = Array.isArray(req.body.photoIds) ? req.body.photoIds.map(n => parseInt(n, 10)).filter(n => !Number.isNaN(n)) : [];
+    const ids = Array.isArray(req.body.photoIds)
+      ? Array.from(new Set(req.body.photoIds.map(n => parseInt(n, 10)).filter(n => !Number.isNaN(n))))
+      : [];
     if (ids.length === 0) return res.status(400).json({ error: 'photoIds must be a non-empty array' });
+    if (ids.length > MAX_ZIP_PHOTOS) {
+      return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
+    }
 
     // 延迟 require archiver，这样在缺少依赖时能返回友好提示
     let archiver;
@@ -697,14 +713,32 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     }
 
     // prepare zip
-    const zipName = req.body.zipName && String(req.body.zipName).trim() ? `${String(req.body.zipName).trim()}.zip` : `photos-${Date.now()}.zip`;
+    const rawZipName = req.body.zipName && String(req.body.zipName).trim() ? String(req.body.zipName).trim() : `photos-${Date.now()}`;
+    const safeZipBase = rawZipName.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_').slice(0, 96) || `photos-${Date.now()}`;
+    const zipName = safeZipBase.toLowerCase().endsWith('.zip') ? safeZipBase : `${safeZipBase}.zip`;
     res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(zipName)}"; filename*=UTF-8''${encodeURIComponent(zipName)}`);
+    res.setHeader('X-Accel-Buffering', 'no');
 
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const archive = archiver('zip', { store: true, zlib: { level: 0 } });
+    const activeRequests = new Set();
+    let clientClosed = false;
+
+    res.on('close', () => {
+      if (res.writableEnded) return;
+      clientClosed = true;
+      for (const activeReq of activeRequests) {
+        try { activeReq.destroy(new Error('CLIENT_CLOSED')); } catch (e) { }
+      }
+      try { archive.abort(); } catch (e) { }
+    });
+
     archive.on('error', (err) => {
       console.error('archive error:', err.message);
       try { res.status(500).end(); } catch (e) { }
+    });
+    archive.on('warning', (err) => {
+      console.warn('archive warning:', err && err.message ? err.message : err);
     });
 
     // pipe archive to response
@@ -724,11 +758,35 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
 
     const appendRemoteFileToArchive = async (remoteUrl, nameInZip) => {
       try {
+        if (clientClosed) return false;
         const client = remoteUrl.startsWith('https') ? require('https') : require('http');
+        const { PassThrough } = require('stream');
         return await new Promise((resolve) => {
           const req = client.get(remoteUrl, (response) => {
+            activeRequests.delete(req);
             if (response.statusCode >= 200 && response.statusCode < 300) {
-              archive.append(response, { name: nameInZip });
+              const contentLength = Number(response.headers['content-length'] || 0);
+              if (Number.isFinite(contentLength) && contentLength > ZIP_MAX_REMOTE_BYTES) {
+                console.warn('[photos.zip] remote file too large, skip:', remoteUrl, contentLength);
+                response.resume();
+                resolve(false);
+                return;
+              }
+              const passthrough = new PassThrough();
+              let received = 0;
+              response.on('data', (chunk) => {
+                received += chunk.length;
+                if (received > ZIP_MAX_REMOTE_BYTES) {
+                  console.warn('[photos.zip] remote stream exceeded max bytes, abort:', remoteUrl);
+                  response.destroy(new Error('REMOTE_FILE_TOO_LARGE'));
+                  passthrough.destroy(new Error('REMOTE_FILE_TOO_LARGE'));
+                }
+              });
+              response.on('error', (err) => {
+                console.error('[photos.zip] remote response error:', remoteUrl, err && err.message ? err.message : err);
+              });
+              response.pipe(passthrough);
+              archive.append(passthrough, { name: nameInZip, store: true });
               addedFileCount += 1;
               resolve(true);
               return;
@@ -737,7 +795,12 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
             response.resume();
             resolve(false);
           });
+          activeRequests.add(req);
+          req.setTimeout(ZIP_REMOTE_TIMEOUT_MS, () => {
+            req.destroy(new Error('REMOTE_DOWNLOAD_TIMEOUT'));
+          });
           req.on('error', (err) => {
+            activeRequests.delete(req);
             console.error('[photos.zip] remote download error:', remoteUrl, err && err.message ? err.message : err);
             resolve(false);
           });
@@ -750,6 +813,7 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
 
     // add files with project-based sequential naming
     for (const r of rows) {
+      if (clientClosed) break;
       try {
         if (!r.url) continue;
         const rawPath = String(r.url).trim();
@@ -788,7 +852,7 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
 
           const ext = path.extname(abs) || '';
           const nameInZip = `${safeProjName}-${seq}${ext}`;
-          archive.file(abs, { name: nameInZip });
+          archive.file(abs, { name: nameInZip, store: true });
           addedFileCount += 1;
         }
       } catch (e) {
@@ -801,7 +865,7 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     }
 
     // finalize
-    archive.finalize();
+    if (!clientClosed) archive.finalize();
   } catch (err) {
     console.error('POST /api/photos/zip error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -964,3 +1028,5 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+module.exports = router;

@@ -7,7 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
-const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
+const cosStorage = require('../lib/cos_storage');
+const JWT_SECRET = keys.JWT_SECRET;
 
 // 如果请求没有运行全量 authMiddleware，但前端仍然携带了 Bearer token，
 // 我们需要一个轻量的解析器来把用户 id 与 organization_id 加载进 req.user，
@@ -56,8 +57,11 @@ function getScopedOrgIdFromReq(req) {
   return demoOrgId;
 }
 
-// 上传根目录（和 upload.js 保持一致）
-const uploadRoot = path.join(__dirname, '..', 'uploads');
+// 上传根目录（和 upload.js/photos.js 保持一致）
+const uploadsAbsDir = keys.UPLOAD_ABS_DIR || path.join(__dirname, '..', 'uploads');
+const uploadRoot = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWith('/uploads')
+  ? uploadsAbsDir
+  : path.join(uploadsAbsDir, 'uploads');
 
 // 当部署到没有本地 uploads 的环境（例如 ECS）时，默认跳过本地文件删除/检查
 const skipLocalFileCheck = (() => {
@@ -884,104 +888,93 @@ router.delete('/:id', requirePermission('projects.delete'), async (req, res) => 
   }
 
   try {
-    // ensure project belongs to user's organization
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-    let ownSql = 'SELECT id FROM projects WHERE id = ?';
-    const ownParams = [id];
-    if (orgId === null) {
-      ownSql += ' AND organization_id IS NULL';
-    } else {
-      ownSql += ' AND organization_id = ?';
-      ownParams.push(orgId);
-    }
-    const [ownRows] = await pool.query(ownSql, ownParams);
-    if (!ownRows || ownRows.length === 0) return res.status(404).json({ error: 'project not found' });
+    let photos = [];
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
 
-    // 1. 查询该项目下所有照片（不再包含已删除的 local_path 列）
-    const [photos] = await pool.query(
-      `SELECT id, url, thumb_url AS thumbUrl
-       FROM photos
-       WHERE project_id = ?`,
-      [id]
-    );
-
-    // 2. 删除照片文件（原图 + 缩略图）
-    for (const p of photos) {
-
-      // 原图（通过 url 还原绝对路径）
-      if (p.url) {
-        try {
-          // 如果是远程 URL（COS）或配置为跳过本地检查，则不尝试删除本地文件
-          if (/^https?:\/\//i.test(String(p.url)) || skipLocalFileCheck) {
-            // nothing to remove locally
-          } else {
-            let rel = p.url.replace(/^\/uploads[\\\/]/, '');
-            rel = rel.split('/').join(path.sep);
-            const abs = path.join(uploadRoot, rel);
-            if (fs.existsSync(abs)) {
-              fs.unlink(abs, err => {
-                if (err) {
-                  console.error('unlink photo file error:', abs, err.message);
-                } else {
-                  console.log('photo file deleted:', abs);
-                }
-              });
-            }
-          }
-        } catch (e) {
-          console.error('check/unlink photo error:', p.url, e && e.message ? e.message : e);
-        }
+      let ownSql = 'SELECT id FROM projects WHERE id = ?';
+      const ownParams = [id];
+      if (orgId === null) {
+        ownSql += ' AND organization_id IS NULL';
+      } else {
+        ownSql += ' AND organization_id = ?';
+        ownParams.push(orgId);
+      }
+      ownSql += ' FOR UPDATE';
+      const [ownRows] = await conn.query(ownSql, ownParams);
+      if (!ownRows || ownRows.length === 0) {
+        await conn.rollback();
+        return res.status(404).json({ error: 'project not found' });
       }
 
-      // 缩略图（通过 thumbUrl 还原绝对路径）
-      if (p.thumbUrl) {
-        try {
-          if (/^https?:\/\//i.test(String(p.thumbUrl)) || skipLocalFileCheck) {
-            // skip local thumb delete
-          } else {
-            // 形如 /uploads/2025/11/16/thumbs/thumb_xxx.jpg
-            let rel = p.thumbUrl.replace(/^\/uploads[\\\/]/, ''); // 去掉 /uploads/
-            rel = rel.split('/').join(path.sep);
-            const absThumb = path.join(uploadRoot, rel);
-
-            if (fs.existsSync(absThumb)) {
-              fs.unlink(absThumb, err => {
-                if (err) {
-                  console.error('unlink thumb file error:', absThumb, err.message);
-                } else {
-                  console.log('thumb file deleted:', absThumb);
-                }
-              });
-            }
-          }
-        } catch (e) {
-          console.error('check/unlink thumb error:', p.thumbUrl, e && e.message ? e.message : e);
-        }
-      }
-    }
-
-    // 3. 删除 photos 表记录
-    if (photos.length > 0) {
-      await pool.query(
-        `DELETE FROM photos WHERE project_id = ?`,
+      const [photoRows] = await conn.query(
+        `SELECT id, url, thumb_url AS thumbUrl
+         FROM photos
+         WHERE project_id = ?`,
         [id]
       );
+      photos = photoRows || [];
+
+      if (photos.length > 0) {
+        await conn.query('DELETE FROM photos WHERE project_id = ?', [id]);
+      }
+
+      const [result] = await conn.query('DELETE FROM projects WHERE id = ?', [id]);
+      if (result.affectedRows === 0) {
+        await conn.rollback();
+        return res.status(404).json({ error: 'project not found' });
+      }
+
+      await conn.commit();
+    } catch (err) {
+      try { await conn.rollback(); } catch (e) { }
+      throw err;
+    } finally {
+      try { conn.release(); } catch (e) { }
     }
 
-    // 4. 删除 projects 表记录
-    const [result] = await pool.query(
-      `DELETE FROM projects WHERE id = ?`,
-      [id]
-    );
+    const storageDeleteResult = await cosStorage.deleteObjectsForPhotoRows(photos);
+    if (storageDeleteResult.errors && storageDeleteResult.errors.length) {
+      console.error('[projects.delete] COS delete errors:', storageDeleteResult.errors);
+    }
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'project not found' });
+    const deletedFiles = [];
+    const notFoundFiles = [];
+    async function tryUnlink(absPath) {
+      try {
+        await fs.promises.unlink(absPath);
+        deletedFiles.push(absPath);
+      } catch (err) {
+        if (err && err.code === 'ENOENT') notFoundFiles.push(absPath);
+        else console.error('[projects.delete] unlink error:', absPath, err && err.message ? err.message : err);
+      }
+    }
+
+    if (!skipLocalFileCheck) {
+      for (const p of photos) {
+        if (p.url && !/^https?:\/\//i.test(String(p.url))) {
+          let rel = p.url.replace(/^\/uploads[\\\/]/, '');
+          rel = rel.split('/').join(path.sep);
+          await tryUnlink(path.join(uploadRoot, rel));
+        }
+        if (p.thumbUrl && !/^https?:\/\//i.test(String(p.thumbUrl))) {
+          let rel = p.thumbUrl.replace(/^\/uploads[\\\/]/, '');
+          rel = rel.split('/').join(path.sep);
+          await tryUnlink(path.join(uploadRoot, rel));
+        }
+      }
     }
 
     res.json({
       success: true,
       deletedProjectId: id,
-      deletedPhotoIds: photos.map(p => p.id)
+      deletedPhotoIds: photos.map(p => p.id),
+      storageDeleted: storageDeleteResult.deleted || [],
+      storageErrors: storageDeleteResult.errors || [],
+      deletedFiles,
+      notFoundFiles
     });
   } catch (err) {
     console.error('DELETE /api/projects/:id error:', err);

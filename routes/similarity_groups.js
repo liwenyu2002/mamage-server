@@ -3,7 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
-const JWT_SECRET = keys.JWT_SECRET || 'please-change-this-secret';
+const JWT_SECRET = keys.JWT_SECRET;
 const { requirePermission, hasPermissionForUserId } = require('../lib/permissions');
 
 function l2Normalize(arr) {
