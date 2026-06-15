@@ -1,6 +1,15 @@
 ﻿// backend/app.js锛堝畬鏁寸ず渚嬶級
-// Load local .env in development (optional). Ensure .env is in .gitignore.
-try { require('dotenv').config(); } catch (e) { }
+// Load local .env. Fill variables that PM2 may have injected as empty strings.
+try {
+  const dotenvResult = require('dotenv').config();
+  if (dotenvResult && dotenvResult.parsed) {
+    for (const [key, value] of Object.entries(dotenvResult.parsed)) {
+      if (process.env[key] === undefined || process.env[key] === '') {
+        process.env[key] = value;
+      }
+    }
+  }
+} catch (e) { }
 // 涓存椂璋冭瘯锛氬 process.exit 杩涜杞婚噺鍖呰锛屾墦鍗拌皟鐢ㄦ爤浠ュ畾浣嶈皝瑙﹀彂浜嗛€€鍑恒€?// 璋冭瘯瀹屾垚鍚庝細绉婚櫎姝や唬鐮併€?// (Removed temporary process.exit wrapper used for debugging)
 // Load local .env in development (optional). Ensure .env is in .gitignore.
 
@@ -133,7 +142,6 @@ async function startup() {
 }
 
 startup();
-
 
 
 

@@ -4,7 +4,8 @@
 // - If you use a local .env file during development, add `require('dotenv').config()` before importing this module (app.js should load dotenv).
 
 const get = (name, fallback = null) => {
-  return process.env[name] !== undefined ? process.env[name] : fallback;
+  const value = process.env[name];
+  return value !== undefined && value !== null && value !== '' ? value : fallback;
 };
 
 module.exports = {
