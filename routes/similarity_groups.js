@@ -298,11 +298,6 @@ router.get('/groups/simple', async (req, res) => {
             params.push(orgId);
         }
         const [rows] = await pool.query(sql, params);
-        // DEBUG: log row count to help diagnose empty results
-        try {
-            console.log('[similarity_groups] projectId=', projectId, 'modelName=', modelName, 'rows=', rows && rows.length ? rows.length : 0);
-            if (rows && rows.length) console.log('[similarity_groups] sample ids=', rows.slice(0, 10).map(r => r.photo_id));
-        } catch (e) { /* ignore logging errors */ }
         if (!rows || rows.length === 0) return res.json({ modelName, groups: [] });
 
         const ids = [];
@@ -325,14 +320,6 @@ router.get('/groups/simple', async (req, res) => {
                 sim[i][j] = s; sim[j][i] = s;
             }
         }
-
-        // DEBUG: print top pair similarities to help diagnose why groups empty
-        try {
-            const pairsDbg = [];
-            for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) pairsDbg.push({ a: ids[i], b: ids[j], score: sim[i][j] });
-            pairsDbg.sort((x, y) => y.score - x.score);
-            console.log('[similarity_groups] top pairs sample=', pairsDbg.slice(0, 10));
-        } catch (e) { }
 
         const groups = [];
         if (mode === 'connected') {
