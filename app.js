@@ -42,7 +42,7 @@ async function runStartupValidations() {
       else console.log('鈿狅笍 Text AI validation:', res.text.reason);
     }
     if (res.vision) {
-      if (res.vision.ok) console.log('鉁?Vision AI key & model validated');
+      if (res.vision.ok) console.log(`鉁?Vision AI validated (${res.vision.provider || 'unknown'}${res.vision.model ? `/${res.vision.model}` : ''})`);
       else console.log('鈿狅笍 Vision AI validation:', res.vision.reason);
     }
   } catch (e) {
@@ -142,7 +142,6 @@ async function startup() {
 }
 
 startup();
-
 
 
 

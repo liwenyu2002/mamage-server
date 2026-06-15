@@ -1,47 +1,118 @@
 // ai_for_tags.js
-// 使用阿里云百炼 DashScope 的多模态模型（带视觉能力）给图片打标签
+// Photo vision analysis provider. Production can use local Ollama/Qwen2.5VL
+// without changing the upload worker contract.
 
-const { OpenAI } = require("openai");
-const http = require("http");
-const https = require("https");
-const fs = require("fs");
+const { OpenAI } = require('openai');
+const http = require('http');
+const https = require('https');
 
-// ⚠️ 强烈建议用环境变量：setx DASHSCOPE_API_KEY "你的Key"
-// 模块不会在加载时要求 API Key；在实际调用分析时会按需读取环境变量。
+const DEFAULT_DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
+const DEFAULT_OLLAMA_MODEL = 'qwen2.5vl:3b';
 
-// 视觉模型（根据你账号实际支持情况修改）
-const VISION_MODEL = process.env.AI_VISION_MODEL || "qwen2-vl-72b-instruct";
+const QUALITY_TAGS = new Set(['AI rejected', 'AI recommended']);
+const STANDARD_TAGS = [
+  '特写', '近景', '中景', '全景', '远景',
+  '长焦', '标准焦段', '超广角',
+  '室内', '室外', '操场', '教室', '会议室',
+  '人物', '无人', '单人', '多人', '动物',
+  '演讲', '运动', '鼓掌', '交流',
+  '讲座', '运动会', '出游', '办公', '上课', '庆典',
+  '正式', '严肃', '庆祝', '动感', '青春', '温馨', '喜悦',
+  '白天', '黑夜',
+];
+const STANDARD_TAG_SET = new Set(STANDARD_TAGS);
+const GENERIC_CUSTOM_TAGS = new Set([
+  '照片', '图片', '图像', '画面', '场景', '内容', '新闻', '活动',
+  '无', '无标签', 'none', 'null', 'undefined', 'unknown', 'reason',
+]);
 
-// 清理可能干扰的环境变量
-try {
-  delete process.env.OPENAI_API_KEY;
-} catch (e) {
-  // ignore
+const LOCAL_VISION_PROMPT = [
+  '你是高校新闻图片审核与打标助手。只根据图片中客观可见内容判断，不要猜测人物身份。',
+  '必须只返回一个 JSON 对象，不要 Markdown，不要解释。',
+  'JSON 字段固定为：description, qualityTag, standardTags, customTags。',
+  'description：20-40 字中文，客观新闻口吻。',
+  'qualityTag：只能是 "AI rejected"、"AI recommended" 或空字符串。',
+  'AI rejected 优先：严重模糊、明显过曝欠曝、严重歪斜、主体被大面积遮挡、构图极乱、人物闭眼或表情明显不适合严肃新闻。',
+  'AI recommended 仅用于主体清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
+  `standardTags：只能从这些固定词中选择，总量适中：${STANDARD_TAGS.join('、')}。`,
+  'standardTags 至少包含一个景别、一个焦段、一个人物数量或无人/动物判断。',
+  'customTags：0-3 个中文短标签，只写画面中客观可见且固定词未覆盖的具体内容；不要重复固定标签；不要写泛词。',
+  '最终标签总数不超过 10 个。'
+].join('\n');
+
+const DASHSCOPE_SYSTEM_PROMPT = [
+  '你是高校新闻中心的图片审核与打标助手。只输出两行，不要解释。',
+  '第1行：description=20-40字中文客观描述。',
+  '第2行：tags=[标签1,标签2,...]，总数不超过10。',
+  'AI rejected 优先：严重模糊、过曝欠曝、歪斜、主体遮挡、构图极乱、闭眼或表情不适合新闻。',
+  'AI recommended 仅用于清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
+  `固定标签优先：${STANDARD_TAGS.join('、')}。`,
+  '可以额外生成 0-3 个客观可见的中文短标签，不要写泛词。'
+].join('\n');
+
+function normalizeProvider(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return 'dashscope';
+  if (raw === 'local' || raw === 'ollama' || raw === 'qwen' || raw === 'qwen-local') return 'ollama';
+  if (raw === 'dashscope' || raw === 'aliyun' || raw === 'cloud') return 'dashscope';
+  if (raw === 'off' || raw === 'disabled' || raw === 'none') return 'off';
+  return raw;
 }
 
-// 按需创建 OpenAI 客户端，避免模块加载阶段依赖环境变量或抛出错误
-function getOpenAIClient() {
+function getVisionProvider() {
+  return normalizeProvider(process.env.AI_VISION_PROVIDER || process.env.VISION_PROVIDER || 'dashscope');
+}
+
+function getFallbackProvider(primary) {
+  const raw = String(process.env.AI_VISION_FALLBACK_PROVIDER || '').trim();
+  if (!raw) return null;
+  const fallback = normalizeProvider(raw);
+  if (!fallback || fallback === primary || fallback === 'off') return null;
+  return fallback;
+}
+
+function getDashScopeClient() {
   const key = process.env.AI_VISION_API_KEY || process.env.DASHSCOPE_API_KEY;
   if (!key) {
     throw new Error('Missing AI_VISION_API_KEY or DASHSCOPE_API_KEY in environment');
   }
-  return new OpenAI({ apiKey: key, baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1' });
+  return new OpenAI({
+    apiKey: key,
+    baseURL: process.env.DASHSCOPE_BASE_URL || DEFAULT_DASHSCOPE_BASE_URL,
+  });
 }
 
-/**
- * 简单 HEAD 请求，调试用：看 URL 能不能访问 / content-type 是否是图片
- */
+function getOllamaBaseUrl() {
+  return String(process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL).replace(/\/+$/, '');
+}
+
+function getOllamaModel() {
+  return process.env.OLLAMA_VISION_MODEL || process.env.LOCAL_VISION_MODEL || DEFAULT_OLLAMA_MODEL;
+}
+
+function getRequestTimeoutMs() {
+  const raw = Number(process.env.OLLAMA_REQUEST_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || 120000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120000;
+}
+
+function inferMime(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return 'image/jpeg';
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return 'image/jpeg';
+}
+
 async function headRequest(url) {
   return new Promise((resolve, reject) => {
     try {
       const u = new URL(url);
-      const lib = u.protocol === "https:" ? https : http;
-      const opts = { method: "HEAD" };
-      const req = lib.request(u, opts, (res) => {
-        const headers = res.headers || {};
-        resolve({ statusCode: res.statusCode, headers });
+      const lib = u.protocol === 'https:' ? https : http;
+      const req = lib.request(u, { method: 'HEAD' }, (res) => {
+        resolve({ statusCode: res.statusCode, headers: res.headers || {} });
       });
-      req.on("error", (err) => reject(err));
+      req.on('error', reject);
       req.end();
     } catch (e) {
       reject(e);
@@ -49,147 +120,138 @@ async function headRequest(url) {
   });
 }
 
-/**
- * 辅助：拉取二进制数据（验证 URL 真的是图片；也用于转 base64）
- */
 async function fetchBinary(url, opts = {}) {
   const maxRedirects = opts.maxRedirects || 5;
   const timeoutMs = opts.timeoutMs || 15000;
+  const maxBytes = opts.maxBytes || Number(process.env.AI_VISION_IMAGE_MAX_BYTES || 5 * 1024 * 1024);
 
   return new Promise((resolve, reject) => {
     let redirects = 0;
 
-    function _get(u) {
+    function get(u) {
       try {
-        const lib = u.protocol === "https:" ? https : http;
+        const lib = u.protocol === 'https:' ? https : http;
         const req = lib.get(u, { timeout: timeoutMs }, (res) => {
-          // 处理重定向
-          if (
-            res.statusCode >= 300 &&
-            res.statusCode < 400 &&
-            res.headers.location
-          ) {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             if (redirects >= maxRedirects) {
-              return reject(new Error("Too many redirects"));
+              res.resume();
+              reject(new Error('Too many redirects'));
+              return;
             }
-            redirects++;
+            redirects += 1;
             const next = new URL(res.headers.location, u);
             res.resume();
-            return _get(next);
+            get(next);
+            return;
           }
 
           if (res.statusCode !== 200) {
-            const err = new Error("HTTP status " + res.statusCode);
+            const err = new Error('HTTP status ' + res.statusCode);
             err.statusCode = res.statusCode;
             res.resume();
-            return reject(err);
+            reject(err);
+            return;
           }
 
           const chunks = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => resolve(Buffer.concat(chunks)));
-          res.on("error", (err) => reject(err));
+          let total = 0;
+          res.on('data', (chunk) => {
+            total += chunk.length;
+            if (total > maxBytes) {
+              req.destroy(new Error('Image exceeds max bytes'));
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+          res.on('error', reject);
         });
-
-        req.on("error", (err) => reject(err));
-        req.on("timeout", () => {
-          req.destroy(new Error("Request timeout"));
-        });
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('Request timeout')));
       } catch (e) {
         reject(e);
       }
     }
 
     try {
-      _get(new URL(url));
+      get(new URL(url));
     } catch (e) {
       reject(e);
     }
   });
 }
 
-/**
- * 真正发图给模型分析（多模态）
- * 关键点：
- *  1. 先本地拉图并转成 data URL，避免 DashScope 自己访问 ngrok 出问题；
- *  2. messages[1].content 是数组，包含 image_url 和 text 两块；
- *  3. 模型会真的“看图”，而不是只看 URL 文本。
- */
-async function analyze(imageUrl) {
-  // 先准备一个要真正发给模型用的 URL
-  let imageUrlForModel = imageUrl;
-
-  // 如果是 http/https 的网络地址，就先在本地拉下来转 base64
-  if (/^https?:\/\//i.test(imageUrl)) {
+async function postJson(url, payload, timeoutMs) {
+  return new Promise((resolve, reject) => {
     try {
-      const buf = await fetchBinary(imageUrl);
-      // 简单假定为 JPEG；如果以后有 PNG，可以用 HEAD 的 content-type 判断
-      const mime = "image/jpeg";
-      const base64 = buf.toString("base64");
-      imageUrlForModel = `data:${mime};base64,${base64}`;
-      // 如需调试可打开：
-      // console.log("[ai_for_tags] use data url, size=", base64.length);
+      const u = new URL(url);
+      const lib = u.protocol === 'https:' ? https : http;
+      const body = Buffer.from(JSON.stringify(payload));
+      const req = lib.request(u, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': body.length,
+        },
+        timeout: timeoutMs,
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`HTTP ${res.statusCode}: ${text.slice(0, 1000)}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(text));
+          } catch (e) {
+            reject(new Error('Invalid JSON response: ' + text.slice(0, 1000)));
+          }
+        });
+      });
+      req.on('timeout', () => req.destroy(new Error('Request timeout')));
+      req.on('error', reject);
+      req.write(body);
+      req.end();
     } catch (e) {
-      console.error(
-        "[ai_for_tags] failed to fetch & encode image, fallback to raw url:",
-        e && e.message ? e.message : e
-      );
-      imageUrlForModel = imageUrl;
+      reject(e);
+    }
+  });
+}
+
+function stripCodeFence(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
+
+function tryParseJsonObject(raw) {
+  const cleaned = stripCodeFence(raw);
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch (e) {
+    // try substring below
+  }
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    const slice = cleaned.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch (e) {
+      return null;
     }
   }
+  return null;
+}
 
-  const openai = getOpenAIClient();
-
-  const resp = await openai.chat.completions.create({
-    model: VISION_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "你是高校新闻中心的图片审核与打标助手。【首要任务：先判断 AI 选片标签】只要出现下面任一情况，都必须判定为 AI rejected（优先级最高）：1. 前景有大面积无关人物或物体遮挡主要活动内容，例如：画面边缘出现超近距离的头像或身体，占据画面约 1/4 以上，且遮挡了后方展板、演讲者或主要活动场景。2. 画面严重模糊、抖动、过曝或欠曝，影响辨认人物和活动内容。3. 拍摄明显歪斜、人物构图非常杂乱，主体不清晰。4. 人物表情明显夸张、搞怪或不严肃，不适合严肃新闻平台5.有人闭眼睛！！。只要满足以上任一条，即使场景本身是活动现场，也必须标记为 AI rejected，并且绝对不能使用 AI recommended。只有在：没有任何 AI rejected 条件，且构图清晰、主题明确、背景简洁、主体无遮挡，能一眼看出活动主题和典型瞬间时，才可以使用 AI recommended。若照片质量中等但没有明显问题，可以不写 AI recommended 和 AI rejected。【输出格式（必须严格遵守）】只输出两行内容，不要输出任何多余文字、解释或空行。第 1 行：以“description=”开头（半角等号），后面是中文描述，描述 30字左右，语气客观、新闻口吻。示例：description=校园活动现场，学生在展板前认真交流，画面清晰，氛围庄重有序。换行：以“tags=[”开头，以“]”结尾，使用半角中括号，标签之间用英文逗号分隔，标签总数不超过 10 个。示例：tags=[AI rejected,中景,标准焦段,室外,多人,交流,青春,白天]。注意：description= 和 tags=[ ] 的符号全部使用英文半角，严禁在这两行之外输出任何其他内容。【标签选择规则】1. AI选片标签（若触发则必须放在第一个）：AI rejected 或 AI recommended 二选一，或都不写。2. 其他标签优先从以下词汇中选，按实际情况挑选，不必全部使用：镜头关系：特写,近景,中景,全景,远景（至少写一个）；焦段（必写一个）：长焦,标准焦段,超广角；场景：室内,室外,操场,教室,会议室；人物：人物,无人,单人,多人,动物（如果是动物就写动物，不要写单人或者多人！）；动作：演讲,运动,鼓掌,交流；活动类型：讲座,运动会,出游,办公,上课,庆典；氛围：正式,严肃,庆祝,动感,青春,温馨,喜悦；时间：白天,黑夜（室内可省略）。3. 若画面还有非常突出的元素，上述标签未涵盖，可额外生成 0~3 个自定义标签，但总标签数不超过 10 个。",
-      },
-      {
-        role: "user",
-        content: [
-          {
-            // 关键：用 image_url + data URL，让服务端不再自己去拉图
-            type: "image_url",
-            image_url: { url: imageUrlForModel },
-          },
-          {
-            type: "text",
-            text:
-              "请严格按照系统提示要求，仅输出两行结果：第一行为description=开头的中文描述（约30字），第二行为tags=[...]格式的标签列表。不要输出任何多余内容。",
-          },
-        ],
-      },
-    ],
-  });
-
-  // 兼容两种返回格式：content 可能是 string，也可能是数组
-  const msg = resp.choices && resp.choices[0] && resp.choices[0].message;
-  let raw = "";
-
-  if (!msg) {
-    raw = "";
-  } else if (typeof msg.content === "string") {
-    raw = msg.content.trim();
-  } else if (Array.isArray(msg.content)) {
-    raw = msg.content
-      .map((p) => {
-        if (typeof p === "string") return p;
-        if (p && typeof p.text === "string") return p.text;
-        if (p && typeof p.output_text === "string") return p.output_text;
-        return "";
-      })
-      .join("")
-      .trim();
-  } else {
-    raw = String(msg.content || "").trim();
-  }
-
-  // 解析 description 和 tags
-  const lines = raw
+function parseLegacyLines(raw) {
+  const lines = String(raw || '')
     .split(/\r?\n/)
     .map((s) => s.trim())
     .filter(Boolean);
@@ -197,23 +259,219 @@ async function analyze(imageUrl) {
   let description = null;
   let tags = [];
 
-  if (lines.length > 0) {
-    const m = lines[0].match(/^description=(.*)$/i);
-    if (m) description = m[1].trim();
-  }
-
-  if (lines.length > 1) {
-    const m2 = lines[1].match(/^tags=\[(.*)\]$/i);
-    if (m2) {
-      tags = m2[1]
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
+  for (const line of lines) {
+    const descMatch = line.match(/^description\s*=\s*(.*)$/i);
+    if (descMatch && !description) {
+      description = descMatch[1].trim();
+      continue;
+    }
+    const tagMatch = line.match(/^tags\s*=\s*\[(.*)\]\s*$/i);
+    if (tagMatch) {
+      tags = tagMatch[1].split(',').map((s) => s.trim()).filter(Boolean);
     }
   }
 
-  return { raw, description, tags };
+  return { description, tags };
 }
 
-// 模块导出：保留核心分析函数供其他模块调用（例如 ai_tags_worker）
-module.exports = { analyze, headRequest, fetchBinary };
+function normalizeArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (e) {
+      // fall through
+    }
+    return trimmed.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function cleanTag(value) {
+  const tag = String(value || '')
+    .replace(/[\[\]{}"']/g, '')
+    .replace(/[，,。；;：:]/g, '')
+    .trim();
+  if (!tag) return '';
+  return tag.slice(0, 24);
+}
+
+function isUsefulCustomTag(tag) {
+  if (!tag) return false;
+  const lower = tag.toLowerCase();
+  if (GENERIC_CUSTOM_TAGS.has(lower) || GENERIC_CUSTOM_TAGS.has(tag)) return false;
+  if (QUALITY_TAGS.has(tag) || STANDARD_TAG_SET.has(tag)) return false;
+  if (!/[\u4e00-\u9fa5]/.test(tag)) return false;
+  if (tag.length > 12) return false;
+  return true;
+}
+
+function pushUnique(target, value, max) {
+  const tag = cleanTag(value);
+  if (!tag || target.includes(tag)) return;
+  if (target.length >= max) return;
+  target.push(tag);
+}
+
+function buildTagsFromStructured(parsed) {
+  const tags = [];
+  const qualityTag = cleanTag(parsed.qualityTag || parsed.quality || parsed.aiLabel || '');
+  if (QUALITY_TAGS.has(qualityTag)) pushUnique(tags, qualityTag, 10);
+
+  const standard = [
+    ...normalizeArray(parsed.standardTags),
+    ...normalizeArray(parsed.fixedTags),
+  ];
+  for (const item of standard) {
+    const tag = cleanTag(item);
+    if (STANDARD_TAG_SET.has(tag)) pushUnique(tags, tag, 10);
+  }
+
+  // Accept tags from models that do not split fixed/custom fields.
+  for (const item of normalizeArray(parsed.tags)) {
+    const tag = cleanTag(item);
+    if (QUALITY_TAGS.has(tag) || STANDARD_TAG_SET.has(tag) || isUsefulCustomTag(tag)) {
+      pushUnique(tags, tag, 10);
+    }
+  }
+
+  let customCount = 0;
+  for (const item of normalizeArray(parsed.customTags)) {
+    const tag = cleanTag(item);
+    if (!isUsefulCustomTag(tag)) continue;
+    pushUnique(tags, tag, 10);
+    customCount += 1;
+    if (customCount >= 3) break;
+  }
+
+  return tags.slice(0, 10);
+}
+
+function parseVisionResponse(raw) {
+  const parsed = tryParseJsonObject(raw);
+  if (parsed) {
+    const description = cleanDescription(parsed.description || parsed.caption || parsed.summary || '');
+    const tags = buildTagsFromStructured(parsed);
+    return { description, tags };
+  }
+
+  const legacy = parseLegacyLines(raw);
+  return {
+    description: cleanDescription(legacy.description || ''),
+    tags: buildTagsFromStructured({ tags: legacy.tags }),
+  };
+}
+
+function cleanDescription(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.slice(0, 160);
+}
+
+async function toModelDataUrl(imageUrl) {
+  if (!/^https?:\/\//i.test(imageUrl)) return imageUrl;
+  const buf = await fetchBinary(imageUrl);
+  const mime = inferMime(buf);
+  return `data:${mime};base64,${buf.toString('base64')}`;
+}
+
+async function analyzeWithDashScope(imageUrl) {
+  let imageUrlForModel = imageUrl;
+  try {
+    imageUrlForModel = await toModelDataUrl(imageUrl);
+  } catch (e) {
+    console.error('[ai_for_tags] failed to fetch image for DashScope, fallback to raw url:', e && e.message ? e.message : e);
+  }
+
+  const openai = getDashScopeClient();
+  const model = process.env.AI_VISION_MODEL || 'qwen-vl-max';
+  const resp = await openai.chat.completions.create({
+    model,
+    messages: [
+      { role: 'system', content: DASHSCOPE_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: imageUrlForModel } },
+          { type: 'text', text: '请严格按要求只输出两行：description=... 和 tags=[...]。' },
+        ],
+      },
+    ],
+  });
+
+  const msg = resp.choices && resp.choices[0] && resp.choices[0].message;
+  const raw = extractOpenAIMessageText(msg);
+  const parsed = parseVisionResponse(raw);
+  return { raw, ...parsed, provider: 'dashscope', model };
+}
+
+function extractOpenAIMessageText(msg) {
+  if (!msg) return '';
+  if (typeof msg.content === 'string') return msg.content.trim();
+  if (Array.isArray(msg.content)) {
+    return msg.content.map((p) => {
+      if (typeof p === 'string') return p;
+      if (p && typeof p.text === 'string') return p.text;
+      if (p && typeof p.output_text === 'string') return p.output_text;
+      return '';
+    }).join('').trim();
+  }
+  return String(msg.content || '').trim();
+}
+
+async function analyzeWithOllama(imageUrl) {
+  const buf = /^https?:\/\//i.test(imageUrl) ? await fetchBinary(imageUrl) : null;
+  if (!buf) throw new Error('Ollama provider requires an http(s) image URL');
+
+  const model = getOllamaModel();
+  const payload = {
+    model,
+    stream: false,
+    format: 'json',
+    prompt: LOCAL_VISION_PROMPT,
+    images: [buf.toString('base64')],
+    options: {
+      temperature: Number(process.env.OLLAMA_VISION_TEMPERATURE || 0.1),
+      num_predict: Number(process.env.OLLAMA_VISION_NUM_PREDICT || 512),
+    },
+  };
+
+  const resp = await postJson(`${getOllamaBaseUrl()}/api/generate`, payload, getRequestTimeoutMs());
+  if (resp && resp.error) throw new Error(resp.error);
+
+  const raw = String((resp && resp.response) || '').trim();
+  const parsed = parseVisionResponse(raw);
+  return { raw, ...parsed, provider: 'ollama', model };
+}
+
+async function analyzeWithProvider(provider, imageUrl) {
+  if (provider === 'off') return { raw: '', description: null, tags: [], provider: 'off', model: null };
+  if (provider === 'ollama') return analyzeWithOllama(imageUrl);
+  if (provider === 'dashscope') return analyzeWithDashScope(imageUrl);
+  throw new Error(`Unsupported AI_VISION_PROVIDER: ${provider}`);
+}
+
+async function analyze(imageUrl) {
+  const provider = getVisionProvider();
+  try {
+    return await analyzeWithProvider(provider, imageUrl);
+  } catch (err) {
+    const fallback = getFallbackProvider(provider);
+    if (!fallback) throw err;
+    console.error(`[ai_for_tags] ${provider} failed, fallback to ${fallback}:`, err && err.message ? err.message : err);
+    return analyzeWithProvider(fallback, imageUrl);
+  }
+}
+
+module.exports = {
+  analyze,
+  headRequest,
+  fetchBinary,
+  parseVisionResponse,
+  analyzeWithOllama,
+  analyzeWithDashScope,
+};

@@ -41,8 +41,18 @@ module.exports = {
         
         // AI 配置（可选）
         DASHSCOPE_API_KEY: process.env.DASHSCOPE_API_KEY || '',
+        AI_VISION_API_KEY: process.env.AI_VISION_API_KEY || '',
+        DASHSCOPE_BASE_URL: process.env.DASHSCOPE_BASE_URL || '',
         OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
+        AI_TEXT_API_KEY: process.env.AI_TEXT_API_KEY || '',
+        AI_TEXT_MODEL: process.env.AI_TEXT_MODEL || '',
+        AI_VISION_PROVIDER: process.env.AI_VISION_PROVIDER || 'dashscope',
         AI_VISION_MODEL: process.env.AI_VISION_MODEL || 'qwen2-vl-72b-instruct',
+        AI_VISION_FALLBACK_PROVIDER: process.env.AI_VISION_FALLBACK_PROVIDER || '',
+        AI_REQUEST_TIMEOUT_MS: process.env.AI_REQUEST_TIMEOUT_MS || '60000',
+        OLLAMA_BASE_URL: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
+        OLLAMA_VISION_MODEL: process.env.OLLAMA_VISION_MODEL || 'qwen2.5vl:3b',
+        OLLAMA_REQUEST_TIMEOUT_MS: process.env.OLLAMA_REQUEST_TIMEOUT_MS || '120000',
         
         // CORS
         CORS_ORIGIN: process.env.CORS_ORIGIN || 'http://localhost:5173'

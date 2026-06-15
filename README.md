@@ -104,9 +104,19 @@ COS_BASE_URL=https://<your-bucket>.cos.<region>.myqcloud.com
 OPENAI_API_KEY= 或 AI_TEXT_API_KEY=
 AI_TEXT_MODEL=
 
-# 视觉分析（AI 打标）
+# 视觉分析（AI 打标）：本地 Ollama（推荐，省云端视觉费用）
+AI_VISION_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_VISION_MODEL=qwen2.5vl:3b
+OLLAMA_REQUEST_TIMEOUT_MS=120000
+
+# 视觉分析（AI 打标）：DashScope 云端
+AI_VISION_PROVIDER=dashscope
 AI_VISION_API_KEY= 或 DASHSCOPE_API_KEY=
-AI_VISION_MODEL=qwen2-vl-72b-instruct
+AI_VISION_MODEL=qwen-vl-max
+
+# 可选：只有显式设置才会在本地失败后回退云端
+AI_VISION_FALLBACK_PROVIDER=
 ```
 
 ## 2.4 初始化数据库（推荐：迁移 + 最小 Seed）
