@@ -99,6 +99,13 @@ function getRequestTimeoutMs() {
   return Number.isFinite(raw) && raw > 0 ? raw : 120000;
 }
 
+function getOllamaKeepAlive() {
+  const raw = process.env.OLLAMA_KEEP_ALIVE;
+  if (raw === undefined || raw === null) return null;
+  const value = String(raw).trim();
+  return value || null;
+}
+
 function inferMime(buf) {
   if (!Buffer.isBuffer(buf) || buf.length < 12) return 'image/jpeg';
   if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
@@ -468,6 +475,8 @@ async function analyzeWithOllama(imageUrl) {
       num_predict: Number(process.env.OLLAMA_VISION_NUM_PREDICT || 512),
     },
   };
+  const keepAlive = getOllamaKeepAlive();
+  if (keepAlive) payload.keep_alive = keepAlive;
 
   const resp = await postJson(`${getOllamaBaseUrl()}/api/generate`, payload, getRequestTimeoutMs());
   if (resp && resp.error) throw new Error(resp.error);
