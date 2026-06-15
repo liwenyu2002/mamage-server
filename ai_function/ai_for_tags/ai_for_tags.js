@@ -26,15 +26,23 @@ const GENERIC_CUSTOM_TAGS = new Set([
   '照片', '图片', '图像', '画面', '场景', '内容', '新闻', '活动',
   '无', '无标签', 'none', 'null', 'undefined', 'unknown', 'reason',
 ]);
+const RECOMMENDED_QUALITY_VALUES = new Set([
+  'ai recommended', 'airecommended', 'recommended', 'recommend', 'good', 'selected',
+  'ai推荐', '推荐', '建议推荐', '精选', '可用', '优质',
+]);
+const REJECTED_QUALITY_VALUES = new Set([
+  'ai rejected', 'airejected', 'rejected', 'reject', 'bad', 'discard', 'discarded',
+  'ai拒绝', '拒绝', '不推荐', '建议不推荐', '淘汰', '废片', '不可用',
+]);
 
 const LOCAL_VISION_PROMPT = [
   '你是高校新闻图片审核与打标助手。只根据图片中客观可见内容判断，不要猜测人物身份。',
   '必须只返回一个 JSON 对象，不要 Markdown，不要解释。',
   'JSON 字段固定为：description, qualityTag, standardTags, customTags。',
   'description：20-40 字中文，客观新闻口吻。',
-  'qualityTag：只能是 "AI rejected"、"AI recommended" 或空字符串。',
+  'qualityTag：必须优先输出 "AI rejected" 或 "AI recommended"；只有完全无法判断质量时才输出空字符串。',
   'AI rejected 优先：严重模糊、明显过曝欠曝、严重歪斜、主体被大面积遮挡、构图极乱、人物闭眼或表情明显不适合严肃新闻。',
-  'AI recommended 仅用于主体清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
+  'AI recommended 用于主体清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
   `standardTags：只能从这些固定词中选择，总量适中：${STANDARD_TAGS.join('、')}。`,
   'standardTags 至少包含一个景别、一个焦段、一个人物数量或无人/动物判断。',
   '人物数量规则：单人=只有 1 个清晰可见真人；多人=有 2 个或以上清晰可见真人；无人=没有真人；动物=主体是动物。',
@@ -48,7 +56,7 @@ const DASHSCOPE_SYSTEM_PROMPT = [
   '第1行：description=20-40字中文客观描述。',
   '第2行：tags=[标签1,标签2,...]，总数不超过10。',
   'AI rejected 优先：严重模糊、过曝欠曝、歪斜、主体遮挡、构图极乱、闭眼或表情不适合新闻。',
-  'AI recommended 仅用于清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
+  'AI recommended 用于清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
   `固定标签优先：${STANDARD_TAGS.join('、')}。`,
   '人物数量：单人=1 个清晰可见真人；多人=2 个或以上清晰可见真人；不要把讲台、麦克风、海报、屏幕、阴影、背景形状当作人。',
   '可以额外生成 0-3 个客观可见的中文短标签，不要写泛词。'
@@ -310,11 +318,23 @@ function cleanTag(value) {
   return tag.slice(0, 24);
 }
 
+function normalizeQualityTag(value) {
+  const tag = cleanTag(value);
+  if (!tag) return '';
+  if (QUALITY_TAGS.has(tag)) return tag;
+  const normalized = tag.toLowerCase().replace(/\s+/g, '');
+  const spaced = tag.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (RECOMMENDED_QUALITY_VALUES.has(normalized) || RECOMMENDED_QUALITY_VALUES.has(spaced)) return 'AI recommended';
+  if (REJECTED_QUALITY_VALUES.has(normalized) || REJECTED_QUALITY_VALUES.has(spaced)) return 'AI rejected';
+  return '';
+}
+
 function isUsefulCustomTag(tag) {
   if (!tag) return false;
   const lower = tag.toLowerCase();
   if (GENERIC_CUSTOM_TAGS.has(lower) || GENERIC_CUSTOM_TAGS.has(tag)) return false;
   if (QUALITY_TAGS.has(tag) || STANDARD_TAG_SET.has(tag)) return false;
+  if (normalizeQualityTag(tag)) return false;
   if (!/[\u4e00-\u9fa5]/.test(tag)) return false;
   if (tag.length > 12) return false;
   return true;
@@ -329,8 +349,8 @@ function pushUnique(target, value, max) {
 
 function buildTagsFromStructured(parsed) {
   const tags = [];
-  const qualityTag = cleanTag(parsed.qualityTag || parsed.quality || parsed.aiLabel || '');
-  if (QUALITY_TAGS.has(qualityTag)) pushUnique(tags, qualityTag, 10);
+  const qualityTag = normalizeQualityTag(parsed.qualityTag || parsed.quality || parsed.aiLabel || '');
+  if (qualityTag) pushUnique(tags, qualityTag, 10);
 
   const standard = [
     ...normalizeArray(parsed.standardTags),
@@ -344,7 +364,10 @@ function buildTagsFromStructured(parsed) {
   // Accept tags from models that do not split fixed/custom fields.
   for (const item of normalizeArray(parsed.tags)) {
     const tag = cleanTag(item);
-    if (QUALITY_TAGS.has(tag) || STANDARD_TAG_SET.has(tag) || isUsefulCustomTag(tag)) {
+    const quality = normalizeQualityTag(tag);
+    if (quality) {
+      pushUnique(tags, quality, 10);
+    } else if (STANDARD_TAG_SET.has(tag) || isUsefulCustomTag(tag)) {
       pushUnique(tags, tag, 10);
     }
   }
