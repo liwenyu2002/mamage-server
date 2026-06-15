@@ -10,7 +10,7 @@ const DEFAULT_DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mo
 const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
 const DEFAULT_OLLAMA_MODEL = 'qwen2.5vl:3b';
 
-const QUALITY_TAGS = new Set(['AI rejected', 'AI recommended']);
+const QUALITY_TAGS = new Set(['AI rejected', 'AI medium', 'AI recommended']);
 const STANDARD_TAGS = [
   '特写', '近景', '中景', '全景', '远景',
   '长焦', '标准焦段', '超广角',
@@ -28,7 +28,12 @@ const GENERIC_CUSTOM_TAGS = new Set([
 ]);
 const RECOMMENDED_QUALITY_VALUES = new Set([
   'ai recommended', 'airecommended', 'recommended', 'recommend', 'good', 'selected',
-  'ai推荐', '推荐', '建议推荐', '精选', '可用', '优质',
+  'ai推荐', '推荐', '建议推荐', '精选', '优质',
+]);
+const MEDIUM_QUALITY_VALUES = new Set([
+  'ai medium', 'aimedium', 'medium', 'neutral', 'normal', 'average', 'ok', 'okay',
+  'acceptable', 'ordinary', 'fair', 'middle',
+  'ai中等', '中等', '中档', '普通', '一般', '尚可', '可用但普通', '一般可用',
 ]);
 const REJECTED_QUALITY_VALUES = new Set([
   'ai rejected', 'airejected', 'rejected', 'reject', 'bad', 'discard', 'discarded',
@@ -40,9 +45,10 @@ const LOCAL_VISION_PROMPT = [
   '必须只返回一个 JSON 对象，不要 Markdown，不要解释。',
   'JSON 字段固定为：description, qualityTag, standardTags, customTags。',
   'description：20-40 字中文，客观新闻口吻。',
-  'qualityTag：必须优先输出 "AI rejected" 或 "AI recommended"；只有完全无法判断质量时才输出空字符串。',
+  'qualityTag：必须输出 "AI recommended"、"AI medium" 或 "AI rejected" 三者之一。',
   'AI rejected 优先：严重模糊、明显过曝欠曝、严重歪斜、主体被大面积遮挡、构图极乱、人物闭眼或表情明显不适合严肃新闻。',
-  'AI recommended 用于主体清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
+  'AI recommended 要严格：不仅画质清晰，还要主体明确、构图好、审美舒服、有新闻展示价值。',
+  'AI medium 用于画质基本可用、内容清楚，但构图普通、审美一般、冲击力不强或只适合留档的照片。',
   `standardTags：只能从这些固定词中选择，总量适中：${STANDARD_TAGS.join('、')}。`,
   'standardTags 至少包含一个景别、一个焦段、一个人物数量或无人/动物判断。',
   '人物数量规则：单人=只有 1 个清晰可见真人；多人=有 2 个或以上清晰可见真人；无人=没有真人；动物=主体是动物。',
@@ -56,7 +62,8 @@ const DASHSCOPE_SYSTEM_PROMPT = [
   '第1行：description=20-40字中文客观描述。',
   '第2行：tags=[标签1,标签2,...]，总数不超过10。',
   'AI rejected 优先：严重模糊、过曝欠曝、歪斜、主体遮挡、构图极乱、闭眼或表情不适合新闻。',
-  'AI recommended 用于清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
+  'AI recommended 要严格：不仅画质清晰，还要主体明确、构图好、审美舒服、有新闻展示价值。',
+  'AI medium 用于画质基本可用、内容清楚，但构图普通、审美一般、冲击力不强或只适合留档的照片。',
   `固定标签优先：${STANDARD_TAGS.join('、')}。`,
   '人物数量：单人=1 个清晰可见真人；多人=2 个或以上清晰可见真人；不要把讲台、麦克风、海报、屏幕、阴影、背景形状当作人。',
   '可以额外生成 0-3 个客观可见的中文短标签，不要写泛词。'
@@ -325,6 +332,7 @@ function normalizeQualityTag(value) {
   const normalized = tag.toLowerCase().replace(/\s+/g, '');
   const spaced = tag.toLowerCase().replace(/\s+/g, ' ').trim();
   if (RECOMMENDED_QUALITY_VALUES.has(normalized) || RECOMMENDED_QUALITY_VALUES.has(spaced)) return 'AI recommended';
+  if (MEDIUM_QUALITY_VALUES.has(normalized) || MEDIUM_QUALITY_VALUES.has(spaced)) return 'AI medium';
   if (REJECTED_QUALITY_VALUES.has(normalized) || REJECTED_QUALITY_VALUES.has(spaced)) return 'AI rejected';
   return '';
 }
