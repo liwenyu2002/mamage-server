@@ -37,6 +37,8 @@ const LOCAL_VISION_PROMPT = [
   'AI recommended 仅用于主体清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
   `standardTags：只能从这些固定词中选择，总量适中：${STANDARD_TAGS.join('、')}。`,
   'standardTags 至少包含一个景别、一个焦段、一个人物数量或无人/动物判断。',
+  '人物数量规则：单人=只有 1 个清晰可见真人；多人=有 2 个或以上清晰可见真人；无人=没有真人；动物=主体是动物。',
+  '不要把讲台、麦克风、海报、屏幕、雕像、文字、阴影、模糊背景形状、残缺肢体当作人。只有一位演讲者或发言者时必须写单人，不能写多人。',
   'customTags：0-3 个中文短标签，只写画面中客观可见且固定词未覆盖的具体内容；不要重复固定标签；不要写泛词。',
   '最终标签总数不超过 10 个。'
 ].join('\n');
@@ -48,6 +50,7 @@ const DASHSCOPE_SYSTEM_PROMPT = [
   'AI rejected 优先：严重模糊、过曝欠曝、歪斜、主体遮挡、构图极乱、闭眼或表情不适合新闻。',
   'AI recommended 仅用于清晰、主题明确、构图稳、无遮挡、适合新闻展示的照片。',
   `固定标签优先：${STANDARD_TAGS.join('、')}。`,
+  '人物数量：单人=1 个清晰可见真人；多人=2 个或以上清晰可见真人；不要把讲台、麦克风、海报、屏幕、阴影、背景形状当作人。',
   '可以额外生成 0-3 个客观可见的中文短标签，不要写泛词。'
 ].join('\n');
 
@@ -348,7 +351,33 @@ function buildTagsFromStructured(parsed) {
     if (customCount >= 3) break;
   }
 
-  return tags.slice(0, 10);
+  return normalizePersonCountTags(tags.slice(0, 10), parsed.description || parsed.caption || parsed.summary || '');
+}
+
+function descriptionLooksSinglePerson(description) {
+  const text = String(description || '');
+  if (!text) return false;
+  if (/(多人|多位|多名|两位|两名|二人|三人|观众|听众|人群|合影|师生|学生们|大家|集体)/.test(text)) {
+    return false;
+  }
+  return /(一位|一名|一个|1位|1名).{0,16}(男性|女性|男子|女子|男士|女士|老师|教师|学生|嘉宾|专家|院士|演讲者|发言者|人员|人)/.test(text);
+}
+
+function normalizePersonCountTags(tags, description) {
+  let next = Array.isArray(tags) ? tags.slice() : [];
+  if (next.includes('动物')) {
+    return next.filter((tag) => !['人物', '无人', '单人', '多人'].includes(tag));
+  }
+  if (next.includes('无人')) {
+    return next.filter((tag) => !['人物', '单人', '多人'].includes(tag));
+  }
+  if (descriptionLooksSinglePerson(description) && next.includes('多人')) {
+    next = next.map((tag) => tag === '多人' ? '单人' : tag);
+  }
+  if (next.includes('单人') && next.includes('多人')) {
+    next = next.filter((tag) => tag !== '多人');
+  }
+  return Array.from(new Set(next)).slice(0, 10);
 }
 
 function parseVisionResponse(raw) {
@@ -362,7 +391,7 @@ function parseVisionResponse(raw) {
   const legacy = parseLegacyLines(raw);
   return {
     description: cleanDescription(legacy.description || ''),
-    tags: buildTagsFromStructured({ tags: legacy.tags }),
+    tags: buildTagsFromStructured({ description: legacy.description, tags: legacy.tags }),
   };
 }
 
