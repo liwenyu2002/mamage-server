@@ -10,7 +10,7 @@ const cosStorage = require('../lib/cos_storage');
 const { requirePermission } = require('../lib/permissions');
 
 const MAX_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_FILE_MB || 30)) * 1024 * 1024;
-const THUMB_WIDTH = Math.max(320, Number(process.env.UPLOAD_THUMB_MAX_WIDTH || 800));
+const THUMB_MAX_DIMENSION = Math.max(320, Number(process.env.UPLOAD_THUMB_MAX_DIMENSION || process.env.UPLOAD_THUMB_MAX_WIDTH || 800));
 const THUMB_QUALITY = Math.min(95, Math.max(50, Number(process.env.UPLOAD_THUMB_JPEG_QUALITY || 80)));
 const UPLOAD_CACHE_CONTROL = process.env.UPLOAD_CACHE_CONTROL || 'public, max-age=31536000, immutable';
 const SIGNED_UPLOAD_EXPIRES_SECONDS = Number(process.env.COS_SIGNED_UPLOAD_EXPIRES_SECONDS || 900);
@@ -269,7 +269,7 @@ async function getPhotographerName(photographerId) {
 async function createThumbBuffer(originalBuffer) {
   return sharp(originalBuffer, { failOn: 'none' })
     .rotate()
-    .resize({ width: THUMB_WIDTH, withoutEnlargement: true })
+    .resize({ width: THUMB_MAX_DIMENSION, height: THUMB_MAX_DIMENSION, fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: THUMB_QUALITY, mozjpeg: true })
     .toBuffer();
 }
