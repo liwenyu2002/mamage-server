@@ -40,6 +40,7 @@ const MAX_DELETE_PHOTOS = Math.max(1, Number(process.env.PHOTO_DELETE_MAX_IDS ||
 const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 50));
 const ZIP_REMOTE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_ZIP_REMOTE_TIMEOUT_MS || 20000));
 const ZIP_MAX_REMOTE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_MAX_REMOTE_BYTES || 1024 * 1024 * 1024));
+const ZIP_MAX_RENDER_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
 
 async function populateReqUserFromAuthIfPresent(req) {
   try {
@@ -156,6 +157,93 @@ function parsePhotoAdjustments(rawAdjustments) {
   } catch (e) {
     return null;
   }
+}
+
+function hasMeaningfulPhotoAdjustments(adjustments) {
+  const a = normalizePhotoAdjustments(adjustments);
+  if (!a) return false;
+  return Math.abs(a.brightness) >= 0.01
+    || Math.abs(a.contrast) >= 0.01
+    || Math.abs(a.whites) >= 0.01
+    || Math.abs(a.highlights) >= 0.01
+    || Math.abs(a.shadows) >= 0.01
+    || Math.abs(a.blacks) >= 0.01
+    || Math.abs(a.temperature) >= 0.01
+    || Math.abs(a.tint) >= 0.01;
+}
+
+function srgbToLinear(v) {
+  const x = v / 255;
+  return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(v) {
+  const x = clampNumber(v, 0, 1, 0);
+  const y = x <= 0.0031308 ? x * 12.92 : (1.055 * Math.pow(x, 1 / 2.4)) - 0.055;
+  return clampNumber(Math.round(y * 255), 0, 255, 0);
+}
+
+function smoothstep(edge0, edge1, value) {
+  if (edge0 === edge1) return value >= edge1 ? 1 : 0;
+  const x = clampNumber((value - edge0) / (edge1 - edge0), 0, 1, 0);
+  return x * x * (3 - (2 * x));
+}
+
+function zoneDeltaForLuma(luma, adjustments) {
+  const blacksMask = 1 - smoothstep(0.03, 0.28, luma);
+  const shadowsMask = 1 - smoothstep(0.18, 0.56, luma);
+  const highlightsMask = smoothstep(0.48, 0.86, luma);
+  const whitesMask = smoothstep(0.72, 0.98, luma);
+
+  return ((adjustments.blacks / 100) * 0.12 * blacksMask)
+    + ((adjustments.shadows / 100) * 0.18 * shadowsMask)
+    + ((adjustments.highlights / 100) * 0.16 * highlightsMask)
+    + ((adjustments.whites / 100) * 0.11 * whitesMask);
+}
+
+function applyToneToRgb(r, g, b, adjustments) {
+  const a = normalizePhotoAdjustments(adjustments);
+  const exposure = Math.pow(2, (a.brightness / 100) * 1.25);
+  const contrast = (a.contrast / 100) * 0.65;
+  const gains = Array.isArray(a.wbGains) ? a.wbGains : [1, 1, 1];
+  let lr = srgbToLinear(r) * gains[0] * exposure;
+  let lg = srgbToLinear(g) * gains[1] * exposure;
+  let lb = srgbToLinear(b) * gains[2] * exposure;
+  const luma = clampNumber((0.2126 * lr) + (0.7152 * lg) + (0.0722 * lb), 0, 1, 0);
+  const zoneDelta = zoneDeltaForLuma(luma, a);
+  lr = clampNumber(lr + zoneDelta, 0, 1, 0);
+  lg = clampNumber(lg + zoneDelta, 0, 1, 0);
+  lb = clampNumber(lb + zoneDelta, 0, 1, 0);
+  const applyContrast = (x) => clampNumber(x + contrast * (x - 0.5) * 4 * x * (1 - x), 0, 1, 0);
+  return [linearToSrgb(applyContrast(lr)), linearToSrgb(applyContrast(lg)), linearToSrgb(applyContrast(lb))];
+}
+
+async function renderAdjustedPhotoBuffer(inputBuffer, adjustments) {
+  const sharp = require('sharp');
+  const pipeline = sharp(inputBuffer, { failOn: 'none' })
+    .rotate()
+    .resize({
+      width: 4096,
+      height: 4096,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
+    .flatten({ background: '#ffffff' });
+  const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+  const channels = info.channels || 3;
+  for (let i = 0; i < data.length; i += channels) {
+    const [r, g, b] = applyToneToRgb(data[i], data[i + 1], data[i + 2], adjustments);
+    data[i] = r;
+    data[i + 1] = g;
+    data[i + 2] = b;
+  }
+  return sharp(data, {
+    raw: {
+      width: info.width,
+      height: info.height,
+      channels,
+    },
+  }).jpeg({ quality: 94, mozjpeg: true }).toBuffer();
 }
 
 function parseProjectPhotoIds(existing) {
@@ -748,7 +836,7 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     // 查询照片及其 project_id
     // enforce organization scoping for zip
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-    let zipSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, title FROM photos WHERE id IN (?)`;
+    let zipSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, title, adjustments FROM photos WHERE id IN (?)`;
     const zipParams = [ids];
     if (orgId === null) {
       zipSql += ' AND organization_id IS NULL';
@@ -869,6 +957,38 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
       }
     };
 
+    const fetchRemoteFileBuffer = async (remoteUrl) => {
+      const response = await fetch(remoteUrl, { timeout: ZIP_REMOTE_TIMEOUT_MS });
+      if (!response || !response.ok) {
+        console.warn('[photos.zip] remote file not available for render:', remoteUrl, response && response.status);
+        return null;
+      }
+      const contentLength = Number(response.headers && response.headers.get ? response.headers.get('content-length') : 0);
+      if (Number.isFinite(contentLength) && contentLength > ZIP_MAX_RENDER_SOURCE_BYTES) {
+        console.warn('[photos.zip] remote file too large for render:', remoteUrl, contentLength);
+        return null;
+      }
+      const buffer = await response.buffer();
+      if (buffer.length > ZIP_MAX_RENDER_SOURCE_BYTES) {
+        console.warn('[photos.zip] remote rendered source exceeded max bytes:', remoteUrl, buffer.length);
+        return null;
+      }
+      return buffer;
+    };
+
+    const appendAdjustedBufferToArchive = async (sourceBuffer, adjustments, nameInZip) => {
+      try {
+        if (clientClosed || !sourceBuffer || !hasMeaningfulPhotoAdjustments(adjustments)) return false;
+        const rendered = await renderAdjustedPhotoBuffer(sourceBuffer, adjustments);
+        archive.append(rendered, { name: nameInZip, store: true });
+        addedFileCount += 1;
+        return true;
+      } catch (e) {
+        console.error('[photos.zip] render adjusted photo failed:', e && e.message ? e.message : e);
+        return false;
+      }
+    };
+
     // add files with project-based sequential naming
     for (const r of rows) {
       if (clientClosed) break;
@@ -884,12 +1004,19 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
 
         counters[projId] = (counters[projId] || 0) + 1;
         const seq = counters[projId];
+        const adjustments = parsePhotoAdjustments(r.adjustments);
+        const shouldRenderAdjusted = hasMeaningfulPhotoAdjustments(adjustments);
 
         // 如果是远程 URL（例如 COS 上的图片），通过 HTTP(S) 下载并把响应流追加到 zip
         if (/^https?:\/\//i.test(rawPath)) {
           const ext = getExtFromUrl(rawPath);
-          const nameInZip = `${safeProjName}-${seq}${ext}`;
-          await appendRemoteFileToArchive(rawPath, nameInZip);
+          const originalNameInZip = `${safeProjName}-${seq}${ext}`;
+          const nameInZip = shouldRenderAdjusted ? `${safeProjName}-${seq}.jpg` : originalNameInZip;
+          if (shouldRenderAdjusted) {
+            const sourceBuffer = await fetchRemoteFileBuffer(rawPath);
+            if (sourceBuffer && await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
+          }
+          await appendRemoteFileToArchive(rawPath, originalNameInZip);
         } else {
           // 本地文件处理（保留原有行为）
           let rel = rawPath.replace(/^\/?uploads[\\\/]/i, '');
@@ -900,8 +1027,13 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
             const fallbackRemoteUrl = buildUploadUrl(rawPath);
             if (/^https?:\/\//i.test(String(fallbackRemoteUrl || ''))) {
               const ext = getExtFromUrl(fallbackRemoteUrl);
-              const nameInZip = `${safeProjName}-${seq}${ext}`;
-              await appendRemoteFileToArchive(fallbackRemoteUrl, nameInZip);
+              const originalNameInZip = `${safeProjName}-${seq}${ext}`;
+              const nameInZip = shouldRenderAdjusted ? `${safeProjName}-${seq}.jpg` : originalNameInZip;
+              if (shouldRenderAdjusted) {
+                const sourceBuffer = await fetchRemoteFileBuffer(fallbackRemoteUrl);
+                if (sourceBuffer && await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
+              }
+              await appendRemoteFileToArchive(fallbackRemoteUrl, originalNameInZip);
               continue;
             }
             console.warn('[photos.zip] file not found and no remote fallback URL:', rawPath);
@@ -909,8 +1041,16 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
           }
 
           const ext = path.extname(abs) || '';
-          const nameInZip = `${safeProjName}-${seq}${ext}`;
-          archive.file(abs, { name: nameInZip, store: true });
+          const originalNameInZip = `${safeProjName}-${seq}${ext}`;
+          const nameInZip = shouldRenderAdjusted ? `${safeProjName}-${seq}.jpg` : originalNameInZip;
+          if (shouldRenderAdjusted) {
+            const stat = await fs.promises.stat(abs).catch(() => null);
+            if (stat && stat.size <= ZIP_MAX_RENDER_SOURCE_BYTES) {
+              const sourceBuffer = await fs.promises.readFile(abs);
+              if (await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
+            }
+          }
+          archive.file(abs, { name: originalNameInZip, store: true });
           addedFileCount += 1;
         }
       } catch (e) {
