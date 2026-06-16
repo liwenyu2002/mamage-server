@@ -4,6 +4,7 @@ const { pool, buildUploadUrl } = require('../db');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
+const fetch = require('node-fetch');
 const keys = require('../config/keys');
 const cosStorage = require('../lib/cos_storage');
 const JWT_SECRET = keys.JWT_SECRET;
@@ -106,6 +107,53 @@ function parsePhotoTags(rawTags) {
   }
 }
 
+function clampNumber(value, min, max, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function normalizePhotoAdjustments(input) {
+  if (input === null) return null;
+  if (input === undefined) return undefined;
+
+  let parsed = input;
+  if (typeof input === 'string') {
+    try {
+      parsed = JSON.parse(input);
+    } catch (e) {
+      return undefined;
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+
+  const rawGains = Array.isArray(parsed.wbGains) ? parsed.wbGains : [];
+  const wbGains = [0, 1, 2].map((idx) => clampNumber(rawGains[idx], 0.5, 1.8, 1));
+  const source = String(parsed.source || 'manual').trim().slice(0, 24) || 'manual';
+
+  return {
+    version: 1,
+    engine: 'mamage-tone-v1',
+    brightness: clampNumber(parsed.brightness, -100, 100, 0),
+    contrast: clampNumber(parsed.contrast, -100, 100, 0),
+    temperature: clampNumber(parsed.temperature, -100, 100, 0),
+    tint: clampNumber(parsed.tint, -100, 100, 0),
+    wbGains,
+    source,
+    updatedAt: parsed.updatedAt ? String(parsed.updatedAt).slice(0, 64) : new Date().toISOString(),
+  };
+}
+
+function parsePhotoAdjustments(rawAdjustments) {
+  if (!rawAdjustments) return null;
+  if (typeof rawAdjustments === 'object') return normalizePhotoAdjustments(rawAdjustments) || null;
+  try {
+    return normalizePhotoAdjustments(JSON.parse(rawAdjustments)) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function parseProjectPhotoIds(existing) {
   if (!existing) return [];
   if (Array.isArray(existing)) return existing.map(Number).filter(Number.isFinite);
@@ -144,6 +192,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.thumb_url       AS thumbUrl,
         p.title,
         p.description,
+        p.adjustments,
         p.tags,
         p.type,
         p.photographer_id AS photographerId,
@@ -229,7 +278,8 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         ...p,
         url: resolveUrl(p.url),
         thumbUrl: resolveUrl(p.thumbUrl),
-        description: p.description || null
+        description: p.description || null,
+        adjustments: parsePhotoAdjustments(p.adjustments)
       };
     });
 
@@ -263,6 +313,7 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         p.thumb_url       AS thumbUrl,
         p.title,
         p.description,
+        p.adjustments,
         p.tags,
         p.type,
         p.photographer_id AS photographerId,
@@ -325,7 +376,8 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         ...p,
         url: resolveUrl(p.url),
         thumbUrl: resolveUrl(p.thumbUrl),
-        description: p.description || null
+        description: p.description || null,
+        adjustments: parsePhotoAdjustments(p.adjustments)
       };
     });
 
@@ -476,6 +528,7 @@ router.get('/search', async (req, res) => {
         p.thumb_url AS thumbUrl,
         p.title,
         p.description,
+        p.adjustments,
         p.tags,
         p.type,
         p.photographer_id AS photographerId,
@@ -500,6 +553,7 @@ router.get('/search', async (req, res) => {
       thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
       title: p.title || null,
       description: p.description || null,
+      adjustments: parsePhotoAdjustments(p.adjustments),
       tags: parsePhotoTags(p.tags),
       type: p.type,
       photographerId: p.photographerId || null,
@@ -873,6 +927,66 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
 });
 
 
+// GET /api/photos/:id/pixel-source
+// Authenticated same-origin image bytes for front-end canvas analysis.
+router.get('/:id/pixel-source', requirePermission('photos.view'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
+
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    let sql = 'SELECT id, url, thumb_url AS thumbUrl FROM photos WHERE id = ?';
+    const params = [id];
+    if (orgId === null) {
+      sql += ' AND organization_id IS NULL';
+    } else {
+      sql += ' AND organization_id = ?';
+      params.push(orgId);
+    }
+    sql += ' LIMIT 1';
+
+    const [rows] = await pool.query(sql, params);
+    if (!rows || rows.length === 0) return res.status(404).json({ error: 'photo not found' });
+
+    const row = rows[0];
+    const variant = String(req.query.variant || 'thumb').toLowerCase();
+    const raw = variant === 'original' ? (row.url || row.thumbUrl) : (row.thumbUrl || row.url);
+    if (!raw) return res.status(404).json({ error: 'photo source not found' });
+
+    const built = /^https?:\/\//i.test(String(raw)) ? String(raw) : buildUploadUrl(raw);
+    const targetUrl = /^https?:\/\//i.test(built)
+      ? built
+      : `${req.protocol}://${req.get('host')}${String(built).startsWith('/') ? built : `/${built}`}`;
+    const response = await fetch(targetUrl, {
+      timeout: Math.max(1000, Number(process.env.PHOTO_PIXEL_SOURCE_TIMEOUT_MS || 15000)),
+      headers: { 'User-Agent': 'MaMage pixel analyzer' },
+    });
+
+    if (!response.ok) {
+      return res.status(502).json({ error: 'photo source unavailable', status: response.status });
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    if (!/^image\//i.test(contentType)) {
+      return res.status(415).json({ error: 'photo source is not an image' });
+    }
+
+    const contentLength = response.headers.get('content-length');
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    response.body.on('error', (err) => {
+      console.error('pixel-source stream error:', err && err.message ? err.message : err);
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    response.body.pipe(res);
+  } catch (err) {
+    console.error('GET /api/photos/:id/pixel-source error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 // 获取单张照片（包含 photographerName）
 // GET /api/photos/:id
@@ -891,6 +1005,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         p.thumb_url AS thumbUrl,
         p.title,
         p.description,
+        p.adjustments,
         p.tags,
         p.type,
         p.photographer_id AS photographerId,
@@ -934,6 +1049,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       thumbUrl: resolveUrl(p.thumbUrl),
       title: p.title,
       description: p.description || null,
+      adjustments: parsePhotoAdjustments(p.adjustments),
       tags: parsedTags,
       type: p.type,
       photographerId: p.photographerId || null,
@@ -955,7 +1071,7 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
 
-    const { description, tags } = req.body || {};
+    const { description, tags, adjustments } = req.body || {};
 
     const updates = [];
     const params = [];
@@ -988,6 +1104,15 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
       params.push(tagsVal);
     }
 
+    if (typeof adjustments !== 'undefined') {
+      const normalizedAdjustments = normalizePhotoAdjustments(adjustments);
+      if (adjustments !== null && !normalizedAdjustments) {
+        return res.status(400).json({ error: 'invalid adjustments' });
+      }
+      updates.push('adjustments = ?');
+      params.push(normalizedAdjustments ? JSON.stringify(normalizedAdjustments) : null);
+    }
+
     if (updates.length === 0) return res.status(400).json({ error: 'nothing to update' });
 
     // enforce organization scoping: ensure photo belongs to user's organization
@@ -1007,7 +1132,7 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     const sql = `UPDATE photos SET ${updates.join(', ')} WHERE id = ?`;
     await pool.query(sql, params);
 
-    const [rows] = await pool.query('SELECT id, url, thumb_url AS thumbUrl, title, description, tags FROM photos WHERE id = ?', [id]);
+    const [rows] = await pool.query('SELECT id, url, thumb_url AS thumbUrl, title, description, adjustments, tags FROM photos WHERE id = ?', [id]);
     if (!rows || rows.length === 0) return res.status(404).json({ error: 'photo not found' });
 
     const p = rows[0];
@@ -1021,6 +1146,7 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
       thumbUrl: buildUploadUrl(p.thumbUrl),
       title: p.title,
       description: p.description,
+      adjustments: parsePhotoAdjustments(p.adjustments),
       tags: parsedTags
     });
   } catch (err) {

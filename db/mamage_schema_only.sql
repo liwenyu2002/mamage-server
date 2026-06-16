@@ -181,6 +181,7 @@ CREATE TABLE `photos` (
   `capture_time` date DEFAULT NULL,
   `photographer_id` int unsigned DEFAULT NULL COMMENT '上传该照片的摄影师用户id，关联 users.id',
   `description` text,
+  `adjustments` json DEFAULT NULL COMMENT '非破坏式调色参数 JSON',
   `organization_id` int unsigned NOT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_photos_uuid` (`uuid`),

@@ -108,6 +108,30 @@ function parseTags(tags) {
   return [];
 }
 
+function parsePhotoAdjustments(adjustments) {
+  if (!adjustments) return null;
+  const value = typeof adjustments === 'string' ? (() => {
+    try { return JSON.parse(adjustments); } catch (e) { return null; }
+  })() : adjustments;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const num = (v, fallback = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const gains = Array.isArray(value.wbGains) ? value.wbGains : [];
+  return {
+    version: 1,
+    engine: value.engine || 'mamage-tone-v1',
+    brightness: Math.min(100, Math.max(-100, num(value.brightness))),
+    contrast: Math.min(100, Math.max(-100, num(value.contrast))),
+    temperature: Math.min(100, Math.max(-100, num(value.temperature))),
+    tint: Math.min(100, Math.max(-100, num(value.tint))),
+    wbGains: [0, 1, 2].map((idx) => Math.min(1.8, Math.max(0.5, num(gains[idx], 1)))),
+    source: value.source || 'manual',
+    updatedAt: value.updatedAt || null,
+  };
+}
+
 // 选择封面：优先选同时包含标签 '合影' 和 '推荐' 的最新照片，次优包含 '合影'，次优包含 '推荐'，否则取最新一张
 function chooseCoverFromPhotos(photoRows) {
   if (!photoRows || photoRows.length === 0) return { url: null, thumbUrl: null };
@@ -588,6 +612,7 @@ router.get('/:id', async (req, res) => {
         /* local_path column removed from schema; do not select it */
         ph.title,
         ph.description,
+        ph.adjustments,
         ph.tags,
         ph.type,
         ph.photographer_id AS photographerId,
@@ -614,7 +639,8 @@ router.get('/:id', async (req, res) => {
       thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
       fullUrl: p.url ? buildUploadUrl(p.url) : null,
       fullThumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
-      description: p.description || null
+      description: p.description || null,
+      adjustments: parsePhotoAdjustments(p.adjustments)
     }));
 
     if (shouldIncludeFaces && project.photos.length > 0) {
