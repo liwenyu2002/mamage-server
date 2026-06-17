@@ -168,6 +168,83 @@ function chooseCoverFromPhotos(photoRows) {
   return { url: chosen.url || null, thumbUrl: chosen.thumbUrl || null };
 }
 
+async function fetchProjectPreviewPhotos(projectIds, orgId, latestLimit = 6) {
+  const ids = (Array.isArray(projectIds) ? projectIds : [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) return [];
+
+  const safeLatestLimit = Math.max(1, Math.min(12, Number(latestLimit) || 6));
+  let sql = `
+    SELECT
+      ranked.id,
+      ranked.projectId,
+      ranked.url,
+      ranked.thumbUrl,
+      ranked.tags,
+      ranked.created_at AS created_at
+    FROM (
+      SELECT
+        ph.id,
+        ph.project_id AS projectId,
+        ph.url,
+        ph.thumb_url AS thumbUrl,
+        ph.tags,
+        ph.created_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY ph.project_id
+          ORDER BY ph.created_at DESC, ph.id DESC
+        ) AS latestRank,
+        ROW_NUMBER() OVER (
+          PARTITION BY ph.project_id
+          ORDER BY
+            CASE
+              WHEN ph.tags LIKE '%合影%' AND ph.tags LIKE '%推荐%' THEN 0
+              WHEN ph.tags LIKE '%合影%' THEN 1
+              WHEN ph.tags LIKE '%推荐%' THEN 2
+              ELSE 3
+            END,
+            ph.created_at DESC,
+            ph.id DESC
+        ) AS coverRank
+      FROM photos ph
+      WHERE ph.project_id IN (?)
+  `;
+  const params = [ids];
+  if (orgId === null) {
+    sql += ' AND ph.organization_id IS NULL';
+  } else {
+    sql += ' AND ph.organization_id = ?';
+    params.push(orgId);
+  }
+  sql += `
+    ) ranked
+    WHERE ranked.latestRank <= ? OR ranked.coverRank = 1
+    ORDER BY ranked.projectId ASC, ranked.created_at DESC, ranked.id DESC
+  `;
+  params.push(safeLatestLimit);
+
+  try {
+    const [rows] = await pool.query(sql, params);
+    return rows || [];
+  } catch (err) {
+    // Older MySQL variants may not support window functions. Keep a safe fallback
+    // so deployments do not break, while MySQL 8+ gets bounded per-project reads.
+    console.warn('[projects] preview window query fallback:', err && err.message ? err.message : err);
+    let fallbackSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?)`;
+    const fallbackParams = [ids];
+    if (orgId === null) {
+      fallbackSql += ' AND organization_id IS NULL';
+    } else {
+      fallbackSql += ' AND organization_id = ?';
+      fallbackParams.push(orgId);
+    }
+    fallbackSql += ' ORDER BY created_at DESC, id DESC';
+    const [rows] = await pool.query(fallbackSql, fallbackParams);
+    return rows || [];
+  }
+}
+
 function normalizeTagsInput(input) {
   if (input === undefined || input === null) return null;
   let arr = [];
@@ -259,17 +336,7 @@ router.get('/', async (req, res) => {
     try {
       const projIds = rows.map(r => r.id).filter(Boolean);
       if (projIds.length) {
-        // fetch photos within user's organization only
-        let photoSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?)`;
-        const photoParams = [projIds];
-        if (orgId === null) {
-          photoSql += ' AND organization_id IS NULL';
-        } else {
-          photoSql += ' AND organization_id = ?';
-          photoParams.push(orgId);
-        }
-        photoSql += ' ORDER BY created_at DESC, id DESC';
-        const [photos] = await pool.query(photoSql, photoParams);
+        const photos = await fetchProjectPreviewPhotos(projIds, orgId, 6);
 
         const byProj = {};
         for (const ph of photos) {
@@ -517,16 +584,7 @@ router.get('/list', async (req, res) => {
     try {
       const projIds = rows.map(r => r.id).filter(Boolean);
       if (projIds.length) {
-        let photoSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?)`;
-        const photoParams = [projIds];
-        if (orgId === null) {
-          photoSql += ' AND organization_id IS NULL';
-        } else {
-          photoSql += ' AND organization_id = ?';
-          photoParams.push(orgId);
-        }
-        photoSql += ' ORDER BY created_at DESC, id DESC';
-        const [photos] = await pool.query(photoSql, photoParams);
+        const photos = await fetchProjectPreviewPhotos(projIds, orgId, 6);
 
         const byProj = {};
         for (const ph of photos) {
