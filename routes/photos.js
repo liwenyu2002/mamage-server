@@ -41,6 +41,9 @@ const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 50));
 const ZIP_REMOTE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_ZIP_REMOTE_TIMEOUT_MS || 20000));
 const ZIP_MAX_REMOTE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_MAX_REMOTE_BYTES || 1024 * 1024 * 1024));
 const ZIP_MAX_RENDER_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
+const RENDER_SOURCE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_RENDER_SOURCE_TIMEOUT_MS || 20000));
+const RENDER_MAX_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
+const TONE_ENGINE = 'mamage-tone-v2-acr-like';
 
 async function populateReqUserFromAuthIfPresent(req) {
   try {
@@ -114,6 +117,16 @@ function clampNumber(value, min, max, fallback = 0) {
   return Math.min(max, Math.max(min, n));
 }
 
+function computeWbGains(temperature = 0, tint = 0) {
+  const t = clampNumber(temperature, -100, 100, 0) / 100;
+  const g = clampNumber(tint, -100, 100, 0) / 100;
+  return [
+    clampNumber(1 + t * 0.22, 0.5, 1.8, 1),
+    clampNumber(1 - g * 0.16, 0.5, 1.8, 1),
+    clampNumber(1 - t * 0.22, 0.5, 1.8, 1),
+  ];
+}
+
 function normalizePhotoAdjustments(input) {
   if (input === null) return null;
   if (input === undefined) return undefined;
@@ -128,21 +141,31 @@ function normalizePhotoAdjustments(input) {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
 
-  const rawGains = Array.isArray(parsed.wbGains) ? parsed.wbGains : [];
+  const brightness = clampNumber(parsed.brightness, -100, 100, 0);
+  const contrast = clampNumber(parsed.contrast, -100, 100, 0);
+  const highlights = clampNumber(parsed.highlights, -100, 100, 0);
+  const shadows = clampNumber(parsed.shadows, -100, 100, 0);
+  const whites = clampNumber(parsed.whites, -100, 100, 0);
+  const blacks = clampNumber(parsed.blacks, -100, 100, 0);
+  const temperature = clampNumber(parsed.temperature, -100, 100, 0);
+  const tint = clampNumber(parsed.tint, -100, 100, 0);
+  const rawGains = Array.isArray(parsed.wbGains) && parsed.wbGains.length >= 3
+    ? parsed.wbGains
+    : computeWbGains(temperature, tint);
   const wbGains = [0, 1, 2].map((idx) => clampNumber(rawGains[idx], 0.5, 1.8, 1));
   const source = String(parsed.source || 'manual').trim().slice(0, 24) || 'manual';
 
   return {
-    version: 1,
-    engine: 'mamage-tone-v1',
-    brightness: clampNumber(parsed.brightness, -100, 100, 0),
-    contrast: clampNumber(parsed.contrast, -100, 100, 0),
-    whites: clampNumber(parsed.whites, -100, 100, 0),
-    highlights: clampNumber(parsed.highlights, -100, 100, 0),
-    shadows: clampNumber(parsed.shadows, -100, 100, 0),
-    blacks: clampNumber(parsed.blacks, -100, 100, 0),
-    temperature: clampNumber(parsed.temperature, -100, 100, 0),
-    tint: clampNumber(parsed.tint, -100, 100, 0),
+    version: 2,
+    engine: TONE_ENGINE,
+    brightness,
+    contrast,
+    highlights,
+    shadows,
+    whites,
+    blacks,
+    temperature,
+    tint,
     wbGains,
     source,
     updatedAt: parsed.updatedAt ? String(parsed.updatedAt).slice(0, 64) : new Date().toISOString(),
@@ -177,10 +200,10 @@ function srgbToLinear(v) {
   return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
 }
 
-function linearToSrgb(v) {
+function linearToSrgb(v, dither = 0) {
   const x = clampNumber(v, 0, 1, 0);
   const y = x <= 0.0031308 ? x * 12.92 : (1.055 * Math.pow(x, 1 / 2.4)) - 0.055;
-  return clampNumber(Math.round(y * 255), 0, 255, 0);
+  return clampNumber(Math.round((y * 255) + dither), 0, 255, 0);
 }
 
 function smoothstep(edge0, edge1, value) {
@@ -189,61 +212,215 @@ function smoothstep(edge0, edge1, value) {
   return x * x * (3 - (2 * x));
 }
 
-function zoneDeltaForLuma(luma, adjustments) {
-  const blacksMask = 1 - smoothstep(0.03, 0.28, luma);
-  const shadowsMask = 1 - smoothstep(0.18, 0.56, luma);
-  const highlightsMask = smoothstep(0.48, 0.86, luma);
-  const whitesMask = smoothstep(0.72, 0.98, luma);
-
-  return ((adjustments.blacks / 100) * 0.12 * blacksMask)
-    + ((adjustments.shadows / 100) * 0.18 * shadowsMask)
-    + ((adjustments.highlights / 100) * 0.16 * highlightsMask)
-    + ((adjustments.whites / 100) * 0.11 * whitesMask);
+function curvePushPull(luma, sliderValue, mask, scale) {
+  const amount = (clampNumber(sliderValue, -100, 100, 0) / 100) * clampNumber(mask, 0, 1, 0) * scale;
+  if (Math.abs(amount) < 0.00001) return luma;
+  const strength = 1 - Math.exp(-Math.abs(amount) * 2.2);
+  if (amount > 0) {
+    return clampNumber(luma + (1 - luma) * strength, 0, 1, luma);
+  }
+  return clampNumber(luma - luma * strength, 0, 1, luma);
 }
 
-function applyToneToRgb(r, g, b, adjustments) {
-  const a = normalizePhotoAdjustments(adjustments);
-  const exposure = Math.pow(2, (a.brightness / 100) * 1.25);
-  const contrast = (a.contrast / 100) * 0.65;
-  const gains = Array.isArray(a.wbGains) ? a.wbGains : [1, 1, 1];
+function applyMidtoneContrast(luma, contrastValue) {
+  const amount = (clampNumber(contrastValue, -100, 100, 0) / 100) * 0.58;
+  if (Math.abs(amount) < 0.00001) return luma;
+  const midMask = Math.pow(clampNumber(4 * luma * (1 - luma), 0, 1, 0), 0.72);
+  return clampNumber(luma + amount * (luma - 0.5) * midMask, 0, 1, luma);
+}
+
+function acrLikeToneMapLuma(luma, adjustments) {
+  let y = clampNumber(luma, 0, 1, 0);
+  const highlightsMask = smoothstep(0.44, 0.82, y) * (1 - smoothstep(0.96, 1, y) * 0.42);
+  y = curvePushPull(y, adjustments.highlights, highlightsMask, 0.34);
+
+  const shadowsMask = (1 - smoothstep(0.18, 0.58, y)) * (0.38 + smoothstep(0.012, 0.11, y) * 0.62);
+  y = curvePushPull(y, adjustments.shadows, shadowsMask, 0.36);
+
+  const whitesMask = smoothstep(0.68, 0.985, y);
+  y = curvePushPull(y, adjustments.whites, whitesMask, 0.3);
+
+  const blacksMask = 1 - smoothstep(0.012, 0.32, y);
+  y = curvePushPull(y, adjustments.blacks, blacksMask, 0.28);
+
+  return applyMidtoneContrast(y, adjustments.contrast);
+}
+
+function fitRgbToLuma(lr, lg, lb, sourceLuma, targetLuma) {
+  const y = clampNumber(targetLuma, 0, 1, 0);
+  if (sourceLuma <= 0.000001) return [y, y, y];
+  const ratio = clampNumber(y / sourceLuma, 0, 8, 1);
+  let nr = lr * ratio;
+  let ng = lg * ratio;
+  let nb = lb * ratio;
+  const maxChannel = Math.max(nr, ng, nb);
+  if (maxChannel > 1) {
+    const overshoot = maxChannel - 1;
+    const blendToGray = smoothstep(0, 0.42, overshoot) * 0.72;
+    nr += (y - nr) * blendToGray;
+    ng += (y - ng) * blendToGray;
+    nb += (y - nb) * blendToGray;
+  }
+  return [clampNumber(nr, 0, 1), clampNumber(ng, 0, 1), clampNumber(nb, 0, 1)];
+}
+
+function applyToneToRgb(r, g, b, adjustments, dither = 0) {
+  const exposure = Math.pow(2, (adjustments.brightness / 100) * 1.12);
+  const gains = Array.isArray(adjustments.wbGains) ? adjustments.wbGains : [1, 1, 1];
   let lr = srgbToLinear(r) * gains[0] * exposure;
   let lg = srgbToLinear(g) * gains[1] * exposure;
   let lb = srgbToLinear(b) * gains[2] * exposure;
   const luma = clampNumber((0.2126 * lr) + (0.7152 * lg) + (0.0722 * lb), 0, 1, 0);
-  const zoneDelta = zoneDeltaForLuma(luma, a);
-  lr = clampNumber(lr + zoneDelta, 0, 1, 0);
-  lg = clampNumber(lg + zoneDelta, 0, 1, 0);
-  lb = clampNumber(lb + zoneDelta, 0, 1, 0);
-  const applyContrast = (x) => clampNumber(x + contrast * (x - 0.5) * 4 * x * (1 - x), 0, 1, 0);
-  return [linearToSrgb(applyContrast(lr)), linearToSrgb(applyContrast(lg)), linearToSrgb(applyContrast(lb))];
+  const mappedLuma = acrLikeToneMapLuma(luma, adjustments);
+  [lr, lg, lb] = fitRgbToLuma(lr, lg, lb, luma, mappedLuma);
+  return [linearToSrgb(lr, dither), linearToSrgb(lg, dither), linearToSrgb(lb, dither)];
 }
 
-async function renderAdjustedPhotoBuffer(inputBuffer, adjustments) {
+const BAYER_4 = [
+  0, 8, 2, 10,
+  12, 4, 14, 6,
+  3, 11, 1, 9,
+  15, 7, 13, 5,
+];
+
+function orderedDither(x, y, strength = 0.55) {
+  const idx = ((y & 3) * 4) + (x & 3);
+  return ((BAYER_4[idx] / 15) - 0.5) * strength;
+}
+
+async function renderAdjustedPhotoBuffer(inputBuffer, adjustments, options = {}) {
   const sharp = require('sharp');
+  const normalizedAdjustments = normalizePhotoAdjustments(adjustments) || normalizePhotoAdjustments({});
+  const maxSize = Math.max(320, Math.min(4096, Number(options.maxSize || 4096)));
+  const format = String(options.format || 'jpeg').toLowerCase();
+  const quality = Math.max(70, Math.min(98, Number(options.quality || 96)));
   const pipeline = sharp(inputBuffer, { failOn: 'none' })
     .rotate()
     .resize({
-      width: 4096,
-      height: 4096,
+      width: maxSize,
+      height: maxSize,
       fit: 'inside',
       withoutEnlargement: true,
     })
+    .toColourspace('srgb')
     .flatten({ background: '#ffffff' });
-  const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await pipeline.raw({ depth: 'ushort' }).toBuffer({ resolveWithObject: true });
   const channels = info.channels || 3;
-  for (let i = 0; i < data.length; i += channels) {
-    const [r, g, b] = applyToneToRgb(data[i], data[i + 1], data[i + 2], adjustments);
-    data[i] = r;
-    data[i + 1] = g;
-    data[i + 2] = b;
+  const outputChannels = 3;
+  const out = Buffer.alloc(info.width * info.height * outputChannels);
+
+  let maxSample = 0;
+  for (let offset = 0; offset + 1 < data.length; offset += 2) {
+    const sample = data.readUInt16LE(offset);
+    if (sample > maxSample) maxSample = sample;
   }
-  return sharp(data, {
+  const sampleToByte = maxSample > 1024 ? (255 / 65535) : 1;
+  const pixelCount = info.width * info.height;
+
+  for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
+    const sourceOffset = pixelIndex * channels * 2;
+    const targetOffset = pixelIndex * outputChannels;
+    const x = pixelIndex % info.width;
+    const y = Math.floor(pixelIndex / info.width);
+    const dither = orderedDither(x, y, 0.62);
+    const sourceR = data.readUInt16LE(sourceOffset) * sampleToByte;
+    const sourceG = data.readUInt16LE(sourceOffset + 2) * sampleToByte;
+    const sourceB = data.readUInt16LE(sourceOffset + 4) * sampleToByte;
+    const [r, g, b] = applyToneToRgb(sourceR, sourceG, sourceB, normalizedAdjustments, dither);
+    out[targetOffset] = r;
+    out[targetOffset + 1] = g;
+    out[targetOffset + 2] = b;
+  }
+  const image = sharp(out, {
     raw: {
       width: info.width,
       height: info.height,
-      channels,
+      channels: outputChannels,
     },
-  }).jpeg({ quality: 94, mozjpeg: true }).toBuffer();
+  });
+
+  if (format === 'webp') {
+    return image.webp({ quality, smartSubsample: true }).toBuffer();
+  }
+  if (format === 'png') {
+    return image.png({ compressionLevel: 8, palette: false }).toBuffer();
+  }
+  return image.jpeg({ quality, chromaSubsampling: '4:4:4', mozjpeg: true }).toBuffer();
+}
+
+async function getScopedPhotoSourceRow(req, id) {
+  const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+  let sql = 'SELECT id, url, thumb_url AS thumbUrl, title, adjustments FROM photos WHERE id = ?';
+  const params = [id];
+  if (orgId === null) {
+    sql += ' AND organization_id IS NULL';
+  } else {
+    sql += ' AND organization_id = ?';
+    params.push(orgId);
+  }
+  sql += ' LIMIT 1';
+  const [rows] = await pool.query(sql, params);
+  return rows && rows.length ? rows[0] : null;
+}
+
+function resolvePhotoSourceTargetUrl(req, row, variant = 'original') {
+  const requested = String(variant || 'original').toLowerCase();
+  const raw = requested === 'thumb' ? (row.thumbUrl || row.url) : (row.url || row.thumbUrl);
+  if (!raw) return '';
+  const built = /^https?:\/\//i.test(String(raw)) ? String(raw) : buildUploadUrl(raw);
+  return /^https?:\/\//i.test(built)
+    ? built
+    : `${req.protocol}://${req.get('host')}${String(built).startsWith('/') ? built : `/${built}`}`;
+}
+
+async function fetchImageBufferFromUrl(targetUrl, options = {}) {
+  const maxBytes = Math.max(1024 * 1024, Number(options.maxBytes || RENDER_MAX_SOURCE_BYTES));
+  const response = await fetch(targetUrl, {
+    timeout: Math.max(1000, Number(options.timeoutMs || RENDER_SOURCE_TIMEOUT_MS)),
+    headers: { 'User-Agent': 'MaMage photo renderer' },
+  });
+
+  if (!response.ok) {
+    const err = new Error(`photo source unavailable: ${response.status}`);
+    err.status = 502;
+    throw err;
+  }
+
+  const contentType = response.headers.get('content-type') || 'image/jpeg';
+  if (!/^image\//i.test(contentType)) {
+    const err = new Error('photo source is not an image');
+    err.status = 415;
+    throw err;
+  }
+
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    const err = new Error('photo source too large');
+    err.status = 413;
+    throw err;
+  }
+
+  const buffer = await response.buffer();
+  if (buffer.length > maxBytes) {
+    const err = new Error('photo source too large');
+    err.status = 413;
+    throw err;
+  }
+  return { buffer, contentType };
+}
+
+function normalizeRenderFormat(input) {
+  const raw = String(input || 'jpeg').trim().toLowerCase();
+  if (raw === 'jpg' || raw === 'jpeg') return 'jpeg';
+  if (raw === 'webp') return 'webp';
+  if (raw === 'png') return 'png';
+  return '';
+}
+
+function getRenderedContentType(format) {
+  if (format === 'webp') return 'image/webp';
+  if (format === 'png') return 'image/png';
+  return 'image/jpeg';
 }
 
 function parseProjectPhotoIds(existing) {
@@ -1067,6 +1244,61 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
   } catch (err) {
     console.error('POST /api/photos/zip error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// POST /api/photos/:id/rendered
+// Render adjusted image bytes server-side from the original/thumbnail source.
+router.post('/:id/rendered', requirePermission('photos.view'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
+
+    const row = await getScopedPhotoSourceRow(req, id);
+    if (!row) return res.status(404).json({ error: 'photo not found' });
+
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const variant = String(body.variant || req.query.variant || 'original').trim().toLowerCase();
+    if (variant !== 'original' && variant !== 'thumb') {
+      return res.status(400).json({ error: 'invalid variant' });
+    }
+
+    const format = normalizeRenderFormat(body.format || req.query.format || 'jpeg');
+    if (!format) return res.status(400).json({ error: 'invalid format' });
+
+    const defaultMaxSize = variant === 'thumb' ? 900 : 4096;
+    const maxSize = clampNumber(body.maxSize || req.query.maxSize, 320, 4096, defaultMaxSize);
+    const quality = clampNumber(body.quality || req.query.quality, 70, 98, format === 'webp' ? 92 : 96);
+    const hasBodyAdjustments = Object.prototype.hasOwnProperty.call(body, 'adjustments');
+    const rawAdjustments = hasBodyAdjustments ? body.adjustments : row.adjustments;
+    let adjustments = normalizePhotoAdjustments(rawAdjustments);
+    if (adjustments === undefined && rawAdjustments !== undefined && rawAdjustments !== null && rawAdjustments !== '') {
+      return res.status(400).json({ error: 'invalid adjustments' });
+    }
+    if (!adjustments) adjustments = normalizePhotoAdjustments({});
+
+    const targetUrl = resolvePhotoSourceTargetUrl(req, row, variant);
+    if (!targetUrl) return res.status(404).json({ error: 'photo source not found' });
+
+    const { buffer } = await fetchImageBufferFromUrl(targetUrl, {
+      timeoutMs: RENDER_SOURCE_TIMEOUT_MS,
+      maxBytes: RENDER_MAX_SOURCE_BYTES,
+    });
+    const rendered = await renderAdjustedPhotoBuffer(buffer, adjustments, { maxSize, format, quality });
+
+    res.setHeader('Content-Type', getRenderedContentType(format));
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Vary', 'Authorization');
+    res.setHeader('X-MaMage-Tone-Engine', TONE_ENGINE);
+    res.setHeader('X-MaMage-Render-Variant', variant);
+    return res.send(rendered);
+  } catch (err) {
+    const status = Number(err && err.status) || 500;
+    console.error('POST /api/photos/:id/rendered error:', err && err.stack ? err.stack : err);
+    return res.status(status).json({
+      error: status === 500 ? 'Internal server error' : (err && err.message ? err.message : 'render failed'),
+    });
   }
 });
 
