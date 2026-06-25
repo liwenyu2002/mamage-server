@@ -59,8 +59,8 @@ module.exports = {
       },
       
       // ===== 日志配置 =====
-      output: '/var/log/mamage-server/out.log',
-      error: '/var/log/mamage-server/error.log',
+      output: '/Users/liwenyu/mamage-server/logs/out.log',
+      error: '/Users/liwenyu/mamage-server/logs/error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       
       // ===== 自动重启策略 =====

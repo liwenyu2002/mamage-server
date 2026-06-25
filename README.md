@@ -97,6 +97,19 @@ COS_REGION=
 COS_BASE_URL=https://<your-bucket>.cos.<region>.myqcloud.com
 ```
 
+如果对象存储迁移到 S3 兼容服务，并通过后端代理读图：
+
+```env
+COS_BASE_URL=http://<s3-endpoint>
+COS_BUCKET=<bucket>
+COS_REGION=us-east-1
+UPLOAD_BASE_URL=https://<your-domain>/api/image
+UPLOAD_SKIP_LOCAL_FILE_CHECK=1
+# 默认检测到内网 COS_BASE_URL 时关闭浏览器直传，避免前端等待 PUT 超时。
+# 如果对象存储 endpoint 已公网可达，可显式开启：
+# COS_DIRECT_UPLOAD_ENABLED=1
+```
+
 如果要使用 AI：
 
 ```env

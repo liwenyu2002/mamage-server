@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const path = require('path');
+const net = require('net');
 const multer = require('multer');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
@@ -25,6 +26,53 @@ const IMAGE_MIME_BY_EXT = new Map([
   ['.heif', 'image/heif'],
 ]);
 const ALLOWED_IMAGE_MIMES = new Set(IMAGE_MIME_BY_EXT.values());
+
+function parseEnvBoolean(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (['1', 'true', 'yes', 'y', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(raw)) return false;
+  return null;
+}
+
+function isPrivateHostname(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || host === 'localhost') return true;
+
+  const ipType = net.isIP(host);
+  if (ipType === 4) {
+    const parts = host.split('.').map((part) => Number(part));
+    if (parts.length !== 4 || parts.some((part) => !Number.isFinite(part))) return false;
+    const [a, b] = parts;
+    return a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168);
+  }
+  if (ipType === 6) {
+    return host === '::1' || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80:');
+  }
+  return false;
+}
+
+function getDirectUploadUnavailableReason() {
+  const explicit = parseEnvBoolean(process.env.COS_DIRECT_UPLOAD_ENABLED);
+  if (explicit === true) return null;
+  if (explicit === false) return 'DIRECT_UPLOAD_DISABLED';
+
+  const endpoint = cosStorage.getEndpointUrl && cosStorage.getEndpointUrl();
+  if (!endpoint) return 'STORAGE_ENDPOINT_MISSING';
+
+  try {
+    const parsed = new URL(endpoint);
+    if (isPrivateHostname(parsed.hostname)) return 'PRIVATE_STORAGE_ENDPOINT';
+  } catch (e) {
+    return 'INVALID_STORAGE_ENDPOINT';
+  }
+
+  return null;
+}
 
 try {
   const sharpConcurrency = Number(process.env.SHARP_CONCURRENCY || 0);
@@ -451,6 +499,14 @@ router.post('/photo/direct/init', requirePermission('upload.photo'), async (req,
   try {
     if (!cosStorage.isConfigured()) {
       return res.status(503).json({ error: 'COS_NOT_CONFIGURED' });
+    }
+    const directUploadUnavailableReason = getDirectUploadUnavailableReason();
+    if (directUploadUnavailableReason) {
+      return res.status(409).json({
+        error: 'DIRECT_UPLOAD_UNAVAILABLE',
+        reason: directUploadUnavailableReason,
+        fallback: 'api-upload',
+      });
     }
 
     const metadata = readPhotoMetadata(req.body || {});

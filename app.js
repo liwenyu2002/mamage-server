@@ -61,6 +61,7 @@ const orgsRouter = require('./routes/organizations');
 const shareRouter = require('./routes/share');
 const similarityRouter = require('./routes/similarity_groups');
 const facesRouter = require('./routes/faces');
+const imageProxyRouter = require('./routes/image_proxy');
 
 const app = express();
 
@@ -99,6 +100,7 @@ const staticUploadsDir = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWit
   ? uploadsAbsDir
   : path.join(uploadsAbsDir, 'uploads');
 
+app.use('/api/image', imageProxyRouter);
 app.use('/uploads', express.static(staticUploadsDir));
 // ============ 鏃ュ織 ============
 app.use((req, res, next) => {
@@ -142,6 +144,5 @@ async function startup() {
 }
 
 startup();
-
 
 
