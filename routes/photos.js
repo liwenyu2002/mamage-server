@@ -463,6 +463,10 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.description,
         p.adjustments,
         p.tags,
+        p.ai_status       AS aiStatus,
+        p.ai_error        AS aiError,
+        p.ai_started_at   AS aiStartedAt,
+        p.ai_finished_at  AS aiFinishedAt,
         p.type,
         p.photographer_id AS photographerId,
         u.name            AS photographerName,
@@ -548,7 +552,11 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         url: resolveUrl(p.url),
         thumbUrl: resolveUrl(p.thumbUrl),
         description: p.description || null,
-        adjustments: parsePhotoAdjustments(p.adjustments)
+        adjustments: parsePhotoAdjustments(p.adjustments),
+        aiStatus: p.aiStatus || null,
+        aiError: p.aiError || null,
+        aiStartedAt: p.aiStartedAt || null,
+        aiFinishedAt: p.aiFinishedAt || null
       };
     });
 
@@ -584,6 +592,10 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         p.description,
         p.adjustments,
         p.tags,
+        p.ai_status       AS aiStatus,
+        p.ai_error        AS aiError,
+        p.ai_started_at   AS aiStartedAt,
+        p.ai_finished_at  AS aiFinishedAt,
         p.type,
         p.photographer_id AS photographerId,
         u.name            AS photographerName,
@@ -646,7 +658,11 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         url: resolveUrl(p.url),
         thumbUrl: resolveUrl(p.thumbUrl),
         description: p.description || null,
-        adjustments: parsePhotoAdjustments(p.adjustments)
+        adjustments: parsePhotoAdjustments(p.adjustments),
+        aiStatus: p.aiStatus || null,
+        aiError: p.aiError || null,
+        aiStartedAt: p.aiStartedAt || null,
+        aiFinishedAt: p.aiFinishedAt || null
       };
     });
 
@@ -799,6 +815,10 @@ router.get('/search', async (req, res) => {
         p.description,
         p.adjustments,
         p.tags,
+        p.ai_status AS aiStatus,
+        p.ai_error AS aiError,
+        p.ai_started_at AS aiStartedAt,
+        p.ai_finished_at AS aiFinishedAt,
         p.type,
         p.photographer_id AS photographerId,
         COALESCE(NULLIF(u.name, ''), NULLIF(u.nickname, '')) AS photographerName,
@@ -824,6 +844,10 @@ router.get('/search', async (req, res) => {
       description: p.description || null,
       adjustments: parsePhotoAdjustments(p.adjustments),
       tags: parsePhotoTags(p.tags),
+      aiStatus: p.aiStatus || null,
+      aiError: p.aiError || null,
+      aiStartedAt: p.aiStartedAt || null,
+      aiFinishedAt: p.aiFinishedAt || null,
       type: p.type,
       photographerId: p.photographerId || null,
       photographerName: p.photographerName || null,
@@ -1383,6 +1407,10 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         p.description,
         p.adjustments,
         p.tags,
+        p.ai_status AS aiStatus,
+        p.ai_error AS aiError,
+        p.ai_started_at AS aiStartedAt,
+        p.ai_finished_at AS aiFinishedAt,
         p.type,
         p.photographer_id AS photographerId,
         u.name AS photographerName,
@@ -1427,6 +1455,10 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       description: p.description || null,
       adjustments: parsePhotoAdjustments(p.adjustments),
       tags: parsedTags,
+      aiStatus: p.aiStatus || null,
+      aiError: p.aiError || null,
+      aiStartedAt: p.aiStartedAt || null,
+      aiFinishedAt: p.aiFinishedAt || null,
       type: p.type,
       photographerId: p.photographerId || null,
       photographerName: p.photographerName || null,
@@ -1508,7 +1540,13 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     const sql = `UPDATE photos SET ${updates.join(', ')} WHERE id = ?`;
     await pool.query(sql, params);
 
-    const [rows] = await pool.query('SELECT id, url, thumb_url AS thumbUrl, title, description, adjustments, tags FROM photos WHERE id = ?', [id]);
+    const [rows] = await pool.query(
+      `SELECT id, url, thumb_url AS thumbUrl, title, description, adjustments, tags,
+              ai_status AS aiStatus, ai_error AS aiError,
+              ai_started_at AS aiStartedAt, ai_finished_at AS aiFinishedAt
+       FROM photos WHERE id = ?`,
+      [id]
+    );
     if (!rows || rows.length === 0) return res.status(404).json({ error: 'photo not found' });
 
     const p = rows[0];
@@ -1523,7 +1561,11 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
       title: p.title,
       description: p.description,
       adjustments: parsePhotoAdjustments(p.adjustments),
-      tags: parsedTags
+      tags: parsedTags,
+      aiStatus: p.aiStatus || null,
+      aiError: p.aiError || null,
+      aiStartedAt: p.aiStartedAt || null,
+      aiFinishedAt: p.aiFinishedAt || null
     });
   } catch (err) {
     console.error('PATCH /api/photos/:id error:', err && err.stack ? err.stack : err);

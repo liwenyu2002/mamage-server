@@ -252,8 +252,8 @@ async function createPhotoRecord(payload) {
     try {
       [result] = await conn.query(
         `INSERT INTO photos
-          (uuid, project_id, url, thumb_url, title, description, tags, type, photographer_id, organization_id)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (uuid, project_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         [
           payload.projectId || null,
           payload.relPath,
@@ -261,6 +261,7 @@ async function createPhotoRecord(payload) {
           payload.title,
           payload.description,
           payload.tags ? JSON.stringify(payload.tags) : null,
+          payload.aiStatus || 'pending',
           payload.type,
           payload.photographerId || null,
           payload.orgId,
@@ -454,6 +455,8 @@ function makeResponsePayload({ insertedId, projectId, relPath, thumbRel, title, 
     thumbUrl: buildUploadUrl(thumbRel),
     title,
     type,
+    aiStatus: 'pending',
+    ai_status: 'pending',
     photographerId: photographerId || null,
     photographerName: photographerName || null,
   };
