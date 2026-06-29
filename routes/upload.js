@@ -15,6 +15,7 @@ const THUMB_MAX_DIMENSION = Math.max(320, Number(process.env.UPLOAD_THUMB_MAX_DI
 const THUMB_QUALITY = Math.min(95, Math.max(50, Number(process.env.UPLOAD_THUMB_JPEG_QUALITY || 80)));
 const UPLOAD_CACHE_CONTROL = process.env.UPLOAD_CACHE_CONTROL || 'public, max-age=31536000, immutable';
 const SIGNED_UPLOAD_EXPIRES_SECONDS = Number(process.env.COS_SIGNED_UPLOAD_EXPIRES_SECONDS || 900);
+const UPLOAD_TIMING_LOGS = parseEnvBoolean(process.env.UPLOAD_TIMING_LOGS) === true;
 
 const IMAGE_MIME_BY_EXT = new Map([
   ['.jpg', 'image/jpeg'],
@@ -292,7 +293,6 @@ async function createPhotoRecord(payload) {
     }
 
     const insertedId = result.insertId;
-    await appendPhotoIdToProject(conn, payload.projectId, insertedId);
     await conn.commit();
     return insertedId;
   } catch (err) {
@@ -301,6 +301,67 @@ async function createPhotoRecord(payload) {
   } finally {
     conn.release();
   }
+}
+
+function isRetryableDbWriteError(err) {
+  const code = String(err && err.code || '');
+  const errno = Number(err && err.errno);
+  const message = String(err && err.message || '').toLowerCase();
+  return code === 'ER_LOCK_DEADLOCK'
+    || code === 'ER_LOCK_WAIT_TIMEOUT'
+    || errno === 1213
+    || errno === 1205
+    || message.includes('deadlock found')
+    || message.includes('lock wait timeout');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createPhotoRecordWithRetry(payload) {
+  const maxAttempts = Math.max(1, Number(process.env.UPLOAD_DB_INSERT_ATTEMPTS || 3));
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await createPhotoRecord(payload);
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableDbWriteError(err) || attempt >= maxAttempts) break;
+      await sleep(40 * attempt + Math.floor(Math.random() * 40));
+    }
+  }
+  throw lastErr;
+}
+
+async function appendPhotoIdToProjectBestEffort(projectId, insertedId) {
+  if (!projectId || !insertedId) return;
+  const maxAttempts = Math.max(1, Number(process.env.UPLOAD_PROJECT_PHOTO_IDS_ATTEMPTS || 2));
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await appendPhotoIdToProject(conn, projectId, insertedId);
+      await conn.commit();
+      return;
+    } catch (err) {
+      try { await conn.rollback(); } catch (e) { }
+      if (!isRetryableDbWriteError(err) || attempt >= maxAttempts) {
+        console.warn('[upload] skip project photo_ids sync:', err && err.message ? err.message : err);
+        return;
+      }
+      await sleep(80 * attempt + Math.floor(Math.random() * 80));
+    } finally {
+      conn.release();
+    }
+  }
+}
+
+function nowMs() {
+  if (typeof process.hrtime === 'function' && process.hrtime.bigint) {
+    return Number(process.hrtime.bigint() / BigInt(1000000));
+  }
+  return Date.now();
 }
 
 async function getPhotographerName(photographerId) {
@@ -413,6 +474,8 @@ function handleUploadMiddleware(req, res, next) {
 
 async function processUpload(req, res) {
   let uploadedKeys = [];
+  const timings = {};
+  const startMs = nowMs();
   try {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -428,12 +491,14 @@ async function processUpload(req, res) {
     const photographerId = req.user && req.user.id ? req.user.id : null;
     const orgId = getOrgId(req);
     await ensureProjectInScope(pool, metadata.projectId, orgId);
+    timings.scopeMs = nowMs() - startMs;
 
     const mimeType = inferImageMime(req.file.mimetype, req.file.originalname);
     const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType);
 
     let thumbBuffer = null;
     try {
+      const storageStartMs = nowMs();
       const originalUploadPromise = cosStorage.uploadBuffer(originalKey, req.file.buffer, {
         contentType: mimeType,
         cacheControl: UPLOAD_CACHE_CONTROL,
@@ -442,16 +507,22 @@ async function processUpload(req, res) {
         return result;
       });
 
-      thumbBuffer = await createThumbBuffer(req.file.buffer);
-      const thumbUploadPromise = cosStorage.uploadBuffer(thumbKey, thumbBuffer, {
-        contentType: 'image/jpeg',
-        cacheControl: UPLOAD_CACHE_CONTROL,
-      }).then((result) => {
-        uploadedKeys.push(thumbKey);
-        return result;
-      });
+      const thumbUploadPromise = createThumbBuffer(req.file.buffer)
+        .then((buffer) => {
+          thumbBuffer = buffer;
+          timings.thumbBytes = buffer.length;
+          return cosStorage.uploadBuffer(thumbKey, buffer, {
+            contentType: 'image/jpeg',
+            cacheControl: UPLOAD_CACHE_CONTROL,
+          });
+        })
+        .then((result) => {
+          uploadedKeys.push(thumbKey);
+          return result;
+        });
 
       await Promise.all([originalUploadPromise, thumbUploadPromise]);
+      timings.storageMs = nowMs() - storageStartMs;
     } catch (err) {
       await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
       console.error('[upload] upload to COS failed:', err && err.message ? err.message : err);
@@ -460,13 +531,15 @@ async function processUpload(req, res) {
 
     let insertedId;
     try {
-      insertedId = await createPhotoRecord({
+      const dbStartMs = nowMs();
+      insertedId = await createPhotoRecordWithRetry({
         ...metadata,
         relPath,
         thumbRel,
         photographerId,
         orgId,
       });
+      timings.dbMs = nowMs() - dbStartMs;
     } catch (err) {
       await cosStorage.deleteObjects([originalKey, thumbKey]).catch(() => null);
       const status = err.status || 500;
@@ -477,6 +550,24 @@ async function processUpload(req, res) {
 
     const photographerName = await getPhotographerName(photographerId);
     enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographerId });
+    setImmediate(() => {
+      appendPhotoIdToProjectBestEffort(metadata.projectId, insertedId).catch((err) => {
+        console.warn('[upload] project photo_ids async sync failed:', err && err.message ? err.message : err);
+      });
+    });
+
+    if (UPLOAD_TIMING_LOGS) {
+      console.log('[upload] timing', {
+        photoId: insertedId,
+        projectId: metadata.projectId || null,
+        originalBytes: req.file.size,
+        thumbBytes: timings.thumbBytes || 0,
+        scopeMs: timings.scopeMs,
+        storageMs: timings.storageMs,
+        dbMs: timings.dbMs,
+        totalMs: nowMs() - startMs,
+      });
+    }
 
     return res.json(makeResponsePayload({
       insertedId,
@@ -584,7 +675,7 @@ router.post('/photo/direct/complete', requirePermission('upload.photo'), async (
 
     let insertedId;
     try {
-      insertedId = await createPhotoRecord({
+      insertedId = await createPhotoRecordWithRetry({
         ...metadata,
         relPath: `/${originalKey}`,
         thumbRel: `/${thumbKey}`,
@@ -600,6 +691,11 @@ router.post('/photo/direct/complete', requirePermission('upload.photo'), async (
 
     const photographerName = await getPhotographerName(photographerId);
     enqueuePostUploadJobs({ insertedId, thumbRel: `/${thumbKey}`, thumbBuffer: null, photographerId });
+    setImmediate(() => {
+      appendPhotoIdToProjectBestEffort(metadata.projectId, insertedId).catch((err) => {
+        console.warn('[upload] project photo_ids async sync failed:', err && err.message ? err.message : err);
+      });
+    });
 
     res.json(makeResponsePayload({
       insertedId,
