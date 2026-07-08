@@ -266,6 +266,114 @@ function normalizeTagsInput(input) {
   return arr.length ? arr : null;
 }
 
+function parseBooleanInput(value) {
+  if (value === undefined || value === null || value === '') return false;
+  if (typeof value === 'boolean') return value;
+  const raw = String(value).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'y', 'on'].includes(raw);
+}
+
+function normalizeTimelineSectionsInput(input) {
+  if (input === undefined || input === null || input === '') return [];
+  let arr = input;
+  if (typeof input === 'string') {
+    try {
+      const parsed = JSON.parse(input);
+      arr = Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      arr = input.split(/\r?\n/).map((line) => ({ name: line }));
+    }
+  }
+  if (!Array.isArray(arr)) return [];
+
+  const sections = [];
+  const seenNames = new Set();
+  arr.forEach((item, idx) => {
+    const rawName = typeof item === 'string' ? item : (item && (item.name || item.title || item.label));
+    const name = String(rawName || '').trim().slice(0, 100);
+    if (!name || seenNames.has(name)) return;
+    seenNames.add(name);
+    const rawTime = typeof item === 'string' ? '' : (item && (item.sectionTime || item.section_time || item.time || item.eventTime));
+    const sectionTime = String(rawTime || '').trim().slice(0, 64) || null;
+    const sortRaw = typeof item === 'string' ? idx : (item && (item.sortOrder ?? item.sort_order ?? idx));
+    const sortOrder = Number.isFinite(Number(sortRaw)) ? Math.max(0, Math.floor(Number(sortRaw))) : idx;
+    sections.push({ name, sectionTime, sortOrder });
+  });
+
+  return sections.slice(0, 50).map((section, idx) => ({
+    ...section,
+    sortOrder: Number.isFinite(section.sortOrder) ? section.sortOrder : idx,
+  }));
+}
+
+function getTimelineConfigFromBody(body) {
+  const sections = normalizeTimelineSectionsInput(body.timelineSections ?? body.timeline_sections ?? body.sections);
+  const enabled = parseBooleanInput(body.timelineEnabled ?? body.timeline_enabled) || sections.length > 0;
+  return { enabled, sections };
+}
+
+function projectTimelineEnabled(meta, sections) {
+  return Boolean((meta && meta.timelineEnabled) || (Array.isArray(sections) && sections.length > 0));
+}
+
+function serializeTimelineSection(row) {
+  return {
+    id: row.id,
+    projectId: row.projectId ?? row.project_id,
+    name: row.name,
+    sectionTime: row.sectionTime ?? row.section_time ?? null,
+    sortOrder: Number(row.sortOrder ?? row.sort_order ?? 0) || 0,
+  };
+}
+
+async function fetchTimelineSections(projectIds) {
+  const ids = (Array.isArray(projectIds) ? projectIds : [projectIds])
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) return {};
+
+  const [rows] = await pool.query(
+    `SELECT id, project_id AS projectId, name, section_time AS sectionTime, sort_order AS sortOrder
+     FROM project_timeline_sections
+     WHERE project_id IN (?)
+     ORDER BY project_id ASC, sort_order ASC, id ASC`,
+    [ids]
+  );
+  const byProject = {};
+  (rows || []).forEach((row) => {
+    const key = String(row.projectId);
+    if (!byProject[key]) byProject[key] = [];
+    byProject[key].push(serializeTimelineSection(row));
+  });
+  return byProject;
+}
+
+async function attachTimelineToProject(project) {
+  if (!project || !project.id) return project;
+  try {
+    const byProject = await fetchTimelineSections([project.id]);
+    const sections = byProject[String(project.id)] || [];
+    project.timelineSections = sections;
+    project.timelineEnabled = projectTimelineEnabled(project.meta, sections);
+  } catch (err) {
+    project.timelineSections = [];
+    project.timelineEnabled = Boolean(project.meta && project.meta.timelineEnabled);
+  }
+  return project;
+}
+
+async function replaceTimelineSections(conn, projectId, sections) {
+  await conn.query('DELETE FROM project_timeline_sections WHERE project_id = ?', [projectId]);
+  for (let i = 0; i < sections.length; i += 1) {
+    const section = sections[i];
+    await conn.query(
+      `INSERT INTO project_timeline_sections (project_id, name, section_time, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NOW(), NOW())`,
+      [projectId, section.name, section.sectionTime || null, Number.isFinite(section.sortOrder) ? section.sortOrder : i]
+    );
+  }
+}
+
 // ==============================
 // 1. 首页项目列表：GET /api/projects?limit=4
 // ==============================
@@ -662,6 +770,7 @@ router.get('/:id', async (req, res) => {
     const project = projRows[0];
     project.meta = parseMeta(project.meta);
     project.tags = parseTags(project.tags);
+    await attachTimelineToProject(project);
 
     // 查该项目的所有照片
     let photoSql = `
@@ -669,6 +778,7 @@ router.get('/:id', async (req, res) => {
         ph.id,
         ph.uuid,
         ph.project_id AS projectId,
+        ph.timeline_section_id AS timelineSectionId,
         ph.url,
         ph.thumb_url AS thumbUrl,
         /* local_path column removed from schema; do not select it */
@@ -682,11 +792,14 @@ router.get('/:id', async (req, res) => {
         ph.ai_finished_at AS aiFinishedAt,
         ph.type,
         ph.photographer_id AS photographerId,
+        pts.name AS timelineSectionName,
+        pts.section_time AS timelineSectionTime,
         u.name AS photographerName,
         ph.created_at AS createdAt,
         ph.updated_at AS updatedAt
       FROM photos ph
       LEFT JOIN users u ON ph.photographer_id = u.id
+      LEFT JOIN project_timeline_sections pts ON ph.timeline_section_id = pts.id
       WHERE ph.project_id = ?
     `;
     const photoParams = [id];
@@ -789,19 +902,24 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
     const finalDesc = (body.description || body.desc || '').trim();
     const rawEventDate = (body.eventDate || '').trim() || null;
     const tagsArr = normalizeTagsInput(body.tags);
+    const timelineConfig = getTimelineConfigFromBody(body);
 
     if (!finalName) {
       return res.status(400).json({ error: 'projectName is required' });
+    }
+    if (timelineConfig.enabled && timelineConfig.sections.length === 0) {
+      return res.status(400).json({ error: 'TIMELINE_SECTIONS_REQUIRED', message: '开启时间轴后至少需要添加一个环节名称' });
     }
 
     const uuid = uuidv4();
     const adminId = req.user && req.user.id ? req.user.id : null;
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
 
-    const metaObj = {};
+    const metaObj = parseMeta(body.meta);
     if (rawEventDate) {
       metaObj.eventDate = rawEventDate;
     }
+    metaObj.timelineEnabled = Boolean(timelineConfig.enabled);
 
     // 强制要求创建项目的用户属于某个组织（projects.organization_id 为 NOT NULL 的情形）
     if (orgId === null) {
@@ -811,66 +929,79 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
       });
     }
 
-    // 尝试写入包含 organization_id 的记录；如果数据库根本没有该列（旧 schema），则兼容重试不带该列的插入。
     let result;
+    const conn = await pool.getConnection();
     try {
-      [result] = await pool.query(
-        `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, organization_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId, orgId]
-      );
-    } catch (e) {
-      if (e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.message && e.message.indexOf('Unknown column') !== -1))) {
-        // projects.organization_id column doesn't exist; retry without it for compatibility with older DB schemas
-        [result] = await pool.query(
-          `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-          [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId]
+      await conn.beginTransaction();
+      try {
+        [result] = await conn.query(
+          `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, organization_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId, orgId]
         );
-      } else {
-        throw e;
+      } catch (e) {
+        if (e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.message && e.message.indexOf('Unknown column') !== -1))) {
+          // projects.organization_id column doesn't exist; retry without it for compatibility with older DB schemas
+          [result] = await conn.query(
+            `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId]
+          );
+        } else {
+          throw e;
+        }
       }
-    }
 
-    const newId = result.insertId;
+      const newId = result.insertId;
+      if (timelineConfig.enabled) {
+        await replaceTimelineSections(conn, newId, timelineConfig.sections);
+      }
+      await conn.commit();
 
-    const [rows] = await pool.query(
-      `
-      SELECT
-        p.id,
-        p.uuid,
-        p.name AS projectName,
-        p.description,
-        p.event_date AS eventDate,
-        p.meta,
-        p.photo_ids AS photoIds,
-        p.tags,
-        p.admin_id AS adminId,
-        p.created_at AS createdAt,
-        p.updated_at AS updatedAt
-      FROM projects p
-      WHERE p.id = ?
-      `,
-      [newId]
-    );
-
-    const project = rows[0];
-    project.meta = parseMeta(project.meta);
-    project.tags = parseTags(project.tags);
-
-    // 计算封面（如果有照片）并填充为可访问的完整 URL
-    try {
-      const [photos] = await pool.query(
-        `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
+      const [rows] = await pool.query(
+        `
+        SELECT
+          p.id,
+          p.uuid,
+          p.name AS projectName,
+          p.description,
+          p.event_date AS eventDate,
+          p.meta,
+          p.photo_ids AS photoIds,
+          p.tags,
+          p.admin_id AS adminId,
+          p.created_at AS createdAt,
+          p.updated_at AS updatedAt
+        FROM projects p
+        WHERE p.id = ?
+        `,
         [newId]
       );
-      const cover = chooseCoverFromPhotos(photos);
-      project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
-      project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
-    } catch (e) {
-      project.coverFullUrl = null;
-      project.coverFullThumbUrl = null;
-    }
 
-    res.json(project);
+      const project = rows[0];
+      project.meta = parseMeta(project.meta);
+      project.tags = parseTags(project.tags);
+      await attachTimelineToProject(project);
+
+      // 计算封面（如果有照片）并填充为可访问的完整 URL
+      try {
+        const [photos] = await pool.query(
+          `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
+          [newId]
+        );
+        const cover = chooseCoverFromPhotos(photos);
+        project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
+        project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+      } catch (e) {
+        project.coverFullUrl = null;
+        project.coverFullThumbUrl = null;
+      }
+
+      res.json(project);
+    } catch (e) {
+      try { await conn.rollback(); } catch (_) { }
+      throw e;
+    } finally {
+      conn.release();
+    }
   } catch (err) {
     console.error('[POST /api/projects] error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -893,14 +1024,23 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
     const finalDesc = (body.description || body.desc || '').trim();
     const rawEventDate = (body.eventDate || '').trim() || null;
     const tagsArr = normalizeTagsInput(body.tags);
+    const timelineFieldsProvided = body.timelineEnabled !== undefined
+      || body.timeline_enabled !== undefined
+      || body.timelineSections !== undefined
+      || body.timeline_sections !== undefined
+      || body.sections !== undefined;
+    const timelineConfig = timelineFieldsProvided ? getTimelineConfigFromBody(body) : null;
 
     if (!finalName) {
       return res.status(400).json({ error: 'projectName is required' });
     }
+    if (timelineConfig && timelineConfig.enabled && timelineConfig.sections.length === 0) {
+      return res.status(400).json({ error: 'TIMELINE_SECTIONS_REQUIRED', message: '开启时间轴后至少需要添加一个环节名称' });
+    }
 
     // ensure project belongs to user's organization
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-    let ownershipSql = 'SELECT id FROM projects WHERE id = ?';
+    let ownershipSql = 'SELECT id, meta FROM projects WHERE id = ?';
     const ownershipParams = [id];
     if (orgId === null) {
       ownershipSql += ' AND organization_id IS NULL';
@@ -910,20 +1050,46 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
     }
     const [ownRows] = await pool.query(ownershipSql, ownershipParams);
     if (!ownRows || ownRows.length === 0) return res.status(404).json({ error: 'Project not found' });
+    const metaObj = parseMeta(ownRows[0].meta);
+    if (rawEventDate) metaObj.eventDate = rawEventDate;
+    else delete metaObj.eventDate;
+    if (timelineConfig) metaObj.timelineEnabled = Boolean(timelineConfig.enabled);
 
-    const [result] = await pool.query(
-      `
-      UPDATE projects
-      SET
-        name = ?,
-        description = ?,
-        event_date = ?,
-        tags = ?,
-        updated_at = NOW()
-      WHERE id = ?
-      `,
-      [finalName, finalDesc, rawEventDate, tagsArr ? JSON.stringify(tagsArr) : null, id]
-    );
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        `
+        UPDATE projects
+        SET
+          name = ?,
+          description = ?,
+          event_date = ?,
+          meta = ?,
+          tags = ?,
+          updated_at = NOW()
+        WHERE id = ?
+        `,
+        [finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, id]
+      );
+      if (timelineConfig) {
+        await replaceTimelineSections(conn, id, timelineConfig.enabled ? timelineConfig.sections : []);
+        await conn.query(
+          `UPDATE photos p
+           LEFT JOIN project_timeline_sections pts
+             ON p.timeline_section_id = pts.id AND pts.project_id = ?
+           SET p.timeline_section_id = NULL
+           WHERE p.project_id = ? AND p.timeline_section_id IS NOT NULL AND pts.id IS NULL`,
+          [id, id]
+        );
+      }
+      await conn.commit();
+    } catch (e) {
+      try { await conn.rollback(); } catch (_) { }
+      throw e;
+    } finally {
+      conn.release();
+    }
 
     const [rows] = await pool.query(
       `
@@ -948,6 +1114,7 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
     const project = rows[0];
     project.meta = parseMeta(project.meta);
     project.tags = parseTags(project.tags);
+    await attachTimelineToProject(project);
 
     // 计算封面（保持与列表/详情一致的行为）
     try {

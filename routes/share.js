@@ -276,16 +276,32 @@ router.get('/:code', async (req, res) => {
         const offset = normalizeOffset(req.query.offset);
 
         let photos = [];
+        let timelineSections = [];
 
         if (share.share_type === 'project') {
+            try {
+                const [sectionRows] = await pool.query(
+                    `SELECT id, project_id AS projectId, name, section_time AS sectionTime, sort_order AS sortOrder
+                     FROM project_timeline_sections
+                     WHERE project_id = ?
+                     ORDER BY sort_order ASC, id ASC`,
+                    [share.project_id]
+                );
+                timelineSections = sectionRows || [];
+            } catch (e) {
+                timelineSections = [];
+            }
             const [pRows] = await pool.query(
                 `
-					SELECT
-						p.id,
-						p.uuid,
-						p.project_id      AS projectId,
-						p.url,
-						p.thumb_url       AS thumbUrl,
+						SELECT
+							p.id,
+							p.uuid,
+							p.project_id      AS projectId,
+							p.timeline_section_id AS timelineSectionId,
+							pts.name          AS timelineSectionName,
+							pts.section_time  AS timelineSectionTime,
+							p.url,
+							p.thumb_url       AS thumbUrl,
 						p.title,
 						p.description,
 						p.tags,
@@ -294,9 +310,10 @@ router.get('/:code', async (req, res) => {
 						u.name            AS photographerName,
 						p.created_at      AS createdAt,
 						p.updated_at      AS updatedAt
-					FROM photos p
-					LEFT JOIN users u ON p.photographer_id = u.id
-					WHERE p.project_id = ? AND p.organization_id = ?
+						FROM photos p
+						LEFT JOIN users u ON p.photographer_id = u.id
+						LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
+						WHERE p.project_id = ? AND p.organization_id = ?
 					ORDER BY p.created_at DESC
 					LIMIT ? OFFSET ?
 				`,
@@ -307,10 +324,13 @@ router.get('/:code', async (req, res) => {
             const [pRows] = await pool.query(
                 `
 					SELECT
-						p.id,
-						p.uuid,
-						p.project_id      AS projectId,
-						p.url,
+							p.id,
+							p.uuid,
+							p.project_id      AS projectId,
+							p.timeline_section_id AS timelineSectionId,
+							pts.name          AS timelineSectionName,
+							pts.section_time  AS timelineSectionTime,
+							p.url,
 						p.thumb_url       AS thumbUrl,
 						p.title,
 						p.description,
@@ -321,10 +341,11 @@ router.get('/:code', async (req, res) => {
 						p.created_at      AS createdAt,
 						p.updated_at      AS updatedAt,
 						s.sort_order      AS sortOrder
-					FROM share_link_items s
-					INNER JOIN photos p ON s.photo_id = p.id
-					LEFT JOIN users u ON p.photographer_id = u.id
-					WHERE s.share_id = ? AND p.organization_id = ?
+						FROM share_link_items s
+						INNER JOIN photos p ON s.photo_id = p.id
+						LEFT JOIN users u ON p.photographer_id = u.id
+						LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
+						WHERE s.share_id = ? AND p.organization_id = ?
 					ORDER BY s.sort_order ASC, s.id ASC
 					LIMIT ? OFFSET ?
 				`,
@@ -350,6 +371,7 @@ router.get('/:code', async (req, res) => {
             expiresAt: expiresAtIso,
             revokedAt: revokedAtIso,
             remainingSeconds,
+            timelineSections,
             photos: mapped,
             limit,
             offset

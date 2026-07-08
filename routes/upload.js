@@ -119,6 +119,13 @@ function parseProjectId(raw) {
   return projectId;
 }
 
+function parseTimelineSectionId(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+  const sectionId = parseInt(raw, 10);
+  if (!Number.isFinite(sectionId) || sectionId <= 0) return null;
+  return sectionId;
+}
+
 function trimText(value, maxLen) {
   if (value === undefined || value === null) return null;
   const str = String(value).trim();
@@ -161,6 +168,7 @@ function readPhotoMetadata(body) {
     description: trimText(body && body.description, 2000),
     type: trimText(body && body.type, 32) || 'normal',
     tags: parseTags(body && body.tags),
+    timelineSectionId: parseTimelineSectionId(body && (body.timelineSectionId || body.timeline_section_id || body.sectionId)),
   };
 }
 
@@ -233,6 +241,35 @@ async function ensureProjectInScope(db, projectId, orgId) {
   }
 }
 
+async function ensureTimelineSectionInProject(db, projectId, orgId, timelineSectionId) {
+  if (!timelineSectionId) return null;
+  if (!projectId) {
+    const err = new Error('TIMELINE_SECTION_REQUIRES_PROJECT');
+    err.status = 400;
+    throw err;
+  }
+  let sql = `
+    SELECT pts.id, pts.name, pts.section_time AS sectionTime
+    FROM project_timeline_sections pts
+    INNER JOIN projects p ON pts.project_id = p.id
+    WHERE pts.id = ? AND pts.project_id = ?
+  `;
+  const params = [timelineSectionId, projectId];
+  if (orgId === null) {
+    sql += ' AND p.organization_id IS NULL';
+  } else {
+    sql += ' AND p.organization_id = ?';
+    params.push(orgId);
+  }
+  const [rows] = await db.query(sql, params);
+  if (!rows || rows.length === 0) {
+    const err = new Error('INVALID_TIMELINE_SECTION');
+    err.status = 400;
+    throw err;
+  }
+  return rows[0];
+}
+
 async function appendPhotoIdToProject(conn, projectId, insertedId) {
   if (!projectId || !insertedId) return;
   const [projRows] = await conn.query('SELECT photo_ids FROM projects WHERE id = ? FOR UPDATE', [projectId]);
@@ -247,15 +284,17 @@ async function createPhotoRecord(payload) {
   try {
     await conn.beginTransaction();
     await ensureProjectInScope(conn, payload.projectId, payload.orgId);
+    await ensureTimelineSectionInProject(conn, payload.projectId, payload.orgId, payload.timelineSectionId);
 
     let result;
     try {
       [result] = await conn.query(
         `INSERT INTO photos
-          (uuid, project_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+          (uuid, project_id, timeline_section_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         [
           payload.projectId || null,
+          payload.timelineSectionId || null,
           payload.relPath,
           payload.thumbRel,
           payload.title,
@@ -447,10 +486,11 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
   }
 }
 
-function makeResponsePayload({ insertedId, projectId, relPath, thumbRel, title, type, photographerId, photographerName }) {
+function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, title, type, photographerId, photographerName }) {
   return {
     id: insertedId,
     projectId: projectId || null,
+    timelineSectionId: timelineSectionId || null,
     url: buildUploadUrl(relPath),
     thumbUrl: buildUploadUrl(thumbRel),
     title,
@@ -494,6 +534,7 @@ async function processUpload(req, res) {
     const photographerId = req.user && req.user.id ? req.user.id : null;
     const orgId = getOrgId(req);
     await ensureProjectInScope(pool, metadata.projectId, orgId);
+    await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
     timings.scopeMs = nowMs() - startMs;
 
     const mimeType = inferImageMime(req.file.mimetype, req.file.originalname);
@@ -575,6 +616,7 @@ async function processUpload(req, res) {
     return res.json(makeResponsePayload({
       insertedId,
       projectId: metadata.projectId,
+      timelineSectionId: metadata.timelineSectionId,
       relPath,
       thumbRel,
       title: metadata.title,
@@ -606,6 +648,7 @@ router.post('/photo/direct/init', requirePermission('upload.photo'), async (req,
     const metadata = readPhotoMetadata(req.body || {});
     const orgId = getOrgId(req);
     await ensureProjectInScope(pool, metadata.projectId, orgId);
+    await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
 
     const fileName = trimText(req.body && req.body.fileName, 255) || 'photo.jpg';
     const fileSize = Number(req.body && req.body.fileSize);
@@ -703,6 +746,7 @@ router.post('/photo/direct/complete', requirePermission('upload.photo'), async (
     res.json(makeResponsePayload({
       insertedId,
       projectId: metadata.projectId,
+      timelineSectionId: metadata.timelineSectionId,
       relPath: `/${originalKey}`,
       thumbRel: `/${thumbKey}`,
       title: metadata.title,

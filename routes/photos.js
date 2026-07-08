@@ -457,6 +457,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.id,
         p.uuid,
         p.project_id      AS projectId,
+        p.timeline_section_id AS timelineSectionId,
         p.url,
         p.thumb_url       AS thumbUrl,
         p.title,
@@ -470,10 +471,13 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.type,
         p.photographer_id AS photographerId,
         u.name            AS photographerName,
+        pts.name          AS timelineSectionName,
+        pts.section_time  AS timelineSectionTime,
         p.created_at      AS createdAt,
         p.updated_at      AS updatedAt
       FROM photos p
       LEFT JOIN users u ON p.photographer_id = u.id
+      LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
     `;
     const conds = [];
     const params = [];
@@ -586,6 +590,7 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         p.id,
         p.uuid,
         p.project_id      AS projectId,
+        p.timeline_section_id AS timelineSectionId,
         p.url,
         p.thumb_url       AS thumbUrl,
         p.title,
@@ -599,11 +604,14 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         p.type,
         p.photographer_id AS photographerId,
         u.name            AS photographerName,
+        pts.name          AS timelineSectionName,
+        pts.section_time  AS timelineSectionTime,
         p.created_at      AS createdAt,
         p.updated_at      AS updatedAt
       FROM photos p
       LEFT JOIN users u ON p.photographer_id = u.id
       INNER JOIN projects pr ON p.project_id = pr.id
+      LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
       WHERE pr.type = 'scenery'
     `;
 
@@ -735,13 +743,14 @@ router.get('/search', async (req, res) => {
           OR LOWER(COALESCE(p.url, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(p.thumb_url, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(pts.name, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(u.student_no, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(CAST(p.photographer_id AS CHAR), '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#'
         )`);
-        whereParams.push(like, like, like, like, like, like, like, like, like, like, like);
+        whereParams.push(like, like, like, like, like, like, like, like, like, like, like, like);
       });
     }
 
@@ -750,6 +759,7 @@ router.get('/search', async (req, res) => {
       FROM photos p
       LEFT JOIN users u ON p.photographer_id = u.id
       LEFT JOIN projects pr ON p.project_id = pr.id
+      LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
     `;
 
     const [countRows] = await pool.query(
@@ -770,6 +780,8 @@ router.get('/search', async (req, res) => {
         scoreParams.push(prefixLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#' THEN 26 ELSE 0 END`);
         scoreParams.push(prefixLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(pts.name, '')) LIKE ? ESCAPE '#' THEN 25 ELSE 0 END`);
+        scoreParams.push(prefixLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#' THEN 24 ELSE 0 END`);
         scoreParams.push(prefixLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#' THEN 24 ELSE 0 END`);
@@ -777,6 +789,8 @@ router.get('/search', async (req, res) => {
         scoreParts.push(`CASE WHEN LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#' THEN 16 ELSE 0 END`);
         scoreParams.push(containLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#' THEN 14 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(pts.name, '')) LIKE ? ESCAPE '#' THEN 13 ELSE 0 END`);
         scoreParams.push(containLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#' THEN 12 ELSE 0 END`);
         scoreParams.push(containLike);
@@ -809,6 +823,9 @@ router.get('/search', async (req, res) => {
         p.uuid,
         p.project_id AS projectId,
         pr.name AS projectName,
+        p.timeline_section_id AS timelineSectionId,
+        pts.name AS timelineSectionName,
+        pts.section_time AS timelineSectionTime,
         p.url,
         p.thumb_url AS thumbUrl,
         p.title,
@@ -838,6 +855,9 @@ router.get('/search', async (req, res) => {
       uuid: p.uuid,
       projectId: p.projectId,
       projectName: p.projectName || null,
+      timelineSectionId: p.timelineSectionId || null,
+      timelineSectionName: p.timelineSectionName || null,
+      timelineSectionTime: p.timelineSectionTime || null,
       url: p.url ? buildUploadUrl(p.url) : null,
       thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
       title: p.title || null,
@@ -1401,6 +1421,9 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         p.id,
         p.uuid,
         p.project_id AS projectId,
+        p.timeline_section_id AS timelineSectionId,
+        pts.name AS timelineSectionName,
+        pts.section_time AS timelineSectionTime,
         p.url,
         p.thumb_url AS thumbUrl,
         p.title,
@@ -1418,6 +1441,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         p.updated_at AS updatedAt
       FROM photos p
       LEFT JOIN users u ON p.photographer_id = u.id
+      LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
       WHERE p.id = ?`;
 
     // apply organization scoping for single photo
@@ -1449,6 +1473,9 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       id: p.id,
       uuid: p.uuid,
       projectId: p.projectId,
+      timelineSectionId: p.timelineSectionId || null,
+      timelineSectionName: p.timelineSectionName || null,
+      timelineSectionTime: p.timelineSectionTime || null,
       url: resolveUrl(p.url),
       thumbUrl: resolveUrl(p.thumbUrl),
       title: p.title,
@@ -1541,10 +1568,14 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     await pool.query(sql, params);
 
     const [rows] = await pool.query(
-      `SELECT id, url, thumb_url AS thumbUrl, title, description, adjustments, tags,
+      `SELECT p.id, p.project_id AS projectId, p.timeline_section_id AS timelineSectionId,
+              pts.name AS timelineSectionName, pts.section_time AS timelineSectionTime,
+              p.url, p.thumb_url AS thumbUrl, p.title, p.description, p.adjustments, p.tags,
               ai_status AS aiStatus, ai_error AS aiError,
               ai_started_at AS aiStartedAt, ai_finished_at AS aiFinishedAt
-       FROM photos WHERE id = ?`,
+       FROM photos p
+       LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
+       WHERE p.id = ?`,
       [id]
     );
     if (!rows || rows.length === 0) return res.status(404).json({ error: 'photo not found' });
@@ -1556,6 +1587,10 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
 
     res.json({
       id: p.id,
+      projectId: p.projectId || null,
+      timelineSectionId: p.timelineSectionId || null,
+      timelineSectionName: p.timelineSectionName || null,
+      timelineSectionTime: p.timelineSectionTime || null,
       url: buildUploadUrl(p.url),
       thumbUrl: buildUploadUrl(p.thumbUrl),
       title: p.title,
