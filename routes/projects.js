@@ -363,14 +363,39 @@ async function attachTimelineToProject(project) {
 }
 
 async function replaceTimelineSections(conn, projectId, sections) {
-  await conn.query('DELETE FROM project_timeline_sections WHERE project_id = ?', [projectId]);
+  const [existingRows] = await conn.query(
+    'SELECT id, name FROM project_timeline_sections WHERE project_id = ? FOR UPDATE',
+    [projectId]
+  );
+  const existingByName = new Map((existingRows || []).map((row) => [String(row.name || ''), row]));
+  const keepIds = [];
+
   for (let i = 0; i < sections.length; i += 1) {
     const section = sections[i];
-    await conn.query(
-      `INSERT INTO project_timeline_sections (project_id, name, section_time, sort_order, created_at, updated_at)
-       VALUES (?, ?, ?, ?, NOW(), NOW())`,
-      [projectId, section.name, section.sectionTime || null, Number.isFinite(section.sortOrder) ? section.sortOrder : i]
-    );
+    const sortOrder = Number.isFinite(section.sortOrder) ? section.sortOrder : i;
+    const existing = existingByName.get(section.name);
+    if (existing && existing.id) {
+      keepIds.push(existing.id);
+      await conn.query(
+        `UPDATE project_timeline_sections
+         SET section_time = ?, sort_order = ?, updated_at = NOW()
+         WHERE id = ? AND project_id = ?`,
+        [section.sectionTime || null, sortOrder, existing.id, projectId]
+      );
+    } else {
+      const [result] = await conn.query(
+        `INSERT INTO project_timeline_sections (project_id, name, section_time, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, NOW(), NOW())`,
+        [projectId, section.name, section.sectionTime || null, sortOrder]
+      );
+      if (result && result.insertId) keepIds.push(result.insertId);
+    }
+  }
+
+  if (keepIds.length) {
+    await conn.query('DELETE FROM project_timeline_sections WHERE project_id = ? AND id NOT IN (?)', [projectId, keepIds]);
+  } else {
+    await conn.query('DELETE FROM project_timeline_sections WHERE project_id = ?', [projectId]);
   }
 }
 
