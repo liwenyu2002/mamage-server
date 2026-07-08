@@ -104,6 +104,74 @@ async function consumeRegisterEmailCode(email, emailCode) {
   }
 }
 
+function normalizeOrganizationCode(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+async function resolveRegistrationOrganization(db, body) {
+  const rawCode = body?.organizationCode ?? body?.organization_code ?? body?.orgCode ?? body?.org_code;
+  const organizationCode = normalizeOrganizationCode(rawCode);
+  if (organizationCode) {
+    try {
+      const [rows] = await db.query(
+        'SELECT id, name FROM organizations WHERE UPPER(code) = ? LIMIT 1',
+        [organizationCode]
+      );
+      if (!rows || rows.length === 0) {
+        return {
+          error: {
+            status: 400,
+            body: { error: 'INVALID_ORGANIZATION_CODE', message: '组织代号不存在' },
+          },
+        };
+      }
+      return { organizationId: Number(rows[0].id), organizationCode, organization: rows[0] };
+    } catch (e) {
+      const msg = e && e.message ? e.message : '';
+      if (msg.indexOf("Unknown column 'code'") !== -1 || (e && e.code === 'ER_BAD_FIELD_ERROR')) {
+        return {
+          error: {
+            status: 503,
+            body: { error: 'ORG_CODE_NOT_CONFIGURED', message: '组织代号尚未配置，请稍后再试' },
+          },
+        };
+      }
+      throw e;
+    }
+  }
+
+  // Compatibility for an older frontend during rolling deployment.
+  const legacyOrgIdRaw = body?.organization_id ?? body?.organizationId;
+  if (legacyOrgIdRaw !== undefined && legacyOrgIdRaw !== null && String(legacyOrgIdRaw).trim() !== '') {
+    const legacyOrgId = Number.parseInt(String(legacyOrgIdRaw), 10);
+    if (!Number.isFinite(legacyOrgId) || legacyOrgId <= 0) {
+      return {
+        error: {
+          status: 400,
+          body: { error: 'INVALID_ORGANIZATION', message: 'organization not found' },
+        },
+      };
+    }
+    const [rows] = await db.query('SELECT id, name FROM organizations WHERE id = ? LIMIT 1', [legacyOrgId]);
+    if (!rows || rows.length === 0) {
+      return {
+        error: {
+          status: 400,
+          body: { error: 'INVALID_ORGANIZATION', message: 'organization not found' },
+        },
+      };
+    }
+    return { organizationId: legacyOrgId, organizationCode: '', organization: rows[0] };
+  }
+
+  return {
+    error: {
+      status: 400,
+      body: { error: 'MISSING_ORGANIZATION_CODE', message: '请输入组织代号' },
+    },
+  };
+}
+
 // 注册
 router.post('/email-code', async (req, res) => {
   try {
@@ -157,7 +225,7 @@ router.post('/email-code', async (req, res) => {
 
 router.post('/register', async (req, res) => {
   try {
-    const { name, password, student_no, department, invite_code, organization_id } = req.body || {};
+    const { name, password, student_no, department, invite_code } = req.body || {};
     const email = normalizeEmail(req.body?.email);
     const emailCode = String(req.body?.emailCode || req.body?.verificationCode || '').trim();
 
@@ -178,6 +246,10 @@ router.post('/register', async (req, res) => {
     }
     const [existingEmailRows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
     if (existingEmailRows.length) return res.status(409).json({ error: 'EMAIL_EXISTS', message: '该邮箱已注册，请直接登录' });
+
+    const orgResolution = await resolveRegistrationOrganization(pool, req.body || {});
+    if (orgResolution.error) return res.status(orgResolution.error.status).json(orgResolution.error.body);
+    const organizationId = orgResolution.organizationId;
 
     const password_hash = await bcrypt.hash(password, 10);
     const now = new Date();
@@ -208,26 +280,7 @@ router.post('/register', async (req, res) => {
         const placeholders = ['?', '?', '?', '?', '?', '?'];
         const params = [finalStudentNo, name, role, password_hash, now, now];
 
-        if (organization_id !== undefined && organization_id !== null) {
-          // validate organization exists and is public (with fallback if is_public missing)
-          try {
-            const [orgRows] = await conn.query('SELECT id, is_public FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
-            if (!orgRows || orgRows.length === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' }); }
-            if (orgRows[0].is_public === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'ORG_NOT_PUBLIC', message: 'organization is not open for public registration' }); }
-          } catch (e) {
-            const msg = e && e.message ? e.message : '';
-            if (msg.indexOf("Unknown column 'is_public'") !== -1 || (e && e.code === 'ER_BAD_FIELD_ERROR')) {
-              // fallback: check existence only
-              const [orgRows2] = await conn.query('SELECT id FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
-              if (!orgRows2 || orgRows2.length === 0) { await conn.rollback(); conn.release(); return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' }); }
-            } else {
-              console.error('[users.register] organization validation error', e && e.stack ? e.stack : e);
-              await conn.rollback(); conn.release();
-              return res.status(500).json({ error: 'server error' });
-            }
-          }
-          cols.push('organization_id'); placeholders.push('?'); params.push(organization_id);
-        }
+        cols.push('organization_id'); placeholders.push('?'); params.push(organizationId);
         if (department !== undefined) { cols.push('department'); placeholders.push('?'); params.push(department); }
         if (email !== undefined) { cols.push('email'); placeholders.push('?'); params.push(email); }
 
@@ -261,23 +314,7 @@ router.post('/register', async (req, res) => {
         cols.push('created_at'); placeholders.push('?'); params.push(now);
         cols.push('updated_at'); placeholders.push('?'); params.push(now);
 
-        if (organization_id !== undefined && organization_id !== null) {
-          try {
-            const [orgRows] = await pool.query('SELECT id, is_public FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
-            if (!orgRows || orgRows.length === 0) return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' });
-            if (orgRows[0].is_public === 0) return res.status(400).json({ error: 'ORG_NOT_PUBLIC', message: 'organization is not open for public registration' });
-          } catch (e) {
-            const msg = e && e.message ? e.message : '';
-            if (msg.indexOf("Unknown column 'is_public'") !== -1 || (e && e.code === 'ER_BAD_FIELD_ERROR')) {
-              const [orgRows2] = await pool.query('SELECT id FROM organizations WHERE id = ? LIMIT 1', [organization_id]);
-              if (!orgRows2 || orgRows2.length === 0) return res.status(400).json({ error: 'INVALID_ORGANIZATION', message: 'organization not found' });
-            } else {
-              console.error('[users.register] organization validation error', e && e.stack ? e.stack : e);
-              return res.status(500).json({ error: 'server error' });
-            }
-          }
-          cols.push('organization_id'); placeholders.push('?'); params.push(organization_id);
-        }
+        cols.push('organization_id'); placeholders.push('?'); params.push(organizationId);
 
         const codeError = await consumeRegisterEmailCode(email, emailCode);
         if (codeError) return res.status(codeError.status).json(codeError.body);

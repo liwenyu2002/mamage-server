@@ -10,6 +10,7 @@
 // Optional envs:
 //   DEV_SEED_ORG_NAME=Default Organization
 //   DEV_SEED_ORG_SLUG=default-org
+//   DEV_SEED_ORG_CODE=DEVORG
 //   DEV_SEED_ADMIN_NAME=Dev Admin
 //   DEV_SEED_ADMIN_STUDENT_NO=devadmin
 //   DEV_SEED_ADMIN_EMAIL=dev-admin@example.com
@@ -32,6 +33,7 @@ const ROLE_PERM_SQL = path.resolve(__dirname, '..', 'db', 'role_permissions_seed
 const DEFAULTS = {
   orgName: process.env.DEV_SEED_ORG_NAME || 'Default Organization',
   orgSlug: process.env.DEV_SEED_ORG_SLUG || 'default-org',
+  orgCode: process.env.DEV_SEED_ORG_CODE || 'DEVORG',
   adminName: process.env.DEV_SEED_ADMIN_NAME || 'Dev Admin',
   adminStudentNo: process.env.DEV_SEED_ADMIN_STUDENT_NO || 'devadmin',
   adminEmail: process.env.DEV_SEED_ADMIN_EMAIL || 'dev-admin@example.com',
@@ -132,14 +134,18 @@ async function upsertDefaultOrganization() {
     throw new Error('organizations.name column is missing');
   }
 
-  const { orgName, orgSlug } = DEFAULTS;
+  const { orgName, orgSlug, orgCode } = DEFAULTS;
   let row = null;
-  if (cols.has('slug') && orgSlug) {
-    const [rows] = await pool.query('SELECT id, name, slug FROM organizations WHERE slug = ? LIMIT 1', [orgSlug]);
+  if (cols.has('code') && orgCode) {
+    const [rows] = await pool.query('SELECT id, name, slug, code FROM organizations WHERE code = ? LIMIT 1', [orgCode]);
+    row = rows && rows[0] ? rows[0] : null;
+  }
+  if (!row && cols.has('slug') && orgSlug) {
+    const [rows] = await pool.query('SELECT id, name, slug, code FROM organizations WHERE slug = ? LIMIT 1', [orgSlug]);
     row = rows && rows[0] ? rows[0] : null;
   }
   if (!row) {
-    const [rows] = await pool.query('SELECT id, name, slug FROM organizations WHERE name = ? LIMIT 1', [orgName]);
+    const [rows] = await pool.query('SELECT id, name, slug, code FROM organizations WHERE name = ? LIMIT 1', [orgName]);
     row = rows && rows[0] ? rows[0] : null;
   }
 
@@ -148,7 +154,11 @@ async function upsertDefaultOrganization() {
       await pool.query('UPDATE organizations SET slug = ? WHERE id = ?', [orgSlug, row.id]);
       row.slug = orgSlug;
     }
-    return { id: Number(row.id), created: false, name: row.name, slug: row.slug || null };
+    if (cols.has('code') && orgCode && String(row.code || '') !== orgCode) {
+      await pool.query('UPDATE organizations SET code = ? WHERE id = ?', [orgCode, row.id]);
+      row.code = orgCode;
+    }
+    return { id: Number(row.id), created: false, name: row.name, slug: row.slug || null, code: row.code || null };
   }
 
   const fields = ['name'];
@@ -156,6 +166,10 @@ async function upsertDefaultOrganization() {
   if (cols.has('slug')) {
     fields.push('slug');
     values.push(orgSlug);
+  }
+  if (cols.has('code')) {
+    fields.push('code');
+    values.push(orgCode);
   }
   const placeholders = fields.map(() => '?').join(', ');
   const [insertRes] = await pool.query(
@@ -167,6 +181,7 @@ async function upsertDefaultOrganization() {
     created: true,
     name: orgName,
     slug: cols.has('slug') ? orgSlug : null,
+    code: cols.has('code') ? orgCode : null,
   };
 }
 
