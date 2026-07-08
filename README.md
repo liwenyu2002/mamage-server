@@ -87,6 +87,24 @@ CORS_ORIGIN=http://localhost:5173
 UPLOAD_BASE_URL=https://<your-cos-domain>
 ```
 
+如果要开放真实邮箱验证码注册，还需要 SMTP 发信配置：
+
+```env
+SMTP_HOST=smtp.example.com
+SMTP_PORT=465
+SMTP_SECURE=1
+SMTP_USER=
+SMTP_PASS=
+SMTP_FROM=MaMage 图库 <no-reply@example.com>
+EMAIL_CODE_SECRET=
+EMAIL_CODE_TTL_SECONDS=600
+EMAIL_CODE_COOLDOWN_SECONDS=60
+EMAIL_CODE_MAX_PER_HOUR=5
+EMAIL_CODE_MAX_ATTEMPTS=5
+```
+
+`EMAIL_CODE_SECRET` 不填时会回退使用 `JWT_SECRET`；生产环境建议单独设置。
+
 如果要使用上传接口（`POST /api/upload/photo`），还需要：
 
 ```env

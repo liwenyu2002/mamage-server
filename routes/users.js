@@ -8,6 +8,12 @@ const { v4: uuidv4 } = require('uuid');
 const keys = require('../config/keys');
 const JWT_SECRET = keys.JWT_SECRET;
 const crypto = require('crypto');
+const {
+  normalizeEmail,
+  getRequestIp,
+  sendVerificationCode,
+  verifyAndConsumeVerificationCode,
+} = require('../lib/email_verification');
 
 // validation
 const emailRegex = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
@@ -79,10 +85,81 @@ async function authMiddleware(req, res, next) {
   }
 }
 
+async function consumeRegisterEmailCode(email, emailCode) {
+  try {
+    await verifyAndConsumeVerificationCode({ email, purpose: 'register', code: emailCode });
+    return null;
+  } catch (e) {
+    const code = e && e.code;
+    if (code === 'EMAIL_CODE_EXPIRED') {
+      return { status: 400, body: { error: code, message: '验证码已过期，请重新获取' } };
+    }
+    if (code === 'EMAIL_CODE_ATTEMPTS_EXCEEDED') {
+      return { status: 400, body: { error: code, message: '验证码错误次数过多，请重新获取' } };
+    }
+    if (code === 'INVALID_EMAIL_CODE') {
+      return { status: 400, body: { error: code, message: '验证码不正确' } };
+    }
+    throw e;
+  }
+}
+
 // 注册
+router.post('/email-code', async (req, res) => {
+  try {
+    if (process.env.DISABLE_USER_REGISTRATION === '1') {
+      return res.status(503).json({ error: 'REGISTRATION_DISABLED', message: '注册已被临时关闭' });
+    }
+
+    const purpose = String(req.body?.purpose || 'register').trim().toLowerCase();
+    if (purpose !== 'register') {
+      return res.status(400).json({ error: 'UNSUPPORTED_EMAIL_PURPOSE', message: '暂不支持该验证码用途' });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).json({ error: 'MISSING_EMAIL', message: '请填写邮箱' });
+    if (!emailRegex.test(email)) return res.status(400).json({ error: 'INVALID_EMAIL', message: '邮箱格式不正确' });
+
+    const [existing] = await pool.query('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+    if (existing.length) return res.status(409).json({ error: 'EMAIL_EXISTS', message: '该邮箱已注册，请直接登录' });
+
+    const result = await sendVerificationCode({
+      email,
+      purpose,
+      requestIp: getRequestIp(req),
+    });
+
+    return res.json({
+      ok: true,
+      expiresInSeconds: result.expiresInSeconds,
+      cooldownSeconds: result.cooldownSeconds,
+    });
+  } catch (err) {
+    const code = err && err.code;
+    if (code === 'EMAIL_CODE_COOLDOWN') {
+      return res.status(429).json({
+        error: code,
+        message: '验证码发送太频繁，请稍后再试',
+        cooldownSeconds: Math.max(1, Number(err.cooldownSeconds || 60)),
+      });
+    }
+    if (code === 'EMAIL_CODE_RATE_LIMITED') {
+      return res.status(429).json({ error: code, message: '验证码请求过多，请一小时后再试' });
+    }
+    if (code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_CODE_SECRET_MISSING') {
+      console.error('[users.emailCode] configuration error:', code);
+      return res.status(503).json({ error: 'EMAIL_SERVICE_NOT_CONFIGURED', message: '邮件服务尚未配置' });
+    }
+    console.error('[users.emailCode]', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'EMAIL_SEND_FAILED', message: '验证码发送失败，请稍后重试' });
+  }
+});
+
 router.post('/register', async (req, res) => {
   try {
-    const { name, password, student_no, email, department, invite_code, organization_id } = req.body || {};
+    const { name, password, student_no, department, invite_code, organization_id } = req.body || {};
+    const email = normalizeEmail(req.body?.email);
+    const emailCode = String(req.body?.emailCode || req.body?.verificationCode || '').trim();
 
     // 临时禁用注册：设置环境变量 `DISABLE_USER_REGISTRATION=1` 可重新开启
     if (process.env.DISABLE_USER_REGISTRATION === '1') {
@@ -90,19 +167,17 @@ router.post('/register', async (req, res) => {
     }
 
     // basic validation
-    if (!name || !password) return res.status(400).json({ error: 'MISSING_FIELDS', message: 'name 和 password 为必填项' });
+    if (!name || !password || !email || !emailCode) return res.status(400).json({ error: 'MISSING_FIELDS', message: '姓名、邮箱、验证码和密码为必填项' });
     if (!pwdRegex.test(password)) return res.status(400).json({ error: 'INVALID_PASSWORD', message: '密码须为8-16位，且为字母和数字的组合' });
-    if (email && !emailRegex.test(email)) return res.status(400).json({ error: 'INVALID_EMAIL', message: '邮箱格式不正确' });
+    if (!emailRegex.test(email)) return res.status(400).json({ error: 'INVALID_EMAIL', message: '邮箱格式不正确' });
 
     // uniqueness checks
     if (student_no) {
       const [existing] = await pool.query('SELECT id FROM users WHERE student_no = ?', [student_no]);
       if (existing.length) return res.status(409).json({ error: 'student_no already exists' });
     }
-    if (email) {
-      const [existing] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
-      if (existing.length) return res.status(409).json({ error: 'email already exists' });
-    }
+    const [existingEmailRows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+    if (existingEmailRows.length) return res.status(409).json({ error: 'EMAIL_EXISTS', message: '该邮箱已注册，请直接登录' });
 
     const password_hash = await bcrypt.hash(password, 10);
     const now = new Date();
@@ -156,6 +231,12 @@ router.post('/register', async (req, res) => {
         if (department !== undefined) { cols.push('department'); placeholders.push('?'); params.push(department); }
         if (email !== undefined) { cols.push('email'); placeholders.push('?'); params.push(email); }
 
+        const codeError = await consumeRegisterEmailCode(email, emailCode);
+        if (codeError) {
+          await conn.rollback(); conn.release();
+          return res.status(codeError.status).json(codeError.body);
+        }
+
         const sql = `INSERT INTO users (${cols.join(',')}) VALUES (${placeholders.join(',')})`;
         const [result] = await conn.query(sql, params);
         const userId = result.insertId;
@@ -197,6 +278,9 @@ router.post('/register', async (req, res) => {
           }
           cols.push('organization_id'); placeholders.push('?'); params.push(organization_id);
         }
+
+        const codeError = await consumeRegisterEmailCode(email, emailCode);
+        if (codeError) return res.status(codeError.status).json(codeError.body);
 
         const sql = `INSERT INTO users (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`;
         const [result] = await pool.query(sql, params);
