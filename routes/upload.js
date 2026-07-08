@@ -1,6 +1,8 @@
 // routes/upload.js
 const express = require('express');
 const router = express.Router();
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const net = require('net');
 const multer = require('multer');
@@ -11,6 +13,7 @@ const cosStorage = require('../lib/cos_storage');
 const { requirePermission } = require('../lib/permissions');
 
 const MAX_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_FILE_MB || 30)) * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_VIDEO_MB || 512)) * 1024 * 1024;
 const THUMB_MAX_DIMENSION = Math.max(320, Number(process.env.UPLOAD_THUMB_MAX_DIMENSION || process.env.UPLOAD_THUMB_MAX_WIDTH || 800));
 const THUMB_QUALITY = Math.min(95, Math.max(50, Number(process.env.UPLOAD_THUMB_JPEG_QUALITY || 80)));
 const UPLOAD_CACHE_CONTROL = process.env.UPLOAD_CACHE_CONTROL || 'public, max-age=31536000, immutable';
@@ -27,6 +30,16 @@ const IMAGE_MIME_BY_EXT = new Map([
   ['.heif', 'image/heif'],
 ]);
 const ALLOWED_IMAGE_MIMES = new Set(IMAGE_MIME_BY_EXT.values());
+const VIDEO_MIME_BY_EXT = new Map([
+  ['.mp4', 'video/mp4'],
+  ['.m4v', 'video/mp4'],
+  ['.mov', 'video/quicktime'],
+  ['.webm', 'video/webm'],
+  ['.ogg', 'video/ogg'],
+  ['.ogv', 'video/ogg'],
+]);
+const ALLOWED_VIDEO_MIMES = new Set(VIDEO_MIME_BY_EXT.values());
+const VIDEO_UPLOAD_TMP_DIR = process.env.UPLOAD_VIDEO_TMP_DIR || path.join(os.tmpdir(), 'mamage-video-uploads');
 
 function parseEnvBoolean(value) {
   const raw = String(value || '').trim().toLowerCase();
@@ -105,11 +118,52 @@ const upload = multer({
   },
 });
 
+try {
+  fs.mkdirSync(VIDEO_UPLOAD_TMP_DIR, { recursive: true });
+} catch (err) {
+  console.warn('[upload] create video tmp dir failed:', err && err.message ? err.message : err);
+}
+
+const videoStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, VIDEO_UPLOAD_TMP_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(String(file && file.originalname || '')).toLowerCase() || '.mp4';
+    cb(null, `${uuidv4()}${ext}`);
+  },
+});
+
+const videoUpload = multer({
+  storage: videoStorage,
+  limits: {
+    fileSize: MAX_VIDEO_UPLOAD_BYTES,
+    files: 1,
+    fields: 16,
+    parts: 24,
+  },
+  fileFilter: (req, file, cb) => {
+    const mime = inferVideoMime(file && file.mimetype, file && file.originalname);
+    if (!mime || !ALLOWED_VIDEO_MIMES.has(mime)) {
+      const err = new Error('UNSUPPORTED_VIDEO_TYPE');
+      err.status = 415;
+      return cb(err);
+    }
+    file.mimetype = mime;
+    cb(null, true);
+  },
+});
+
 function inferImageMime(mimeType, filename) {
   const mime = String(mimeType || '').trim().toLowerCase();
   if (ALLOWED_IMAGE_MIMES.has(mime)) return mime;
   const ext = path.extname(String(filename || '')).toLowerCase();
   return IMAGE_MIME_BY_EXT.get(ext) || null;
+}
+
+function inferVideoMime(mimeType, filename) {
+  const mime = String(mimeType || '').trim().toLowerCase();
+  if (ALLOWED_VIDEO_MIMES.has(mime)) return mime;
+  const ext = path.extname(String(filename || '')).toLowerCase();
+  return VIDEO_MIME_BY_EXT.get(ext) || null;
 }
 
 function parseProjectId(raw) {
@@ -172,26 +226,26 @@ function readPhotoMetadata(body) {
   };
 }
 
-function buildObjectKeys(projectId, originalName, mimeType) {
+function buildObjectKeys(projectId, originalName, mimeType, mediaType = 'image') {
   let keyPrefix;
   if (Number(projectId) === 1) {
-    keyPrefix = 'uploads/scenery';
+    keyPrefix = mediaType === 'video' ? 'uploads/scenery/videos' : 'uploads/scenery';
   } else {
     const now = new Date();
     const year = now.getFullYear().toString();
     const month = String(now.getMonth() + 1).padStart(2, '0');
     const day = String(now.getDate()).padStart(2, '0');
-    keyPrefix = `uploads/${year}/${month}/${day}`;
+    keyPrefix = mediaType === 'video' ? `uploads/videos/${year}/${month}/${day}` : `uploads/${year}/${month}/${day}`;
   }
-  const ext = cosStorage.extFromFilenameOrMime(originalName, mimeType, '.jpg');
+  const ext = cosStorage.extFromFilenameOrMime(originalName, mimeType, mediaType === 'video' ? '.mp4' : '.jpg');
   const filename = `${uuidv4()}${ext}`;
   const originalKey = `${keyPrefix}/${filename}`;
-  const thumbKey = `${keyPrefix}/thumbs/thumb_${path.basename(filename, ext)}.jpg`;
+  const thumbKey = mediaType === 'video' ? null : `${keyPrefix}/thumbs/thumb_${path.basename(filename, ext)}.jpg`;
   return {
     originalKey,
     thumbKey,
     relPath: `/${originalKey}`,
-    thumbRel: `/${thumbKey}`,
+    thumbRel: thumbKey ? `/${thumbKey}` : null,
   };
 }
 
@@ -486,17 +540,21 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
   }
 }
 
-function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, title, type, photographerId, photographerName }) {
+function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, title, type, mediaType, photographerId, photographerName }) {
   return {
     id: insertedId,
     projectId: projectId || null,
     timelineSectionId: timelineSectionId || null,
     url: buildUploadUrl(relPath),
-    thumbUrl: buildUploadUrl(thumbRel),
+    thumbUrl: thumbRel ? buildUploadUrl(thumbRel) : null,
+    fullUrl: buildUploadUrl(relPath),
+    fullThumbUrl: thumbRel ? buildUploadUrl(thumbRel) : null,
     title,
     type,
-    aiStatus: 'pending',
-    ai_status: 'pending',
+    mediaType: mediaType || (type === 'video' ? 'video' : 'image'),
+    media_type: mediaType || (type === 'video' ? 'video' : 'image'),
+    aiStatus: type === 'video' ? 'skipped' : 'pending',
+    ai_status: type === 'video' ? 'skipped' : 'pending',
     photographerId: photographerId || null,
     photographerName: photographerName || null,
   };
@@ -512,6 +570,19 @@ function handleUploadMiddleware(req, res, next) {
       return res.status(400).json({ error: err.code || 'UPLOAD_REJECTED' });
     }
     return res.status(err.status || 400).json({ error: err.message || 'UPLOAD_REJECTED' });
+  });
+}
+
+function handleVideoUploadMiddleware(req, res, next) {
+  videoUpload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'VIDEO_FILE_TOO_LARGE', maxFileBytes: MAX_VIDEO_UPLOAD_BYTES });
+      }
+      return res.status(400).json({ error: err.code || 'VIDEO_UPLOAD_REJECTED' });
+    }
+    return res.status(err.status || 400).json({ error: err.message || 'VIDEO_UPLOAD_REJECTED' });
   });
 }
 
@@ -628,6 +699,102 @@ async function processUpload(req, res) {
     await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
     console.error('POST /api/upload/photo error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+  }
+}
+
+async function processVideoUpload(req, res) {
+  let uploadedKeys = [];
+  const startMs = nowMs();
+  const filePath = req.file && req.file.path ? req.file.path : null;
+  try {
+    if (!req.file || !filePath) {
+      return res.status(400).json({ error: 'No video uploaded' });
+    }
+    if (!cosStorage.isConfigured()) {
+      return res.status(503).json({
+        error: 'COS_NOT_CONFIGURED',
+        message: 'Server is not configured to upload to object storage. Configure COS_SECRET_ID/COS_SECRET_KEY/COS_BUCKET/COS_REGION.',
+      });
+    }
+
+    const metadata = readPhotoMetadata(req.body || {});
+    metadata.type = 'video';
+    const photographerId = req.user && req.user.id ? req.user.id : null;
+    const orgId = getOrgId(req);
+    await ensureProjectInScope(pool, metadata.projectId, orgId);
+    await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
+
+    const mimeType = inferVideoMime(req.file.mimetype, req.file.originalname);
+    if (!mimeType) return res.status(415).json({ error: 'UNSUPPORTED_VIDEO_TYPE' });
+    const { originalKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
+
+    try {
+      await cosStorage.uploadFile(originalKey, filePath, {
+        contentType: mimeType,
+        contentLength: req.file.size,
+        cacheControl: UPLOAD_CACHE_CONTROL,
+      });
+      uploadedKeys.push(originalKey);
+    } catch (err) {
+      await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
+      console.error('[upload.video] upload to COS failed:', err && err.message ? err.message : err);
+      return res.status(502).json({ error: 'COS_UPLOAD_FAILED', message: String(err && err.message ? err.message : err) });
+    }
+
+    let insertedId;
+    try {
+      insertedId = await createPhotoRecordWithRetry({
+        ...metadata,
+        relPath,
+        thumbRel,
+        aiStatus: 'skipped',
+        photographerId,
+        orgId,
+      });
+    } catch (err) {
+      await cosStorage.deleteObjects([originalKey]).catch(() => null);
+      const status = err.status || 500;
+      const message = err.publicMessage || err.message || 'DB_INSERT_FAILED';
+      console.error('[upload.video] DB insert failed, cleaned COS object:', message);
+      return res.status(status).json({ error: status === 404 ? 'PROJECT_NOT_FOUND' : 'DB_INSERT_FAILED', message });
+    }
+
+    setImmediate(() => {
+      appendPhotoIdToProjectBestEffort(metadata.projectId, insertedId).catch((err) => {
+        console.warn('[upload.video] project photo_ids async sync failed:', err && err.message ? err.message : err);
+      });
+    });
+
+    const photographerName = await getPhotographerName(photographerId);
+    if (UPLOAD_TIMING_LOGS) {
+      console.log('[upload.video] timing', {
+        mediaId: insertedId,
+        projectId: metadata.projectId || null,
+        bytes: req.file.size,
+        totalMs: nowMs() - startMs,
+      });
+    }
+
+    return res.json(makeResponsePayload({
+      insertedId,
+      projectId: metadata.projectId,
+      timelineSectionId: metadata.timelineSectionId,
+      relPath,
+      thumbRel,
+      title: metadata.title,
+      type: 'video',
+      mediaType: 'video',
+      photographerId,
+      photographerName,
+    }));
+  } catch (err) {
+    await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
+    console.error('POST /api/upload/video error:', err && err.stack ? err.stack : err);
+    return res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+  } finally {
+    if (filePath) {
+      fs.promises.unlink(filePath).catch(() => null);
+    }
   }
 }
 
@@ -774,8 +941,10 @@ router.post('/photo/direct/abort', requirePermission('upload.photo'), async (req
 });
 
 router.post('/photo', requirePermission('upload.photo'), handleUploadMiddleware, processUpload);
+router.post('/video', requirePermission('upload.photo'), handleVideoUploadMiddleware, processVideoUpload);
 
 router.upload = upload;
 router.processUpload = processUpload;
+router.processVideoUpload = processVideoUpload;
 
 module.exports = router;

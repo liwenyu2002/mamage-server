@@ -147,6 +147,7 @@ function chooseCoverFromPhotos(photoRows) {
   let first = null;
 
   for (const p of photoRows) {
+    if (String(p.type || p.mediaType || '').toLowerCase() === 'video') continue;
     if (!first) first = p;
     let tags = null;
     try {
@@ -182,6 +183,7 @@ async function fetchProjectPreviewPhotos(projectIds, orgId, latestLimit = 6) {
       ranked.url,
       ranked.thumbUrl,
       ranked.tags,
+      ranked.type,
       ranked.created_at AS created_at
     FROM (
       SELECT
@@ -190,6 +192,7 @@ async function fetchProjectPreviewPhotos(projectIds, orgId, latestLimit = 6) {
         ph.url,
         ph.thumb_url AS thumbUrl,
         ph.tags,
+        ph.type,
         ph.created_at,
         ROW_NUMBER() OVER (
           PARTITION BY ph.project_id
@@ -209,6 +212,7 @@ async function fetchProjectPreviewPhotos(projectIds, orgId, latestLimit = 6) {
         ) AS coverRank
       FROM photos ph
       WHERE ph.project_id IN (?)
+        AND (ph.type IS NULL OR ph.type <> 'video')
   `;
   const params = [ids];
   if (orgId === null) {
@@ -231,7 +235,7 @@ async function fetchProjectPreviewPhotos(projectIds, orgId, latestLimit = 6) {
     // Older MySQL variants may not support window functions. Keep a safe fallback
     // so deployments do not break, while MySQL 8+ gets bounded per-project reads.
     console.warn('[projects] preview window query fallback:', err && err.message ? err.message : err);
-    let fallbackSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id IN (?)`;
+    let fallbackSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, type, created_at FROM photos WHERE project_id IN (?) AND (type IS NULL OR type <> 'video')`;
     const fallbackParams = [ids];
     if (orgId === null) {
       fallbackSql += ' AND organization_id IS NULL';
@@ -432,6 +436,7 @@ router.get('/', async (req, res) => {
           SELECT ph.thumb_url
           FROM photos ph
           WHERE ph.project_id = p.id
+            AND (ph.type IS NULL OR ph.type <> 'video')
           ORDER BY ph.created_at DESC, ph.id DESC
           LIMIT 1
         ) AS coverThumbUrl,
@@ -439,6 +444,7 @@ router.get('/', async (req, res) => {
           SELECT ph.url
           FROM photos ph
           WHERE ph.project_id = p.id
+            AND (ph.type IS NULL OR ph.type <> 'video')
           ORDER BY ph.created_at DESC, ph.id DESC
           LIMIT 1
         ) AS coverUrl
@@ -681,6 +687,7 @@ router.get('/list', async (req, res) => {
           FROM photos ph
           WHERE ph.project_id = p.id
           ${orgId === null ? 'AND ph.organization_id IS NULL' : 'AND ph.organization_id = ?'}
+          AND (ph.type IS NULL OR ph.type <> 'video')
           ORDER BY ph.created_at DESC, ph.id DESC
           LIMIT 1
         ) AS coverThumbUrl,
@@ -689,6 +696,7 @@ router.get('/list', async (req, res) => {
           FROM photos ph
           WHERE ph.project_id = p.id
           ${orgId === null ? 'AND ph.organization_id IS NULL' : 'AND ph.organization_id = ?'}
+          AND (ph.type IS NULL OR ph.type <> 'video')
           ORDER BY ph.created_at DESC, ph.id DESC
           LIMIT 1
         ) AS coverUrl
@@ -730,11 +738,12 @@ router.get('/list', async (req, res) => {
           const cover = chooseCoverFromPhotos(pRows);
           item.coverUrl = cover.url ? buildUploadUrl(cover.url) : null;
           item.coverThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
-          item.previewImages = pRows.slice(0, 6).map((ph) => ({
+          item.previewImages = pRows.filter((ph) => String(ph.type || '').toLowerCase() !== 'video').slice(0, 6).map((ph) => ({
             id: ph.id,
             url: ph.url ? buildUploadUrl(ph.url) : null,
             thumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null,
             fullThumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null,
+            type: ph.type || null,
           })).filter((ph) => ph && (ph.url || ph.thumbUrl));
         }
       }
@@ -1009,7 +1018,7 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
       // 计算封面（如果有照片）并填充为可访问的完整 URL
       try {
         const [photos] = await pool.query(
-          `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
+          `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, type, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
           [newId]
         );
         const cover = chooseCoverFromPhotos(photos);
@@ -1144,7 +1153,7 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
     // 计算封面（保持与列表/详情一致的行为）
     try {
       const [photos] = await pool.query(
-        `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
+        `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, tags, type, created_at FROM photos WHERE project_id = ? ORDER BY created_at DESC, id DESC`,
         [id]
       );
       const cover = chooseCoverFromPhotos(photos);
