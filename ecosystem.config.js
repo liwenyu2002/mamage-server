@@ -1,6 +1,7 @@
 // ecosystem.config.js
 // PM2 生态配置文件
 // 在 ECS 上使用此配置可以自动从系统环境变量读取密钥并注入到应用进程
+require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
 module.exports = {
   apps: [
@@ -18,9 +19,9 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         // 数据库配置
-        DB_HOST: process.env.DB_HOST || '127.0.0.1',
+        DB_HOST: process.env.DB_HOST || 'localhost',
         DB_PORT: process.env.DB_PORT || '3306',
-        DB_USER: process.env.DB_USER || 'user',
+        DB_USER: process.env.DB_USER || 'root',
         DB_PASSWORD: process.env.DB_PASSWORD || '',
         DB_NAME: process.env.DB_NAME || 'mamage',
         
