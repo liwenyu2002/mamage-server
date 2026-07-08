@@ -55,7 +55,18 @@ module.exports = {
         OLLAMA_REQUEST_TIMEOUT_MS: process.env.OLLAMA_REQUEST_TIMEOUT_MS || '120000',
         
         // CORS
-        CORS_ORIGIN: process.env.CORS_ORIGIN || 'http://localhost:5173'
+        CORS_ORIGIN: process.env.CORS_ORIGIN || [
+          'http://localhost:5173',
+          'http://127.0.0.1:5173',
+          'http://localhost:5188',
+          'http://127.0.0.1:5188',
+          'http://10.11.12.63:3000',
+          'http://10.100.83.67:3000',
+          'https://mamage.wenyuli.site',
+          'https://lan.mamage.wenyuli.site',
+          'https://lan.mamage.wenyuli.site:3443',
+          'http://mamage.wenyuli.site',
+        ].join(',')
       },
       
       // ===== 日志配置 =====

@@ -73,9 +73,21 @@ const configuredCorsOrigins = String(process.env.CORS_ORIGIN || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+const defaultCorsOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5188',
+  'http://127.0.0.1:5188',
+  'http://10.11.12.63:3000',
+  'http://10.100.83.67:3000',
+  'https://mamage.wenyuli.site',
+  'https://lan.mamage.wenyuli.site',
+  'https://lan.mamage.wenyuli.site:3443',
+  'http://mamage.wenyuli.site',
+];
 const allowedCorsOrigins = new Set(configuredCorsOrigins.length
   ? configuredCorsOrigins
-  : ['http://localhost:5173', 'http://127.0.0.1:5173']);
+  : defaultCorsOrigins);
 app.use((req, res, next) => {
   const origin = req.get('origin');
   const originAllowed = origin && allowedCorsOrigins.has(origin);
@@ -83,6 +95,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
@@ -144,5 +157,3 @@ async function startup() {
 }
 
 startup();
-
-
