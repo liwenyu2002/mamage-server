@@ -15,7 +15,8 @@
     "face:backfill": "node scripts/backfill_faces.js",
     "image:backfill": "node scripts/backfill_image_embeddings.js",
     "video:playback:backfill": "node scripts/backfill_video_playback.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "ai:tags:backfill": "node scripts/backfill_ai_tags.js"
   },
   "keywords": [],
   "author": "",

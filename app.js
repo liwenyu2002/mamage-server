@@ -154,6 +154,18 @@ async function startup() {
   app.listen(PORT, () => {
     console.log(`API server listening on http://localhost:${PORT}`);
   });
+
+  // AI 打标队列是纯内存的：重启后把 pending/running 孤儿重新入队。
+  // 延迟执行避开启动高峰；AI_REQUEUE_ON_BOOT=0 可关闭。
+  if (String(process.env.AI_REQUEUE_ON_BOOT || '1') !== '0') {
+    setTimeout(() => {
+      try {
+        require('./lib/ai_tags_worker').requeueStuckPhotos({ limit: Number(process.env.AI_REQUEUE_LIMIT) || 200 });
+      } catch (e) {
+        console.warn('AI requeue on boot failed:', e && e.message ? e.message : e);
+      }
+    }, 15000);
+  }
 }
 
 startup();
