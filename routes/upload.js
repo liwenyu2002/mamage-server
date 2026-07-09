@@ -5,12 +5,16 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const multer = require('multer');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
 const { pool, buildUploadUrl } = require('../db');
 const cosStorage = require('../lib/cos_storage');
 const { requirePermission } = require('../lib/permissions');
+
+const execFileAsync = promisify(execFile);
 
 const MAX_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_FILE_MB || 30)) * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_VIDEO_MB || 512)) * 1024 * 1024;
@@ -19,6 +23,9 @@ const THUMB_QUALITY = Math.min(95, Math.max(50, Number(process.env.UPLOAD_THUMB_
 const UPLOAD_CACHE_CONTROL = process.env.UPLOAD_CACHE_CONTROL || 'public, max-age=31536000, immutable';
 const SIGNED_UPLOAD_EXPIRES_SECONDS = Number(process.env.COS_SIGNED_UPLOAD_EXPIRES_SECONDS || 900);
 const UPLOAD_TIMING_LOGS = parseEnvBoolean(process.env.UPLOAD_TIMING_LOGS) === true;
+const VIDEO_FASTSTART_ENABLED = parseEnvBoolean(process.env.VIDEO_FASTSTART_ENABLED) !== false;
+const VIDEO_FASTSTART_TIMEOUT_MS = Math.max(10000, Number(process.env.VIDEO_FASTSTART_TIMEOUT_MS || 120000));
+const FFMPEG_PATH = process.env.FFMPEG_PATH || (fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg');
 
 const IMAGE_MIME_BY_EXT = new Map([
   ['.jpg', 'image/jpeg'],
@@ -164,6 +171,46 @@ function inferVideoMime(mimeType, filename) {
   if (ALLOWED_VIDEO_MIMES.has(mime)) return mime;
   const ext = path.extname(String(filename || '')).toLowerCase();
   return VIDEO_MIME_BY_EXT.get(ext) || null;
+}
+
+function shouldFastStartVideo(mimeType, filePath) {
+  if (!VIDEO_FASTSTART_ENABLED) return false;
+  const mime = String(mimeType || '').toLowerCase();
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return mime === 'video/mp4' || mime === 'video/quicktime' || ext === '.mp4' || ext === '.m4v' || ext === '.mov';
+}
+
+async function prepareVideoForStreaming(filePath, mimeType) {
+  if (!filePath || !shouldFastStartVideo(mimeType, filePath)) {
+    const stat = filePath ? await fs.promises.stat(filePath).catch(() => null) : null;
+    return { filePath, cleanupPath: null, size: stat ? stat.size : null, fastStarted: false };
+  }
+
+  const ext = path.extname(String(filePath || '')).toLowerCase() || '.mp4';
+  const outputPath = path.join(VIDEO_UPLOAD_TMP_DIR, `${uuidv4()}-faststart${ext}`);
+  try {
+    await execFileAsync(FFMPEG_PATH, [
+      '-y',
+      '-v', 'error',
+      '-i', filePath,
+      '-map', '0',
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      '-avoid_negative_ts', 'make_zero',
+      outputPath,
+    ], {
+      timeout: VIDEO_FASTSTART_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    const stat = await fs.promises.stat(outputPath);
+    if (!stat.size) throw new Error('ffmpeg produced empty video');
+    return { filePath: outputPath, cleanupPath: outputPath, size: stat.size, fastStarted: true };
+  } catch (err) {
+    fs.promises.unlink(outputPath).catch(() => null);
+    console.warn('[upload.video] faststart skipped:', err && err.message ? err.message : err);
+    const stat = await fs.promises.stat(filePath).catch(() => null);
+    return { filePath, cleanupPath: null, size: stat ? stat.size : null, fastStarted: false };
+  }
 }
 
 function parseProjectId(raw) {
@@ -706,6 +753,7 @@ async function processVideoUpload(req, res) {
   let uploadedKeys = [];
   const startMs = nowMs();
   const filePath = req.file && req.file.path ? req.file.path : null;
+  let processedVideo = null;
   try {
     if (!req.file || !filePath) {
       return res.status(400).json({ error: 'No video uploaded' });
@@ -727,11 +775,14 @@ async function processVideoUpload(req, res) {
     const mimeType = inferVideoMime(req.file.mimetype, req.file.originalname);
     if (!mimeType) return res.status(415).json({ error: 'UNSUPPORTED_VIDEO_TYPE' });
     const { originalKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
+    processedVideo = await prepareVideoForStreaming(filePath, mimeType);
+    const uploadFilePath = processedVideo.filePath || filePath;
+    const uploadSize = processedVideo.size || req.file.size;
 
     try {
-      await cosStorage.uploadFile(originalKey, filePath, {
+      await cosStorage.uploadFile(originalKey, uploadFilePath, {
         contentType: mimeType,
-        contentLength: req.file.size,
+        contentLength: uploadSize,
         cacheControl: UPLOAD_CACHE_CONTROL,
       });
       uploadedKeys.push(originalKey);
@@ -770,7 +821,8 @@ async function processVideoUpload(req, res) {
       console.log('[upload.video] timing', {
         mediaId: insertedId,
         projectId: metadata.projectId || null,
-        bytes: req.file.size,
+        bytes: uploadSize,
+        fastStarted: !!(processedVideo && processedVideo.fastStarted),
         totalMs: nowMs() - startMs,
       });
     }
@@ -792,6 +844,9 @@ async function processVideoUpload(req, res) {
     console.error('POST /api/upload/video error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
   } finally {
+    if (processedVideo && processedVideo.cleanupPath && processedVideo.cleanupPath !== filePath) {
+      fs.promises.unlink(processedVideo.cleanupPath).catch(() => null);
+    }
     if (filePath) {
       fs.promises.unlink(filePath).catch(() => null);
     }

@@ -13,6 +13,12 @@ const CONTENT_TYPE_BY_EXT = new Map([
   ['.heic', 'image/heic'],
   ['.heif', 'image/heif'],
   ['.avif', 'image/avif'],
+  ['.mp4', 'video/mp4'],
+  ['.m4v', 'video/mp4'],
+  ['.mov', 'video/quicktime'],
+  ['.webm', 'video/webm'],
+  ['.ogg', 'video/ogg'],
+  ['.ogv', 'video/ogg'],
 ]);
 
 function normalizeProxyKey(req) {

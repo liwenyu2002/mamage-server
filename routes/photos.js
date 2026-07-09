@@ -45,6 +45,59 @@ const RENDER_SOURCE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_RENDER_
 const RENDER_MAX_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
 const TONE_ENGINE = 'mamage-tone-v2-acr-like';
 
+async function cleanupDeletedPhotoRows(rows, context = {}) {
+  const deletedFiles = [];
+  const notFoundFiles = [];
+
+  async function tryUnlink(absPath) {
+    try {
+      await fs.promises.unlink(absPath);
+      deletedFiles.push(absPath);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        notFoundFiles.push(absPath);
+      } else {
+        console.error('[photos.delete] unlink error:', absPath, err && err.message ? err.message : err);
+      }
+    }
+  }
+
+  const storageDeleteResult = await cosStorage.deleteObjectsForPhotoRows(rows);
+  if (storageDeleteResult.errors && storageDeleteResult.errors.length) {
+    console.error('[photos.delete] COS delete errors:', storageDeleteResult.errors);
+  }
+
+  if (!skipLocalFileCheck) {
+    for (const row of rows || []) {
+      try {
+        if (row.url && !/^https?:\/\//i.test(String(row.url))) {
+          let rel = row.url.replace(/^\/uploads[\\/]/, '');
+          rel = rel.split('/').join(path.sep);
+          await tryUnlink(path.join(uploadRoot, rel));
+        }
+
+        if (row.thumbUrl && !/^https?:\/\//i.test(String(row.thumbUrl))) {
+          let relt = row.thumbUrl.replace(/^\/uploads[\\/]/, '');
+          relt = relt.split('/').join(path.sep);
+          await tryUnlink(path.join(uploadRoot, relt));
+        }
+      } catch (e) {
+        console.error('[photos.delete] check/unlink file error:', e && e.message ? e.message : e);
+      }
+    }
+  }
+
+  console.info(
+    '[photos.delete.cleanup] user=%s deletedPhotoIds=%o deletedFiles=%d notFoundFiles=%d storageDeleted=%d storageErrors=%d',
+    context.userId || null,
+    context.photoIds || [],
+    deletedFiles.length,
+    notFoundFiles.length,
+    (storageDeleteResult.deleted || []).length,
+    (storageDeleteResult.errors || []).length
+  );
+}
+
 async function populateReqUserFromAuthIfPresent(req) {
   try {
     if (req.user && req.user.id !== undefined) return;
@@ -969,61 +1022,19 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
       try { conn.release(); } catch (e) { }
     }
 
-    // 删除文件（使用 promises 并汇总结果，避免大量逐文件日志）
-    const fsp = fs.promises;
-    const deletedFiles = [];
-    const notFoundFiles = [];
-
-    async function tryUnlink(absPath) {
-      try {
-        await fsp.unlink(absPath);
-        deletedFiles.push(absPath);
-      } catch (err) {
-        if (err && err.code === 'ENOENT') {
-          notFoundFiles.push(absPath);
-        } else {
-          console.error('[photos.delete] unlink error:', absPath, err && err.message ? err.message : err);
-        }
-      }
-    }
-
-    const storageDeleteResult = await cosStorage.deleteObjectsForPhotoRows(rows);
-    if (storageDeleteResult.errors && storageDeleteResult.errors.length) {
-      console.error('[photos.delete] COS delete errors:', storageDeleteResult.errors);
-    }
-
-    for (const row of rows) {
-      try {
-        if (row.url && !skipLocalFileCheck && !/^https?:\/\//i.test(String(row.url))) {
-          let rel = row.url.replace(/^\/uploads[\\/]/, '');
-          rel = rel.split('/').join(path.sep);
-          const abs = path.join(uploadRoot, rel);
-          // 尝试删除（如果不存在会被记录到 notFoundFiles）
-          await tryUnlink(abs);
-        }
-
-        if (row.thumbUrl && !skipLocalFileCheck && !/^https?:\/\//i.test(String(row.thumbUrl))) {
-          let relt = row.thumbUrl.replace(/^\/uploads[\\/]/, '');
-          relt = relt.split('/').join(path.sep);
-          const absThumb = path.join(uploadRoot, relt);
-          await tryUnlink(absThumb);
-        }
-      } catch (e) {
-        console.error('[photos.delete] check/unlink file error:', e && e.message ? e.message : e);
-      }
-    }
-
-    // 输出一条摘要日志；详细列表为 debug
-    try {
-      console.info('[photos.delete] user=%s deletedPhotoIds=%o deletedFiles=%d notFoundFiles=%d storageDeleted=%d storageErrors=%d', req.user && req.user.id, foundIds, deletedFiles.length, notFoundFiles.length, (storageDeleteResult.deleted || []).length, (storageDeleteResult.errors || []).length);
-      console.debug && console.debug('[photos.delete] deletedFiles=%o notFoundFiles=%o', deletedFiles, notFoundFiles);
-    } catch (e) { }
+    const cleanupRows = rows.slice();
+    const cleanupContext = { userId: req.user && req.user.id, photoIds: foundIds.slice() };
+    setImmediate(() => {
+      cleanupDeletedPhotoRows(cleanupRows, cleanupContext).catch((err) => {
+        console.error('[photos.delete.cleanup] failed:', err && err.stack ? err.stack : err);
+      });
+    });
+    console.info('[photos.delete] user=%s deletedPhotoIds=%o cleanupQueued=1', req.user && req.user.id, foundIds);
 
     res.json({
       deletedIds: foundIds,
       notFoundIds,
-      storageDeleted: storageDeleteResult.deleted || [],
-      storageErrors: storageDeleteResult.errors || [],
+      storageDeleteQueued: true,
     });
   } catch (err) {
     console.error('POST /api/photos/delete error:', err);
