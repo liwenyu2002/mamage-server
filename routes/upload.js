@@ -26,6 +26,12 @@ const UPLOAD_TIMING_LOGS = parseEnvBoolean(process.env.UPLOAD_TIMING_LOGS) === t
 const VIDEO_FASTSTART_ENABLED = parseEnvBoolean(process.env.VIDEO_FASTSTART_ENABLED) !== false;
 const VIDEO_FASTSTART_TIMEOUT_MS = Math.max(10000, Number(process.env.VIDEO_FASTSTART_TIMEOUT_MS || 120000));
 const FFMPEG_PATH = process.env.FFMPEG_PATH || (fs.existsSync('/opt/homebrew/bin/ffmpeg') ? '/opt/homebrew/bin/ffmpeg' : 'ffmpeg');
+const VIDEO_PREVIEW_ENABLED = parseEnvBoolean(process.env.VIDEO_PREVIEW_ENABLED) !== false;
+const VIDEO_PREVIEW_MAX_WIDTH = Math.max(360, Number(process.env.VIDEO_PREVIEW_MAX_WIDTH || 1280));
+const VIDEO_PREVIEW_CRF = Math.min(35, Math.max(18, Number(process.env.VIDEO_PREVIEW_CRF || 25)));
+const VIDEO_PREVIEW_MAXRATE = process.env.VIDEO_PREVIEW_MAXRATE || '2500k';
+const VIDEO_PREVIEW_BUFSIZE = process.env.VIDEO_PREVIEW_BUFSIZE || '5000k';
+const VIDEO_PREVIEW_TIMEOUT_MS = Math.max(10000, Number(process.env.VIDEO_PREVIEW_TIMEOUT_MS || 180000));
 
 const IMAGE_MIME_BY_EXT = new Map([
   ['.jpg', 'image/jpeg'],
@@ -213,6 +219,40 @@ async function prepareVideoForStreaming(filePath, mimeType) {
   }
 }
 
+async function createVideoPreviewForPlayback(filePath) {
+  if (!VIDEO_PREVIEW_ENABLED || !filePath) return null;
+
+  const outputPath = path.join(VIDEO_UPLOAD_TMP_DIR, `${uuidv4()}-preview.mp4`);
+  try {
+    await execFileAsync(FFMPEG_PATH, [
+      '-y',
+      '-v', 'error',
+      '-i', filePath,
+      '-map', '0:v:0',
+      '-vf', `scale=min(${VIDEO_PREVIEW_MAX_WIDTH}\\,iw):-2`,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', String(VIDEO_PREVIEW_CRF),
+      '-maxrate', VIDEO_PREVIEW_MAXRATE,
+      '-bufsize', VIDEO_PREVIEW_BUFSIZE,
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-an',
+      outputPath,
+    ], {
+      timeout: VIDEO_PREVIEW_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    const stat = await fs.promises.stat(outputPath);
+    if (!stat.size) throw new Error('ffmpeg produced empty preview');
+    return { filePath: outputPath, size: stat.size };
+  } catch (err) {
+    fs.promises.unlink(outputPath).catch(() => null);
+    console.warn('[upload.video] preview skipped:', err && err.message ? err.message : err);
+    return null;
+  }
+}
+
 function parseProjectId(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return null;
   const projectId = parseInt(raw, 10);
@@ -287,7 +327,9 @@ function buildObjectKeys(projectId, originalName, mimeType, mediaType = 'image')
   const ext = cosStorage.extFromFilenameOrMime(originalName, mimeType, mediaType === 'video' ? '.mp4' : '.jpg');
   const filename = `${uuidv4()}${ext}`;
   const originalKey = `${keyPrefix}/${filename}`;
-  const thumbKey = mediaType === 'video' ? null : `${keyPrefix}/thumbs/thumb_${path.basename(filename, ext)}.jpg`;
+  const thumbKey = mediaType === 'video'
+    ? `${keyPrefix}/previews/preview_${path.basename(filename, ext)}.mp4`
+    : `${keyPrefix}/thumbs/thumb_${path.basename(filename, ext)}.jpg`;
   return {
     originalKey,
     thumbKey,
@@ -754,6 +796,7 @@ async function processVideoUpload(req, res) {
   const startMs = nowMs();
   const filePath = req.file && req.file.path ? req.file.path : null;
   let processedVideo = null;
+  let previewVideo = null;
   try {
     if (!req.file || !filePath) {
       return res.status(400).json({ error: 'No video uploaded' });
@@ -774,10 +817,12 @@ async function processVideoUpload(req, res) {
 
     const mimeType = inferVideoMime(req.file.mimetype, req.file.originalname);
     if (!mimeType) return res.status(415).json({ error: 'UNSUPPORTED_VIDEO_TYPE' });
-    const { originalKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
+    const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
     processedVideo = await prepareVideoForStreaming(filePath, mimeType);
     const uploadFilePath = processedVideo.filePath || filePath;
     const uploadSize = processedVideo.size || req.file.size;
+    previewVideo = await createVideoPreviewForPlayback(uploadFilePath);
+    const playbackThumbRel = previewVideo && thumbKey ? thumbRel : null;
 
     try {
       await cosStorage.uploadFile(originalKey, uploadFilePath, {
@@ -786,6 +831,14 @@ async function processVideoUpload(req, res) {
         cacheControl: UPLOAD_CACHE_CONTROL,
       });
       uploadedKeys.push(originalKey);
+      if (previewVideo && thumbKey) {
+        await cosStorage.uploadFile(thumbKey, previewVideo.filePath, {
+          contentType: 'video/mp4',
+          contentLength: previewVideo.size,
+          cacheControl: UPLOAD_CACHE_CONTROL,
+        });
+        uploadedKeys.push(thumbKey);
+      }
     } catch (err) {
       await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
       console.error('[upload.video] upload to COS failed:', err && err.message ? err.message : err);
@@ -797,13 +850,13 @@ async function processVideoUpload(req, res) {
       insertedId = await createPhotoRecordWithRetry({
         ...metadata,
         relPath,
-        thumbRel,
+        thumbRel: playbackThumbRel,
         aiStatus: 'skipped',
         photographerId,
         orgId,
       });
     } catch (err) {
-      await cosStorage.deleteObjects([originalKey]).catch(() => null);
+      await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
       const status = err.status || 500;
       const message = err.publicMessage || err.message || 'DB_INSERT_FAILED';
       console.error('[upload.video] DB insert failed, cleaned COS object:', message);
@@ -823,6 +876,7 @@ async function processVideoUpload(req, res) {
         projectId: metadata.projectId || null,
         bytes: uploadSize,
         fastStarted: !!(processedVideo && processedVideo.fastStarted),
+        previewBytes: previewVideo ? previewVideo.size : 0,
         totalMs: nowMs() - startMs,
       });
     }
@@ -832,7 +886,7 @@ async function processVideoUpload(req, res) {
       projectId: metadata.projectId,
       timelineSectionId: metadata.timelineSectionId,
       relPath,
-      thumbRel,
+      thumbRel: playbackThumbRel,
       title: metadata.title,
       type: 'video',
       mediaType: 'video',
@@ -844,6 +898,9 @@ async function processVideoUpload(req, res) {
     console.error('POST /api/upload/video error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
   } finally {
+    if (previewVideo && previewVideo.filePath) {
+      fs.promises.unlink(previewVideo.filePath).catch(() => null);
+    }
     if (processedVideo && processedVideo.cleanupPath && processedVideo.cleanupPath !== filePath) {
       fs.promises.unlink(processedVideo.cleanupPath).catch(() => null);
     }
