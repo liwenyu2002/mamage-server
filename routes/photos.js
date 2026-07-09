@@ -1053,6 +1053,70 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
 });
 
 
+// POST /api/photos/assign-section
+// 批量把照片移入/移出时间线环节。body: { photoIds: [1,2,3], timelineSectionId: 5 | null }
+// timelineSectionId 为 null/空 表示移出（回落"未归类"）
+router.post('/assign-section', requirePermission('photos.edit'), async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body && req.body.photoIds)
+      ? req.body.photoIds.map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
+    if (!ids.length) return res.status(400).json({ error: 'no valid photo id' });
+    if (ids.length > 500) return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: 500 });
+
+    const rawSection = req.body ? (req.body.timelineSectionId ?? req.body.timeline_section_id ?? req.body.sectionId ?? null) : null;
+    const sectionId = rawSection === null || rawSection === undefined || String(rawSection).trim() === ''
+      ? null
+      : parseInt(rawSection, 10);
+    if (sectionId !== null && (!Number.isFinite(sectionId) || sectionId <= 0)) {
+      return res.status(400).json({ error: 'INVALID_TIMELINE_SECTION' });
+    }
+
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+
+    let selSql = 'SELECT id, project_id AS projectId FROM photos WHERE id IN (?)';
+    const selParams = [ids];
+    if (orgId === null) selSql += ' AND organization_id IS NULL';
+    else { selSql += ' AND organization_id = ?'; selParams.push(orgId); }
+    const [rows] = await pool.query(selSql, selParams);
+    if (!rows || !rows.length) return res.status(404).json({ error: 'photos not found' });
+
+    if (sectionId !== null) {
+      // 环节必须存在，且所有照片与环节属于同一项目（同 org 作用域）
+      const [secRows] = await pool.query(
+        `SELECT s.id, s.project_id AS projectId
+         FROM project_timeline_sections s
+         JOIN projects p ON p.id = s.project_id
+         WHERE s.id = ?${orgId === null ? ' AND p.organization_id IS NULL' : ' AND p.organization_id = ?'}`,
+        orgId === null ? [sectionId] : [sectionId, orgId]
+      );
+      const section = secRows && secRows[0];
+      if (!section) return res.status(404).json({ error: 'Section not found' });
+      const mismatched = rows.filter((r) => Number(r.projectId) !== Number(section.projectId));
+      if (mismatched.length) {
+        return res.status(400).json({ error: 'PHOTO_PROJECT_MISMATCH', photoIds: mismatched.map((r) => r.id) });
+      }
+    }
+
+    const foundIds = rows.map((r) => r.id);
+    let updSql = 'UPDATE photos SET timeline_section_id = ? WHERE id IN (?)';
+    const updParams = [sectionId, foundIds];
+    if (orgId === null) updSql += ' AND organization_id IS NULL';
+    else { updSql += ' AND organization_id = ?'; updParams.push(orgId); }
+    const [result] = await pool.query(updSql, updParams);
+
+    return res.json({
+      ok: true,
+      updated: result.affectedRows || 0,
+      timelineSectionId: sectionId,
+      notFoundIds: ids.filter((id) => !foundIds.includes(id)),
+    });
+  } catch (err) {
+    console.error('POST /api/photos/assign-section error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // POST /api/photos/zip
 // 请求 body: { photoIds: [1,2,3], zipName: 'my-photos' }
 // 返回: application/zip attachment

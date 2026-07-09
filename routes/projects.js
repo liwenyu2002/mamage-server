@@ -301,7 +301,10 @@ function normalizeTimelineSectionsInput(input) {
     const sectionTime = String(rawTime || '').trim().slice(0, 64) || null;
     const sortRaw = typeof item === 'string' ? idx : (item && (item.sortOrder ?? item.sort_order ?? idx));
     const sortOrder = Number.isFinite(Number(sortRaw)) ? Math.max(0, Math.floor(Number(sortRaw))) : idx;
-    sections.push({ name, sectionTime, sortOrder });
+    // 带 id 表示"编辑已有环节"（支持重命名而不丢照片归属），无 id 表示新建
+    const rawId = typeof item === 'string' ? null : (item && (item.id ?? item.sectionId ?? item.section_id));
+    const id = Number.isFinite(Number(rawId)) && Number(rawId) > 0 ? Math.floor(Number(rawId)) : null;
+    sections.push({ id, name, sectionTime, sortOrder });
   });
 
   return sections.slice(0, 50).map((section, idx) => ({
@@ -372,19 +375,25 @@ async function replaceTimelineSections(conn, projectId, sections) {
     [projectId]
   );
   const existingByName = new Map((existingRows || []).map((row) => [String(row.name || ''), row]));
+  const existingById = new Map((existingRows || []).map((row) => [Number(row.id), row]));
   const keepIds = [];
+  const claimedIds = new Set();
 
   for (let i = 0; i < sections.length; i += 1) {
     const section = sections[i];
     const sortOrder = Number.isFinite(section.sortOrder) ? section.sortOrder : i;
-    const existing = existingByName.get(section.name);
+    // id 匹配优先：允许重命名已有环节而不触发"删旧建新"（那会把照片归属清空）；
+    // 已被前面条目占用的行不再复用，避免两个输入项写同一行
+    let existing = (section.id && existingById.get(section.id)) || existingByName.get(section.name);
+    if (existing && claimedIds.has(Number(existing.id))) existing = null;
     if (existing && existing.id) {
+      claimedIds.add(Number(existing.id));
       keepIds.push(existing.id);
       await conn.query(
         `UPDATE project_timeline_sections
-         SET section_time = ?, sort_order = ?, updated_at = NOW()
+         SET name = ?, section_time = ?, sort_order = ?, updated_at = NOW()
          WHERE id = ? AND project_id = ?`,
-        [section.sectionTime || null, sortOrder, existing.id, projectId]
+        [section.name, section.sectionTime || null, sortOrder, existing.id, projectId]
       );
     } else {
       const [result] = await conn.query(
@@ -1171,6 +1180,173 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
   } catch (err) {
     console.error('[POST /api/projects/:id/update] error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==============================
+// 时间线环节单条 CRUD（projects.update）
+// ==============================
+
+// 项目 org 归属校验，返回 {id} 或 null
+async function findScopedProject(req, projectId) {
+  const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+  let sql = 'SELECT id FROM projects WHERE id = ?';
+  const params = [projectId];
+  if (orgId === null) sql += ' AND organization_id IS NULL';
+  else { sql += ' AND organization_id = ?'; params.push(orgId); }
+  const [rows] = await pool.query(sql, params);
+  return rows && rows.length ? rows[0] : null;
+}
+
+// 新建环节
+router.post('/:id/timeline-sections', requirePermission('projects.update'), async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(projectId) || projectId <= 0) return res.status(400).json({ error: 'Invalid project id' });
+    if (!(await findScopedProject(req, projectId))) return res.status(404).json({ error: 'Project not found' });
+
+    const name = String((req.body && req.body.name) || '').trim().slice(0, 100);
+    if (!name) return res.status(400).json({ error: 'SECTION_NAME_REQUIRED' });
+    const sectionTime = String((req.body && (req.body.sectionTime || req.body.section_time)) || '').trim().slice(0, 64) || null;
+
+    const [dups] = await pool.query('SELECT id FROM project_timeline_sections WHERE project_id = ? AND name = ?', [projectId, name]);
+    if (dups && dups.length) return res.status(409).json({ error: 'SECTION_NAME_EXISTS', message: '同名环节已存在' });
+
+    const [[maxRow]] = await pool.query('SELECT COALESCE(MAX(sort_order), -1) AS maxOrder FROM project_timeline_sections WHERE project_id = ?', [projectId]);
+    const sortOrder = Number(maxRow.maxOrder) + 1;
+    const [result] = await pool.query(
+      `INSERT INTO project_timeline_sections (project_id, name, section_time, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NOW(), NOW())`,
+      [projectId, name, sectionTime, sortOrder]
+    );
+    return res.status(201).json(serializeTimelineSection({ id: result.insertId, projectId, name, sectionTime, sortOrder }));
+  } catch (err) {
+    console.error('[POST /api/projects/:id/timeline-sections] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 重命名/改时间（重命名不影响照片归属）
+router.patch('/:id/timeline-sections/:sectionId', requirePermission('projects.update'), async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const sectionId = parseInt(req.params.sectionId, 10);
+    if (!Number.isFinite(projectId) || projectId <= 0 || !Number.isFinite(sectionId) || sectionId <= 0) {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+    if (!(await findScopedProject(req, projectId))) return res.status(404).json({ error: 'Project not found' });
+
+    const [rows] = await pool.query('SELECT id FROM project_timeline_sections WHERE id = ? AND project_id = ?', [sectionId, projectId]);
+    if (!rows || !rows.length) return res.status(404).json({ error: 'Section not found' });
+
+    const sets = [];
+    const params = [];
+    if (req.body && req.body.name !== undefined) {
+      const name = String(req.body.name || '').trim().slice(0, 100);
+      if (!name) return res.status(400).json({ error: 'SECTION_NAME_REQUIRED' });
+      const [dups] = await pool.query(
+        'SELECT id FROM project_timeline_sections WHERE project_id = ? AND name = ? AND id <> ?',
+        [projectId, name, sectionId]
+      );
+      if (dups && dups.length) return res.status(409).json({ error: 'SECTION_NAME_EXISTS', message: '同名环节已存在' });
+      sets.push('name = ?');
+      params.push(name);
+    }
+    if (req.body && (req.body.sectionTime !== undefined || req.body.section_time !== undefined)) {
+      const sectionTime = String(req.body.sectionTime ?? req.body.section_time ?? '').trim().slice(0, 64) || null;
+      sets.push('section_time = ?');
+      params.push(sectionTime);
+    }
+    if (req.body && (req.body.sortOrder !== undefined || req.body.sort_order !== undefined)) {
+      const so = Number(req.body.sortOrder ?? req.body.sort_order);
+      if (Number.isFinite(so) && so >= 0) { sets.push('sort_order = ?'); params.push(Math.floor(so)); }
+    }
+    if (!sets.length) return res.status(400).json({ error: 'NO_FIELDS' });
+
+    await pool.query(
+      `UPDATE project_timeline_sections SET ${sets.join(', ')}, updated_at = NOW() WHERE id = ? AND project_id = ?`,
+      [...params, sectionId, projectId]
+    );
+    const [[row]] = await pool.query(
+      'SELECT id, project_id AS projectId, name, section_time AS sectionTime, sort_order AS sortOrder FROM project_timeline_sections WHERE id = ?',
+      [sectionId]
+    );
+    return res.json(serializeTimelineSection(row));
+  } catch (err) {
+    console.error('[PATCH /api/projects/:id/timeline-sections/:sectionId] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 删除环节：照片回落"未归类"（timeline_section_id 无外键，必须显式回落）
+router.delete('/:id/timeline-sections/:sectionId', requirePermission('projects.update'), async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const sectionId = parseInt(req.params.sectionId, 10);
+    if (!Number.isFinite(projectId) || projectId <= 0 || !Number.isFinite(sectionId) || sectionId <= 0) {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+    if (!(await findScopedProject(req, projectId))) return res.status(404).json({ error: 'Project not found' });
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [result] = await conn.query('DELETE FROM project_timeline_sections WHERE id = ? AND project_id = ?', [sectionId, projectId]);
+      if (!result.affectedRows) {
+        await conn.rollback();
+        return res.status(404).json({ error: 'Section not found' });
+      }
+      const [fallback] = await conn.query(
+        'UPDATE photos SET timeline_section_id = NULL WHERE project_id = ? AND timeline_section_id = ?',
+        [projectId, sectionId]
+      );
+      await conn.commit();
+      return res.json({ ok: true, unassignedPhotos: fallback.affectedRows || 0 });
+    } catch (err) {
+      try { await conn.rollback(); } catch (e) { }
+      throw err;
+    } finally {
+      try { conn.release(); } catch (e) { }
+    }
+  } catch (err) {
+    console.error('[DELETE /api/projects/:id/timeline-sections/:sectionId] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 排序：按数组顺序写 sort_order
+router.post('/:id/timeline-sections/reorder', requirePermission('projects.update'), async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(projectId) || projectId <= 0) return res.status(400).json({ error: 'Invalid project id' });
+    if (!(await findScopedProject(req, projectId))) return res.status(404).json({ error: 'Project not found' });
+
+    const ids = Array.isArray(req.body && req.body.sectionIds)
+      ? req.body.sectionIds.map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
+    if (!ids.length || ids.length > 50) return res.status(400).json({ error: 'INVALID_SECTION_IDS' });
+    if (new Set(ids).size !== ids.length) return res.status(400).json({ error: 'DUPLICATE_SECTION_IDS' });
+
+    const [rows] = await pool.query('SELECT id FROM project_timeline_sections WHERE project_id = ? AND id IN (?)', [projectId, ids]);
+    if (!rows || rows.length !== ids.length) return res.status(400).json({ error: 'SECTION_NOT_IN_PROJECT' });
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (let i = 0; i < ids.length; i += 1) {
+        await conn.query('UPDATE project_timeline_sections SET sort_order = ?, updated_at = NOW() WHERE id = ? AND project_id = ?', [i, ids[i], projectId]);
+      }
+      await conn.commit();
+    } catch (err) {
+      try { await conn.rollback(); } catch (e) { }
+      throw err;
+    } finally {
+      try { conn.release(); } catch (e) { }
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[POST /api/projects/:id/timeline-sections/reorder] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
