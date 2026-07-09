@@ -1,9 +1,39 @@
 const express = require('express');
+const crypto = require('crypto');
 const cosStorage = require('../lib/cos_storage');
 
 const router = express.Router();
 
 const DEFAULT_CACHE_CONTROL = process.env.IMAGE_PROXY_CACHE_CONTROL || 'public, max-age=31536000, immutable';
+
+// 与 db.js signMediaQuery 配对的校验开关/密钥（保持独立读取，避免循环依赖）
+const MEDIA_URL_SIGNING = String(process.env.MEDIA_URL_SIGNING || '') === '1';
+const MEDIA_URL_SECRET = process.env.MEDIA_URL_SECRET || process.env.JWT_SECRET || '';
+// 代理只允许业务媒体目录，杜绝读取 bucket 内任意对象
+const ALLOWED_KEY_PREFIXES = String(process.env.IMAGE_PROXY_KEY_PREFIXES || 'uploads/')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function isAllowedKeyPrefix(key) {
+  return ALLOWED_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function verifyMediaSignature(key, query) {
+  if (!MEDIA_URL_SIGNING || !MEDIA_URL_SECRET) return true;
+  const exp = Number(query.e);
+  const sig = typeof query.s === 'string' ? query.s : '';
+  if (!Number.isFinite(exp) || !sig) return false;
+  if (exp * 1000 < Date.now()) return false;
+  const expected = crypto
+    .createHmac('sha256', MEDIA_URL_SECRET)
+    .update(`${key}:${exp}`)
+    .digest('hex')
+    .slice(0, 32);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 const CONTENT_TYPE_BY_EXT = new Map([
   ['.jpg', 'image/jpeg'],
   ['.jpeg', 'image/jpeg'],
@@ -87,6 +117,8 @@ router.use(async (req, res) => {
 
   const key = normalizeProxyKey(req);
   if (!key || !cosStorage.isSafeKey(key)) return res.status(400).end();
+  if (!isAllowedKeyPrefix(key)) return res.status(404).end();
+  if (!verifyMediaSignature(key, req.query || {})) return res.status(403).end();
 
   if (!cosStorage.isConfigured()) {
     return res.status(503).json({ error: 'S3_NOT_CONFIGURED' });

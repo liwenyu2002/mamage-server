@@ -30,6 +30,13 @@ const VIDEO_PREVIEW_ENABLED = parseEnvBoolean(process.env.VIDEO_PREVIEW_ENABLED)
 const VIDEO_PREVIEW_MAX_WIDTH = Math.max(360, Number(process.env.VIDEO_PREVIEW_MAX_WIDTH || 1280));
 const VIDEO_PREVIEW_TIMEOUT_MS = Math.max(10000, Number(process.env.VIDEO_PREVIEW_TIMEOUT_MS || 180000));
 const VIDEO_POSTER_CAPTURE_SECONDS = Math.max(0, Number(process.env.VIDEO_POSTER_CAPTURE_SECONDS || 1));
+const VIDEO_PLAYBACK_ENABLED = parseEnvBoolean(process.env.VIDEO_PLAYBACK_ENABLED) !== false;
+const VIDEO_PLAYBACK_MAX_WIDTH = Math.max(640, envNumber(process.env.VIDEO_PLAYBACK_MAX_WIDTH, 1280));
+const VIDEO_PLAYBACK_CRF = Math.min(32, Math.max(20, envNumber(process.env.VIDEO_PLAYBACK_CRF, 27)));
+const VIDEO_PLAYBACK_MAXRATE = process.env.VIDEO_PLAYBACK_MAXRATE || '2800k';
+const VIDEO_PLAYBACK_BUFSIZE = process.env.VIDEO_PLAYBACK_BUFSIZE || '5600k';
+const VIDEO_PLAYBACK_TIMEOUT_MS = Math.max(30000, envNumber(process.env.VIDEO_PLAYBACK_TIMEOUT_MS, 900000));
+const VIDEO_TMP_MIN_FREE_BYTES = Math.max(0, envNumber(process.env.VIDEO_TMP_MIN_FREE_MB, 2048)) * 1024 * 1024;
 
 const IMAGE_MIME_BY_EXT = new Map([
   ['.jpg', 'image/jpeg'],
@@ -58,6 +65,13 @@ function parseEnvBoolean(value) {
   if (['1', 'true', 'yes', 'y', 'on'].includes(raw)) return true;
   if (['0', 'false', 'no', 'n', 'off'].includes(raw)) return false;
   return null;
+}
+
+// 环境变量配成非数字时回退默认值，避免 NaN 传染（Math.max(x, NaN)=NaN）
+function envNumber(raw, fallback) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function isPrivateHostname(hostname) {
@@ -135,6 +149,27 @@ try {
   console.warn('[upload] create video tmp dir failed:', err && err.message ? err.message : err);
 }
 
+// 启动清扫：进程崩溃/pm2 restart 会把 multer 原件和转码半成品留在 tmp 目录，
+// 超过 24h 的一律清掉（in-flight 任务不会活这么久）
+(async () => {
+  const maxAgeMs = Math.max(1, envNumber(process.env.VIDEO_TMP_SWEEP_HOURS, 24)) * 3600 * 1000;
+  try {
+    const entries = await fs.promises.readdir(VIDEO_UPLOAD_TMP_DIR);
+    let removed = 0;
+    for (const name of entries) {
+      const full = path.join(VIDEO_UPLOAD_TMP_DIR, name);
+      try {
+        const st = await fs.promises.stat(full);
+        if (st.isFile() && Date.now() - st.mtimeMs > maxAgeMs) {
+          await fs.promises.unlink(full);
+          removed += 1;
+        }
+      } catch (e) { /* 单文件失败忽略 */ }
+    }
+    if (removed) console.log(`[upload.video] tmp sweep removed ${removed} stale file(s)`);
+  } catch (e) { /* 目录不可读则跳过 */ }
+})();
+
 const videoStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, VIDEO_UPLOAD_TMP_DIR),
   filename: (req, file, cb) => {
@@ -193,11 +228,14 @@ async function prepareVideoForStreaming(filePath, mimeType) {
   const ext = path.extname(String(filePath || '')).toLowerCase() || '.mp4';
   const outputPath = path.join(VIDEO_UPLOAD_TMP_DIR, `${uuidv4()}-faststart${ext}`);
   try {
+    // 只挑视频/音频主流：iPhone 视频常带 timecode/data 流，'-map 0' 全流 copy 会因
+    // "Could not find tag for codec none" 写 mp4 头失败（生产 2026-07-09 实际报错）
     await execFileAsync(FFMPEG_PATH, [
       '-y',
       '-v', 'error',
       '-i', filePath,
-      '-map', '0',
+      '-map', '0:v:0',
+      '-map', '0:a:0?',
       '-c', 'copy',
       '-movflags', '+faststart',
       '-avoid_negative_ts', 'make_zero',
@@ -255,6 +293,132 @@ async function createVideoPosterForPreview(filePath) {
     console.warn('[upload.video] poster skipped:', err && err.message ? err.message : err);
     return null;
   }
+}
+
+async function createVideoPlaybackForWeb(filePath) {
+  if (!VIDEO_PLAYBACK_ENABLED || !filePath) return null;
+
+  const outputPath = path.join(VIDEO_UPLOAD_TMP_DIR, `${uuidv4()}-playback.mp4`);
+  try {
+    await execFileAsync(FFMPEG_PATH, [
+      '-y',
+      '-v', 'error',
+      '-i', filePath,
+      '-map', '0:v:0',
+      '-map', '0:a:0?',
+      // trunc(.../2)*2：宽度也强制取偶，否则奇数宽源（裁剪导出/录屏）libx264+yuv420p 直接编码失败
+      '-vf', `scale=trunc(min(${VIDEO_PLAYBACK_MAX_WIDTH}\\,iw)/2)*2:-2`,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', String(VIDEO_PLAYBACK_CRF),
+      '-maxrate', VIDEO_PLAYBACK_MAXRATE,
+      '-bufsize', VIDEO_PLAYBACK_BUFSIZE,
+      '-pix_fmt', 'yuv420p',
+      '-profile:v', 'high',
+      '-level', '4.1',
+      '-movflags', '+faststart',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ac', '2',
+      '-ar', '48000',
+      outputPath,
+    ], {
+      timeout: VIDEO_PLAYBACK_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    const stat = await fs.promises.stat(outputPath);
+    if (!stat.size) throw new Error('ffmpeg produced empty playback video');
+    return { filePath: outputPath, size: stat.size };
+  } catch (err) {
+    fs.promises.unlink(outputPath).catch(() => null);
+    console.warn('[upload.video] playback skipped:', err && err.message ? err.message : err);
+    return null;
+  }
+}
+
+function unlinkFileQuiet(filePath) {
+  if (!filePath) return;
+  fs.promises.unlink(filePath).catch(() => null);
+}
+
+// 转码并发控制：ffmpeg x264 单路即可吃满数核，Mac Mini 同时还跑其他服务，
+// 默认串行排队；队列纯内存，进程重启丢任务由 npm run video:playback:backfill 兜底。
+const VIDEO_PLAYBACK_CONCURRENCY = Math.max(1, envNumber(process.env.VIDEO_PLAYBACK_CONCURRENCY, 1));
+let playbackJobsActive = 0;
+const playbackJobsWaiting = [];
+
+function drainPlaybackQueue() {
+  while (playbackJobsActive < VIDEO_PLAYBACK_CONCURRENCY && playbackJobsWaiting.length) {
+    const job = playbackJobsWaiting.shift();
+    playbackJobsActive += 1;
+    Promise.resolve()
+      .then(job)
+      .catch((err) => console.error('[upload.video] playback job crashed:', err && err.stack ? err.stack : err))
+      .finally(() => {
+        playbackJobsActive -= 1;
+        drainPlaybackQueue();
+      });
+  }
+}
+
+async function tmpDirFreeBytes() {
+  try {
+    const st = await fs.promises.statfs(VIDEO_UPLOAD_TMP_DIR);
+    return Number(st.bsize) * Number(st.bavail);
+  } catch (err) {
+    return null; // statfs 不可用时放行，不因探测失败拒绝上传
+  }
+}
+
+function enqueueVideoPlaybackTranscode({ sourceFilePath, cleanupPaths, playbackKey, playbackRel, insertedId }) {
+  if (!VIDEO_PLAYBACK_ENABLED || !sourceFilePath || !playbackKey || !playbackRel || !insertedId) return false;
+  const cleanupSet = Array.from(new Set((cleanupPaths || []).filter(Boolean)));
+
+  playbackJobsWaiting.push(async () => {
+    let playbackVideo = null;
+    try {
+      playbackVideo = await createVideoPlaybackForWeb(sourceFilePath);
+      if (!playbackVideo) {
+        console.warn('[upload.video] playback job produced no file:', insertedId);
+        return;
+      }
+      await cosStorage.uploadFile(playbackKey, playbackVideo.filePath, {
+        contentType: 'video/mp4',
+        contentLength: playbackVideo.size,
+        cacheControl: UPLOAD_CACHE_CONTROL,
+      });
+      let updateResult;
+      try {
+        [updateResult] = await pool.query(
+          'UPDATE photos SET playback_url = ? WHERE id = ? AND (playback_url IS NULL OR playback_url = \'\')',
+          [playbackRel, insertedId]
+        );
+      } catch (dbErr) {
+        // 列不存在/DB 瞬时故障：回收刚上传的对象再抛出（key 确定性，之后 backfill 会重建）
+        await cosStorage.deleteObjects([playbackKey]).catch(() => null);
+        throw dbErr;
+      }
+      if (!updateResult || !updateResult.affectedRows) {
+        // 转码期间照片已被删除：回收刚上传的对象，避免 COS 孤儿
+        console.warn('[upload.video] playback update matched no row, deleting object:', insertedId, playbackKey);
+        await cosStorage.deleteObjects([playbackKey]).catch(() => null);
+        return;
+      }
+      console.log('[upload.video] playback ready', {
+        mediaId: insertedId,
+        playbackBytes: playbackVideo.size,
+        playbackRel,
+      });
+    } catch (err) {
+      console.error('[upload.video] playback job failed:', insertedId, err && err.stack ? err.stack : err);
+    } finally {
+      if (playbackVideo && playbackVideo.filePath) unlinkFileQuiet(playbackVideo.filePath);
+      cleanupSet.forEach(unlinkFileQuiet);
+    }
+  });
+  drainPlaybackQueue();
+
+  return true;
 }
 
 function parseProjectId(raw) {
@@ -334,11 +498,16 @@ function buildObjectKeys(projectId, originalName, mimeType, mediaType = 'image')
   const thumbKey = mediaType === 'video'
     ? `${keyPrefix}/previews/poster_${path.basename(filename, ext)}.jpg`
     : `${keyPrefix}/thumbs/thumb_${path.basename(filename, ext)}.jpg`;
+  const playbackKey = mediaType === 'video'
+    ? `${keyPrefix}/playback/playback_${path.basename(filename, ext)}.mp4`
+    : null;
   return {
     originalKey,
     thumbKey,
+    playbackKey,
     relPath: `/${originalKey}`,
     thumbRel: thumbKey ? `/${thumbKey}` : null,
+    playbackRel: playbackKey ? `/${playbackKey}` : null,
   };
 }
 
@@ -437,13 +606,14 @@ async function createPhotoRecord(payload) {
     try {
       [result] = await conn.query(
         `INSERT INTO photos
-          (uuid, project_id, timeline_section_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+          (uuid, project_id, timeline_section_id, url, thumb_url, playback_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         [
           payload.projectId || null,
           payload.timelineSectionId || null,
           payload.relPath,
           payload.thumbRel,
+          payload.playbackRel || null,
           payload.title,
           payload.description,
           payload.tags ? JSON.stringify(payload.tags) : null,
@@ -455,21 +625,42 @@ async function createPhotoRecord(payload) {
       );
     } catch (err) {
       if (err && (err.code === 'ER_BAD_FIELD_ERROR' || String(err.message || '').includes('Unknown column'))) {
-        [result] = await conn.query(
-          `INSERT INTO photos
-            (uuid, project_id, url, thumb_url, title, description, tags, type, photographer_id)
-           VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            payload.projectId || null,
-            payload.relPath,
-            payload.thumbRel,
-            payload.title,
-            payload.description,
-            payload.tags ? JSON.stringify(payload.tags) : null,
-            payload.type,
-            payload.photographerId || null,
-          ]
-        );
+        if (String(err.message || '').includes('playback_url')) {
+          [result] = await conn.query(
+            `INSERT INTO photos
+              (uuid, project_id, timeline_section_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
+             VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+            [
+              payload.projectId || null,
+              payload.timelineSectionId || null,
+              payload.relPath,
+              payload.thumbRel,
+              payload.title,
+              payload.description,
+              payload.tags ? JSON.stringify(payload.tags) : null,
+              payload.aiStatus || 'pending',
+              payload.type,
+              payload.photographerId || null,
+              payload.orgId,
+            ]
+          );
+        } else {
+          [result] = await conn.query(
+            `INSERT INTO photos
+              (uuid, project_id, url, thumb_url, title, description, tags, type, photographer_id)
+             VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              payload.projectId || null,
+              payload.relPath,
+              payload.thumbRel,
+              payload.title,
+              payload.description,
+              payload.tags ? JSON.stringify(payload.tags) : null,
+              payload.type,
+              payload.photographerId || null,
+            ]
+          );
+        }
       } else if (err && (err.code === 'ER_NO_DEFAULT_FOR_FIELD' || String(err.message || '').includes("doesn't have a default value"))) {
         err.status = 400;
         err.publicMessage = 'Database requires photos.organization_id. Assign organization to the uploading user.';
@@ -633,21 +824,28 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
   }
 }
 
-function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, title, type, mediaType, photographerId, photographerName }) {
+function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, playbackRel, playbackQueued, title, type, mediaType, photographerId, photographerName }) {
+  const isVideo = type === 'video' || mediaType === 'video';
+  // 只有真正排了转码任务才报 transcoding，否则（如 VIDEO_PLAYBACK_ENABLED=0）前端会白等占位
+  const processingStatus = isVideo && !playbackRel && playbackQueued ? 'transcoding' : null;
   return {
     id: insertedId,
     projectId: projectId || null,
     timelineSectionId: timelineSectionId || null,
     url: buildUploadUrl(relPath),
     thumbUrl: thumbRel ? buildUploadUrl(thumbRel) : null,
+    playbackUrl: playbackRel ? buildUploadUrl(playbackRel) : null,
+    playback_url: playbackRel ? buildUploadUrl(playbackRel) : null,
     fullUrl: buildUploadUrl(relPath),
     fullThumbUrl: thumbRel ? buildUploadUrl(thumbRel) : null,
     title,
     type,
-    mediaType: mediaType || (type === 'video' ? 'video' : 'image'),
-    media_type: mediaType || (type === 'video' ? 'video' : 'image'),
-    aiStatus: type === 'video' ? 'skipped' : 'pending',
-    ai_status: type === 'video' ? 'skipped' : 'pending',
+    mediaType: mediaType || (isVideo ? 'video' : 'image'),
+    media_type: mediaType || (isVideo ? 'video' : 'image'),
+    processingStatus,
+    processing_status: processingStatus,
+    aiStatus: isVideo ? 'skipped' : 'pending',
+    ai_status: isVideo ? 'skipped' : 'pending',
     photographerId: photographerId || null,
     photographerName: photographerName || null,
   };
@@ -801,6 +999,7 @@ async function processVideoUpload(req, res) {
   const filePath = req.file && req.file.path ? req.file.path : null;
   let processedVideo = null;
   let posterImage = null;
+  let playbackJobScheduled = false;
   try {
     if (!req.file || !filePath) {
       return res.status(400).json({ error: 'No video uploaded' });
@@ -821,12 +1020,21 @@ async function processVideoUpload(req, res) {
 
     const mimeType = inferVideoMime(req.file.mimetype, req.file.originalname);
     if (!mimeType) return res.status(415).json({ error: 'UNSUPPORTED_VIDEO_TYPE' });
-    const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
+    // 磁盘防线：faststart 产物 + playback 转码产物最多再占约 2 倍原件大小
+    const freeBytes = await tmpDirFreeBytes();
+    const requiredBytes = Math.max(req.file.size * 2, VIDEO_TMP_MIN_FREE_BYTES);
+    if (freeBytes !== null && freeBytes < requiredBytes) {
+      console.error('[upload.video] insufficient disk space:', { freeBytes, requiredBytes });
+      return res.status(507).json({ error: 'INSUFFICIENT_STORAGE', message: 'Server disk space low, try later' });
+    }
+
+    const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
     processedVideo = await prepareVideoForStreaming(filePath, mimeType);
     const uploadFilePath = processedVideo.filePath || filePath;
     const uploadSize = processedVideo.size || req.file.size;
     posterImage = await createVideoPosterForPreview(uploadFilePath);
     const playbackThumbRel = posterImage && thumbKey ? thumbRel : null;
+    const webPlaybackRel = null;
 
     try {
       await cosStorage.uploadFile(originalKey, uploadFilePath, {
@@ -855,6 +1063,7 @@ async function processVideoUpload(req, res) {
         ...metadata,
         relPath,
         thumbRel: playbackThumbRel,
+        playbackRel: webPlaybackRel,
         aiStatus: 'skipped',
         photographerId,
         orgId,
@@ -874,6 +1083,14 @@ async function processVideoUpload(req, res) {
     });
 
     const photographerName = await getPhotographerName(photographerId);
+    playbackJobScheduled = enqueueVideoPlaybackTranscode({
+      sourceFilePath: uploadFilePath,
+      cleanupPaths: [filePath, processedVideo && processedVideo.cleanupPath],
+      playbackKey,
+      playbackRel,
+      insertedId,
+    });
+
     if (UPLOAD_TIMING_LOGS) {
       console.log('[upload.video] timing', {
         mediaId: insertedId,
@@ -881,6 +1098,7 @@ async function processVideoUpload(req, res) {
         bytes: uploadSize,
         fastStarted: !!(processedVideo && processedVideo.fastStarted),
         posterBytes: posterImage ? posterImage.size : 0,
+        playbackQueued: playbackJobScheduled,
         totalMs: nowMs() - startMs,
       });
     }
@@ -891,6 +1109,8 @@ async function processVideoUpload(req, res) {
       timelineSectionId: metadata.timelineSectionId,
       relPath,
       thumbRel: playbackThumbRel,
+      playbackRel: webPlaybackRel,
+      playbackQueued: playbackJobScheduled,
       title: metadata.title,
       type: 'video',
       mediaType: 'video',
@@ -903,13 +1123,15 @@ async function processVideoUpload(req, res) {
     return res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
   } finally {
     if (posterImage && posterImage.filePath) {
-      fs.promises.unlink(posterImage.filePath).catch(() => null);
+      unlinkFileQuiet(posterImage.filePath);
     }
-    if (processedVideo && processedVideo.cleanupPath && processedVideo.cleanupPath !== filePath) {
-      fs.promises.unlink(processedVideo.cleanupPath).catch(() => null);
-    }
-    if (filePath) {
-      fs.promises.unlink(filePath).catch(() => null);
+    if (!playbackJobScheduled) {
+      if (processedVideo && processedVideo.cleanupPath && processedVideo.cleanupPath !== filePath) {
+        unlinkFileQuiet(processedVideo.cleanupPath);
+      }
+      if (filePath) {
+        unlinkFileQuiet(filePath);
+      }
     }
   }
 }

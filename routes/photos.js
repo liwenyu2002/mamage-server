@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { pool, buildUploadUrl } = require('../db');
+const { pool, buildUploadUrl, buildInternalMediaUrl } = require('../db');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
@@ -428,7 +428,8 @@ function resolvePhotoSourceTargetUrl(req, row, variant = 'original') {
 
 async function fetchImageBufferFromUrl(targetUrl, options = {}) {
   const maxBytes = Math.max(1024 * 1024, Number(options.maxBytes || RENDER_MAX_SOURCE_BYTES));
-  const response = await fetch(targetUrl, {
+  // 服务端自取媒体走内网基址（若配置），避免经公网 cloudflared 回环超时
+  const response = await fetch(buildInternalMediaUrl(targetUrl), {
     timeout: Math.max(1000, Number(options.timeoutMs || RENDER_SOURCE_TIMEOUT_MS)),
     headers: { 'User-Agent': 'MaMage photo renderer' },
   });
@@ -513,6 +514,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.timeline_section_id AS timelineSectionId,
         p.url,
         p.thumb_url       AS thumbUrl,
+        p.playback_url    AS playbackUrl,
         p.title,
         p.description,
         p.adjustments,
@@ -608,6 +610,8 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         ...p,
         url: resolveUrl(p.url),
         thumbUrl: resolveUrl(p.thumbUrl),
+        playbackUrl: resolveUrl(p.playbackUrl),
+        playback_url: resolveUrl(p.playbackUrl),
         description: p.description || null,
         adjustments: parsePhotoAdjustments(p.adjustments),
         aiStatus: p.aiStatus || null,
@@ -646,6 +650,7 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         p.timeline_section_id AS timelineSectionId,
         p.url,
         p.thumb_url       AS thumbUrl,
+        p.playback_url    AS playbackUrl,
         p.title,
         p.description,
         p.adjustments,
@@ -718,6 +723,8 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
         ...p,
         url: resolveUrl(p.url),
         thumbUrl: resolveUrl(p.thumbUrl),
+        playbackUrl: resolveUrl(p.playbackUrl),
+        playback_url: resolveUrl(p.playbackUrl),
         description: p.description || null,
         adjustments: parsePhotoAdjustments(p.adjustments),
         aiStatus: p.aiStatus || null,
@@ -881,6 +888,7 @@ router.get('/search', async (req, res) => {
         pts.section_time AS timelineSectionTime,
         p.url,
         p.thumb_url AS thumbUrl,
+        p.playback_url AS playbackUrl,
         p.title,
         p.description,
         p.adjustments,
@@ -913,6 +921,8 @@ router.get('/search', async (req, res) => {
       timelineSectionTime: p.timelineSectionTime || null,
       url: p.url ? buildUploadUrl(p.url) : null,
       thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
+      playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
+      playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
       title: p.title || null,
       description: p.description || null,
       adjustments: parsePhotoAdjustments(p.adjustments),
@@ -978,7 +988,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
     try {
       await conn.beginTransaction();
 
-      let selSql = 'SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl FROM photos WHERE id IN (?)';
+      let selSql = 'SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, playback_url AS playbackUrl FROM photos WHERE id IN (?)';
       const selParams = [ids];
       if (orgId === null) {
         selSql += ' AND organization_id IS NULL';
@@ -1190,7 +1200,7 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     };
 
     const fetchRemoteFileBuffer = async (remoteUrl) => {
-      const response = await fetch(remoteUrl, { timeout: ZIP_REMOTE_TIMEOUT_MS });
+      const response = await fetch(buildInternalMediaUrl(remoteUrl), { timeout: ZIP_REMOTE_TIMEOUT_MS });
       if (!response || !response.ok) {
         console.warn('[photos.zip] remote file not available for render:', remoteUrl, response && response.status);
         return null;
@@ -1388,7 +1398,7 @@ router.get('/:id/pixel-source', requirePermission('photos.view'), async (req, re
     const targetUrl = /^https?:\/\//i.test(built)
       ? built
       : `${req.protocol}://${req.get('host')}${String(built).startsWith('/') ? built : `/${built}`}`;
-    const response = await fetch(targetUrl, {
+    const response = await fetch(buildInternalMediaUrl(targetUrl), {
       timeout: Math.max(1000, Number(process.env.PHOTO_PIXEL_SOURCE_TIMEOUT_MS || 15000)),
       headers: { 'User-Agent': 'MaMage pixel analyzer' },
     });
@@ -1437,6 +1447,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         pts.section_time AS timelineSectionTime,
         p.url,
         p.thumb_url AS thumbUrl,
+        p.playback_url AS playbackUrl,
         p.title,
         p.description,
         p.adjustments,
@@ -1489,6 +1500,8 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       timelineSectionTime: p.timelineSectionTime || null,
       url: resolveUrl(p.url),
       thumbUrl: resolveUrl(p.thumbUrl),
+      playbackUrl: resolveUrl(p.playbackUrl),
+      playback_url: resolveUrl(p.playbackUrl),
       title: p.title,
       description: p.description || null,
       adjustments: parsePhotoAdjustments(p.adjustments),
@@ -1581,7 +1594,7 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     const [rows] = await pool.query(
       `SELECT p.id, p.project_id AS projectId, p.timeline_section_id AS timelineSectionId,
               pts.name AS timelineSectionName, pts.section_time AS timelineSectionTime,
-              p.url, p.thumb_url AS thumbUrl, p.title, p.description, p.adjustments, p.tags,
+              p.url, p.thumb_url AS thumbUrl, p.playback_url AS playbackUrl, p.title, p.description, p.adjustments, p.tags,
               ai_status AS aiStatus, ai_error AS aiError,
               ai_started_at AS aiStartedAt, ai_finished_at AS aiFinishedAt
        FROM photos p
@@ -1604,6 +1617,8 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
       timelineSectionTime: p.timelineSectionTime || null,
       url: buildUploadUrl(p.url),
       thumbUrl: buildUploadUrl(p.thumbUrl),
+      playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
+      playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
       title: p.title,
       description: p.description,
       adjustments: parsePhotoAdjustments(p.adjustments),

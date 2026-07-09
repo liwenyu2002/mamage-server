@@ -302,6 +302,7 @@ router.get('/:code', async (req, res) => {
 							pts.section_time  AS timelineSectionTime,
 							p.url,
 							p.thumb_url       AS thumbUrl,
+						p.playback_url    AS playbackUrl,
 						p.title,
 						p.description,
 						p.tags,
@@ -332,6 +333,7 @@ router.get('/:code', async (req, res) => {
 							pts.section_time  AS timelineSectionTime,
 							p.url,
 						p.thumb_url       AS thumbUrl,
+						p.playback_url    AS playbackUrl,
 						p.title,
 						p.description,
 						p.tags,
@@ -357,7 +359,9 @@ router.get('/:code', async (req, res) => {
         const mapped = photos.map((p) => ({
             ...p,
             url: p.url ? buildUploadUrl(p.url) : null,
-            thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null
+            thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
+            playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
+            playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null
         }));
 
         res.json({
