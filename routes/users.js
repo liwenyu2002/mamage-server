@@ -505,4 +505,61 @@ router.post('/me/invite', authMiddleware, async (req, res) => {
   }
 });
 
+// ==============================
+// 超级管理员用户后台
+// ==============================
+
+// 查看所有用户信息（不含密码），跨组织。GET /api/users/all
+router.get('/all', authMiddleware, requirePermission('users.view_all'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT u.id, u.name, u.email, u.student_no, u.role, u.department,
+              u.organization_id AS organizationId, o.name AS organizationName,
+              u.created_at AS createdAt
+       FROM users u
+       LEFT JOIN organizations o ON o.id = u.organization_id
+       ORDER BY u.id ASC`
+    );
+    return res.json({ users: rows || [] });
+  } catch (err) {
+    console.error('[GET /api/users/all]', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 修改用户角色。PATCH /api/users/:id/role  body: { role }
+router.patch('/:id/role', authMiddleware, requirePermission('users.manage_roles'), async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(targetId) || targetId <= 0) return res.status(400).json({ error: 'INVALID_USER_ID' });
+    if (req.user && Number(req.user.id) === targetId) {
+      return res.status(400).json({ error: 'CANNOT_CHANGE_OWN_ROLE', message: '不能修改自己的角色' });
+    }
+
+    const role = String((req.body && req.body.role) || '').trim();
+    const [roleRows] = await pool.query('SELECT DISTINCT role FROM role_permissions');
+    const validRoles = (roleRows || []).map((r) => r.role);
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'INVALID_ROLE', validRoles });
+    }
+
+    const [[target]] = await pool.query('SELECT id, role FROM users WHERE id = ?', [targetId]);
+    if (!target) return res.status(404).json({ error: 'USER_NOT_FOUND' });
+
+    // 防止把最后一个超管降级导致后台失守
+    if (target.role === 'superadmin' && role !== 'superadmin') {
+      const [[cnt]] = await pool.query("SELECT COUNT(*) AS c FROM users WHERE role = 'superadmin'");
+      if (Number(cnt.c) <= 1) {
+        return res.status(400).json({ error: 'LAST_SUPERADMIN', message: '至少保留一名超级管理员' });
+      }
+    }
+
+    await pool.query('UPDATE users SET role = ? WHERE id = ?', [role, targetId]);
+    return res.json({ ok: true, id: targetId, role });
+  } catch (err) {
+    console.error('[PATCH /api/users/:id/role]', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;
