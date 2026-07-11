@@ -1137,6 +1137,32 @@ router.post('/assign-section', requirePermission('photos.edit'), async (req, res
   }
 });
 
+// POST /api/photos/group-rescue
+// 一键合影救场：body { photoIds: [..] }（同一相似组的连拍），异步任务，返回 { jobId }
+router.post('/group-rescue', requirePermission('photos.edit'), async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body && req.body.photoIds)
+      ? req.body.photoIds.map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
+    if (ids.length < 2) return res.status(400).json({ error: 'NEED_AT_LEAST_2_PHOTOS' });
+    if (ids.length > 5) return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: 5 });
+
+    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const jobId = require('../lib/group_rescue').startJob(ids, orgId);
+    return res.json({ ok: true, jobId });
+  } catch (err) {
+    console.error('POST /api/photos/group-rescue error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/photos/group-rescue/:jobId — 轮询任务进度
+router.get('/group-rescue/:jobId', requirePermission('photos.edit'), async (req, res) => {
+  const job = require('../lib/group_rescue').getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'JOB_NOT_FOUND' });
+  return res.json(job);
+});
+
 // POST /api/photos/zip
 // 请求 body: { photoIds: [1,2,3], zipName: 'my-photos' }
 // 返回: application/zip attachment

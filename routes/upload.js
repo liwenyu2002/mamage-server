@@ -1284,5 +1284,7 @@ router.post('/video', requirePermission('upload.photo'), handleVideoUploadMiddle
 router.upload = upload;
 router.processUpload = processUpload;
 router.processVideoUpload = processVideoUpload;
+router.createPhotoRecordWithRetry = createPhotoRecordWithRetry;
+router.appendPhotoIdToProjectBestEffort = appendPhotoIdToProjectBestEffort;
 
 module.exports = router;

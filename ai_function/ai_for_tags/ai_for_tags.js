@@ -625,4 +625,5 @@ module.exports = {
   parseVisionResponse,
   analyzeWithOllama,
   analyzeWithDashScope,
+  callOllamaGenerate,
 };
