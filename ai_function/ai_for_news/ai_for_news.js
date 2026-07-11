@@ -115,10 +115,12 @@ async function generateFromPrompt({ prompt, options }) {
   const model = process.env.AI_TEXT_MODEL || 'gpt-3.5-turbo';
 
   if (!apiKey) {
-    return mockGenerate(prompt);
+    // mock 只在显式开启时可用（本地开发）；生产 key 失效时必须报错而不是静默产假文章
+    if (process.env.AI_TEXT_ALLOW_MOCK === '1') return mockGenerate(prompt);
+    throw new Error('文本模型未配置（缺少 AI_TEXT_API_KEY），请联系管理员');
   }
 
-  try {
+  {
     const baseURL = process.env.DASHSCOPE_BASE_URL || process.env.AI_TEXT_BASE_URL || undefined;
     const client = baseURL ? new OpenAI({ apiKey, baseURL }) : new OpenAI({ apiKey });
 
@@ -136,6 +138,12 @@ async function generateFromPrompt({ prompt, options }) {
       '9) 不要输出解释、注释或代码块。'
     ].join('\n');
 
+    // 生成长度随目标字数/照片数伸缩（routes 侧建议值），统一 clamp 防滥用
+    const requestedTokens = Number(options && options.maxTokens);
+    const maxTokens = Number.isFinite(requestedTokens) && requestedTokens > 0
+      ? Math.min(8000, Math.max(600, Math.floor(requestedTokens)))
+      : 1600;
+
     const callOptions = {
       model,
       messages: [
@@ -143,7 +151,7 @@ async function generateFromPrompt({ prompt, options }) {
         { role: 'user', content: prompt }
       ],
       temperature: 0.7,
-      max_tokens: 1600
+      max_tokens: maxTokens
     };
 
     const maxAttempts = parseInt(process.env.AI_JSON_MAX_ATTEMPTS || '3', 10);
@@ -152,6 +160,7 @@ async function generateFromPrompt({ prompt, options }) {
     let resp = null;
     let content = null;
     let parsed = null;
+    let lastErr = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
@@ -165,12 +174,18 @@ async function generateFromPrompt({ prompt, options }) {
         parsed = tryParseJsonFromString(str);
         if (parsed) break;
       } catch (e) {
+        lastErr = e;
         if (attempt >= maxAttempts) {
           console.error('[ai_for_news] text model call failed after retries:', e && e.stack ? e.stack : e);
           resp = null;
           content = null;
         }
       }
+    }
+
+    // 重试耗尽且一个字都没拿到 → 明确失败，不再伪装成功
+    if (!parsed && !content) {
+      throw new Error(`模型调用失败（${lastErr && lastErr.message ? lastErr.message : '重试次数耗尽'}），请稍后重试`);
     }
 
     const selectedMap = (options && Array.isArray(options.selectedPhotos))
@@ -181,10 +196,14 @@ async function generateFromPrompt({ prompt, options }) {
       : {};
 
     let markdown = '';
+    let parsedTitle = '';
+    let parsedSubtitle = '';
     const placeholders = [];
 
     if (parsed && typeof parsed === 'object' && parsed.markdown && Array.isArray(parsed.photos)) {
       markdown = String(parsed.markdown || '');
+      parsedTitle = String(parsed.title || '').trim();
+      parsedSubtitle = String(parsed.subtitle || '').trim();
       (parsed.photos || []).forEach((p) => {
         const id = String(p.id || p.ID || '');
         if (!id) return;
@@ -198,6 +217,10 @@ async function generateFromPrompt({ prompt, options }) {
       });
     } else {
       let str = typeof content === 'string' ? content : String(content || '');
+      // 模型试图输出 JSON 但格式损坏（常见于超长截断）：报错而不是把生 JSON 当正文给用户
+      if (str.trim().startsWith('{')) {
+        throw new Error('模型输出格式异常（可能被截断），请重试或降低目标字数');
+      }
       str = str.replace(/\n?ImageCaptions:\n([\s\S]*?)$/i, '');
       str = fixNestedMarkdown(str);
       markdown = dedupePhotoPlaceholders(str);
@@ -225,8 +248,13 @@ async function generateFromPrompt({ prompt, options }) {
       });
     }
 
-    const title = (markdown.split('\n')[0] || '新闻标题').replace(/^#\s*/, '').slice(0, 80);
-    const subtitle = '';
+    if (!String(markdown || '').trim()) {
+      throw new Error('模型未返回有效内容，请重试');
+    }
+
+    // 优先采用模型认真生成的标题/副标题，缺失时才从正文首行硬算
+    const title = (parsedTitle || (markdown.split('\n')[0] || '新闻标题')).replace(/^#\s*/, '').slice(0, 80);
+    const subtitle = parsedSubtitle.slice(0, 120);
     const html = markdown.replace(/\n/g, '<br/>');
 
     let tokens = null;
@@ -234,9 +262,6 @@ async function generateFromPrompt({ prompt, options }) {
     if (resp && resp.usage) tokens = resp.usage.total_tokens || null;
 
     return { title, subtitle, markdown, html, placeholders, tokens, cost };
-  } catch (e) {
-    console.error('[ai_for_news] text model call failed, falling back to mock:', e && e.stack ? e.stack : e);
-    return mockGenerate(prompt);
   }
 }
 

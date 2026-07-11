@@ -67,7 +67,9 @@ function assemblePrompt(form, selectedPhotos, referenceArticle, interviewText, o
       const projectTitle = p.projectTitle || p.project || '';
       const personNames = extractPersonNames(p);
       const peoplePart = personNames.length ? ` (人物:${personNames.join('、')})` : '';
-      lines.push(`图${idx + 1}：${desc} (tags:${tags}) (projectTitle:${projectTitle})${peoplePart} -> 占位符 PHOTO:${p.id} (thumb provided)`);
+      const photographer = String(p.photographerName || p.photographer_name || '').trim();
+      const photographerPart = photographer ? ` (摄影:${photographer})` : '';
+      lines.push(`图${idx + 1}：${desc} (tags:${tags}) (projectTitle:${projectTitle})${peoplePart}${photographerPart} -> 占位符 PHOTO:${p.id} (thumb provided)`);
     });
     lines.push('说明：仅使用 PHOTO:<id> 作为图片占位符，不要在正文中输出真实图片 URL。');
     lines.push('说明：可以参考 projectTitle 把握语气与主题，但不要把它当成事实来源直接写入。');
@@ -133,8 +135,15 @@ router.post('/render-preview', requirePermission('ai.generate'), async (req, res
 
     const width = Number(body.width);
     const height = Number(body.height);
+    // baseHref 不接受任意值：只允许与请求同 host（防止把带凭证的"同源"指向攻击者域）
     const inferredBaseHref = `${req.protocol}://${req.get('host')}/`;
-    const baseHref = body.baseHref || inferredBaseHref;
+    let baseHref = inferredBaseHref;
+    if (body.baseHref) {
+      try {
+        const candidate = new URL(String(body.baseHref));
+        if (candidate.host === req.get('host')) baseHref = candidate.toString();
+      } catch (e) { /* 非法 URL 一律用推断值 */ }
+    }
 
     const png = await renderNewsPreviewPng({
       html,
@@ -193,11 +202,24 @@ router.post('/generate', requirePermission('ai.generate'), async (req, res) => {
       const referenceArticle = body.referenceArticle || '';
       const interviewText = body.interviewText || '';
 
+      if (selectedPhotos.length > MAX_PHOTOS) {
+        return res.status(413).json({ code: 4134, message: `最多支持 ${MAX_PHOTOS} 张照片，请减少已选照片`, details: { field: 'selectedPhotos', max: MAX_PHOTOS } });
+      }
       if (referenceArticle && referenceArticle.length > MAX_REFERENCE_CHARS) {
         return res.status(413).json({ code: 4131, message: 'referenceArticle too large', details: { field: 'referenceArticle', max: MAX_REFERENCE_CHARS } });
       }
 
       prompt = assemblePrompt(form, selectedPhotos, referenceArticle, interviewText, options);
+      if (prompt.length > MAX_FULLPROMPT_CHARS) {
+        return res.status(413).json({ code: 4135, message: '内容过长：请减少照片数量或缩短参考资料/采访记录' });
+      }
+
+      // 按目标字数与照片数建议生成长度上限（客户端显式传入时尊重其值，后端统一 clamp）
+      if (!options.maxTokens) {
+        const wordsMatch = String(form.targetWords || '').match(/\d+/g);
+        const targetWords = wordsMatch ? Math.max(...wordsMatch.map(Number)) : 800;
+        options.maxTokens = Math.floor(targetWords * 2 + selectedPhotos.length * 100 + 800);
+      }
     }
 
     const [insertResult] = await pool.query(
@@ -224,12 +246,13 @@ router.post('/generate', requirePermission('ai.generate'), async (req, res) => {
         const photos = Array.isArray(result.placeholders)
           ? result.placeholders
           : (result.placeholders ? JSON.parse(result.placeholders) : []);
-        const onePot = { markdown: result.markdown, photos };
+        const onePot = { markdown: result.markdown, photos, title: result.title || null, subtitle: result.subtitle || null, html: result.html || null };
         return res.json({ jobId, status: 'succeeded', result: onePot });
       } catch (e) {
         console.error('sync generate error', e);
-        await pool.query('UPDATE ai_jobs SET status = ?, error = ?, finished_at = NOW() WHERE id = ?', ['failed', String(e && e.message || e), jobId]);
-        return res.status(500).json({ jobId, status: 'failed', error: 'generation failed' });
+        const reason = String((e && e.message) || e).slice(0, 200);
+        await pool.query('UPDATE ai_jobs SET status = ?, error = ?, finished_at = NOW() WHERE id = ?', ['failed', reason, jobId]);
+        return res.status(500).json({ jobId, status: 'failed', error: reason });
       }
     }
 
@@ -249,6 +272,13 @@ router.get('/jobs/:jobId', requirePermission('ai.generate'), async (req, res) =>
     const [rows] = await pool.query('SELECT * FROM ai_jobs WHERE id = ?', [id]);
     if (!rows || rows.length === 0) return res.status(404).json({ code: 4041, message: 'job not found' });
     const job = rows[0];
+
+    // 归属校验：job 只能被创建者本人（或超管）读取；对外统一 404 不暴露存在性
+    const requesterId = req.user && req.user.id ? Number(req.user.id) : null;
+    const isOwner = requesterId !== null && job.user_id !== null && Number(job.user_id) === requesterId;
+    const isSuper = req.user && req.user.role === 'superadmin';
+    if (!isOwner && !isSuper) return res.status(404).json({ code: 4041, message: 'job not found' });
+
     const [resRows] = await pool.query('SELECT * FROM ai_results WHERE job_id = ? ORDER BY id DESC LIMIT 1', [id]);
     const result = resRows && resRows[0] ? resRows[0] : null;
 
@@ -267,7 +297,7 @@ router.get('/jobs/:jobId', requirePermission('ai.generate'), async (req, res) =>
       progress: job.status === 'running' ? 0.5 : (job.status === 'succeeded' ? 1 : 0),
       startedAt: job.started_at,
       finishedAt: job.finished_at,
-      result: result ? { markdown: result.markdown, photos } : null,
+      result: result ? { markdown: result.markdown, photos, title: result.title || null, subtitle: result.subtitle || null, html: result.html || null } : null,
       error: job.error || null
     });
   } catch (e) {
