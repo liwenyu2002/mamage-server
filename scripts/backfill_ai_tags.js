@@ -11,6 +11,7 @@
 //   node scripts/backfill_ai_tags.js --projectId=12
 //   node scripts/backfill_ai_tags.js --force             # full historical re-tag
 //   node scripts/backfill_ai_tags.js --ids=1758,1759
+//   node scripts/backfill_ai_tags.js --rescore           # AI 选片 2.0：给已打标但无评分的照片补评分
 
 try {
   const path = require('path');
@@ -46,10 +47,15 @@ async function selectRows() {
 
   // 显式给出 --ids 即精确意图，不再叠加孤儿状态过滤
   if (!force && !ids.length) {
-    where.push(hasFlag('missing')
-      // 孤儿 + 打过标但没产出标签的历史照片（旧模型/空结果）
-      ? "(ai_status IS NULL OR ai_status IN ('pending', 'running', 'failed') OR tags IS NULL OR tags = '' OR tags = '[]')"
-      : "(ai_status IS NULL OR ai_status IN ('pending', 'running', 'failed'))");
+    if (hasFlag('rescore')) {
+      // AI 选片 2.0 重评分：已完成打标但还没有综合分的历史照片
+      where.push("(ai_score IS NULL AND ai_status = 'done')");
+    } else {
+      where.push(hasFlag('missing')
+        // 孤儿 + 打过标但没产出标签的历史照片（旧模型/空结果）
+        ? "(ai_status IS NULL OR ai_status IN ('pending', 'running', 'failed') OR tags IS NULL OR tags = '' OR tags = '[]')"
+        : "(ai_status IS NULL OR ai_status IN ('pending', 'running', 'failed'))");
+    }
   }
   if (projectId !== null) {
     const pid = Number(projectId);

@@ -5,6 +5,7 @@
 const { OpenAI } = require('openai');
 const http = require('http');
 const https = require('https');
+const { computeTechAndImage, composeQuality } = require('./photo_quality');
 
 const DEFAULT_DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
@@ -57,6 +58,32 @@ const LOCAL_VISION_PROMPT = [
   'customTags：0-3 个中文短标签，只写画面中客观可见且固定词未覆盖的具体内容；不要重复固定标签；不要写泛词。',
   '最终标签总数不超过 10 个。'
 ].join('\n');
+
+// AI 选片 2.0：锐度/曝光已由代码实测（作为提示注入），模型只评主观四维 + 缺陷 + 评语。
+// 不再让模型输出 qualityTag——三档标签由服务端按综合分与致命缺陷映射。
+function buildScoredVisionPrompt(tech) {
+  return [
+    '你是高校摄影社的资深选片编辑。只根据图片客观可见内容判断，不要猜测人物身份。',
+    '必须只返回一个 JSON 对象，不要 Markdown，不要解释。所有字段都必须给出。',
+    'JSON 字段固定为：description, standardTags, customTags, quality。',
+    'description：20-40 字中文，客观新闻口吻，只描述画面内容，绝不要提及锐度/曝光/技术检测等数值。',
+    'quality 是一个对象，字段如下：',
+    'quality.composition：构图 1-10。三分法/引导线/层次/画面平衡；歪斜、切头切脚、主体贴边低分。',
+    'quality.subject：主体 1-10。主体是否突出醒目、与背景分离；找不到主体或主体被杂物淹没低分。',
+    'quality.moment：瞬间 1-10。表情/动作/互动的瞬间价值；呆板站桩合影类给 4-6，抓拍到笑容/掌声/交流高分。',
+    'quality.aesthetics：美感 1-10。光线、色彩、氛围的整体观感。',
+    '评分务必拉开差距：普通记录照应落在 4-6，明显问题给 2-3，只有确实出色的维度才给 8 以上，10 分极罕见。',
+    'quality.flags：0-4 个缺陷，只能从这些词中选：闭眼、表情不佳、背影、主体遮挡、画面歪斜、杂乱背景、无明显主体。没有就给空数组。',
+    '闭眼只在能看清人脸且主要人物明显闭眼时才标；背影指主要人物背对镜头。',
+    'quality.reason：必填，15-30 字中文选片评语，说清这张照片最突出的优点或最主要的问题，例如"主体人物表情自然，舞台光效出色"或"构图松散，主体不突出"。',
+    `参考信息（程序已在原图实测，仅供你写评语参考，不要抄进 description）：锐度 ${tech.sharpness}/10，曝光 ${tech.exposure}/10。你不要评清晰度与曝光。`,
+    `standardTags：只能从这些固定词中选择，总量适中：${STANDARD_TAGS.join('、')}。`,
+    'standardTags 至少包含一个景别、一个焦段、一个人物数量或无人/动物判断。',
+    '人物数量规则：单人=只有 1 个清晰可见真人；多人=有 2 个或以上清晰可见真人；无人=没有真人；动物=主体是动物。',
+    '不要把讲台、麦克风、海报、屏幕、雕像、文字、阴影、模糊背景形状、残缺肢体当作人。',
+    'customTags：0-3 个中文短标签，只写画面中客观可见且固定词未覆盖的具体内容；不要写泛词。',
+  ].join('\n');
+}
 
 const DASHSCOPE_SYSTEM_PROMPT = [
   '你是高校新闻中心的图片审核与打标助手。只输出两行，不要解释。',
@@ -492,17 +519,14 @@ function extractOpenAIMessageText(msg) {
   return String(msg.content || '').trim();
 }
 
-async function analyzeWithOllama(imageUrl) {
-  const buf = /^https?:\/\//i.test(imageUrl) ? await fetchBinary(imageUrl) : null;
-  if (!buf) throw new Error('Ollama provider requires an http(s) image URL');
-
+async function callOllamaGenerate(prompt, imageBase64) {
   const model = getOllamaModel();
   const payload = {
     model,
     stream: false,
     format: 'json',
-    prompt: LOCAL_VISION_PROMPT,
-    images: [buf.toString('base64')],
+    prompt,
+    images: [imageBase64],
     options: {
       temperature: Number(process.env.OLLAMA_VISION_TEMPERATURE || 0.1),
       num_predict: Number(process.env.OLLAMA_VISION_NUM_PREDICT || 512),
@@ -513,10 +537,56 @@ async function analyzeWithOllama(imageUrl) {
 
   const resp = await postJson(`${getOllamaBaseUrl()}/api/generate`, payload, getRequestTimeoutMs());
   if (resp && resp.error) throw new Error(resp.error);
+  return String((resp && resp.response) || '').trim();
+}
 
-  const raw = String((resp && resp.response) || '').trim();
+async function analyzeWithOllama(imageUrl) {
+  const buf = /^https?:\/\//i.test(imageUrl) ? await fetchBinary(imageUrl) : null;
+  if (!buf) throw new Error('Ollama provider requires an http(s) image URL');
+
+  const raw = await callOllamaGenerate(LOCAL_VISION_PROMPT, buf.toString('base64'));
   const parsed = parseVisionResponse(raw);
-  return { raw, ...parsed, provider: 'ollama', model };
+  return { raw, ...parsed, provider: 'ollama', model: getOllamaModel() };
+}
+
+function extractModelQuality(raw) {
+  const parsed = tryParseJsonObject(raw);
+  if (!parsed || typeof parsed.quality !== 'object' || !parsed.quality) return null;
+  return parsed.quality;
+}
+
+// AI 选片 2.0 入口：原图 → 技术实测（sharp）→ 模型主观四维 → 综合分/三档。
+// 与旧 analyze() 的差异：分析用图是原图 resize 1280（而非缩略图），
+// 三档标签由 composeQuality 计算并注入 tags 首位，另返回 score/quality 供持久化。
+async function analyzePhoto(imageUrl) {
+  if (getVisionProvider() !== 'ollama') {
+    // 非本地视觉通道退回旧管线（无评分）
+    const legacy = await analyze(imageUrl);
+    return { ...legacy, score: null, quality: null };
+  }
+
+  // 原图上限用独立环境变量：AI_VISION_IMAGE_MAX_BYTES 是缩略图/DashScope 载荷的 5MB 档，
+  // 共用会在运维收紧后者时静默掐死大原图的评分管线
+  const buf = await fetchBinary(imageUrl, { maxBytes: Number(process.env.AI_VISION_ORIGINAL_MAX_BYTES || 40 * 1024 * 1024) });
+  const { tech, modelJpeg } = await computeTechAndImage(buf);
+
+  const raw = await callOllamaGenerate(buildScoredVisionPrompt(tech), modelJpeg.toString('base64'));
+  const parsed = parseVisionResponse(raw);
+  const modelQuality = extractModelQuality(raw);
+  const { score, label, quality } = composeQuality(tech, modelQuality);
+
+  // 三档标签由服务端算出，替换/前插进 tags（旧数据里的质量标签词表兼容不变）
+  const tags = [label, ...(parsed.tags || []).filter((t) => !QUALITY_TAGS.has(t))].slice(0, 10);
+
+  return {
+    raw,
+    description: parsed.description,
+    tags,
+    score,
+    quality,
+    provider: 'ollama',
+    model: getOllamaModel(),
+  };
 }
 
 async function analyzeWithProvider(provider, imageUrl) {
@@ -540,6 +610,7 @@ async function analyze(imageUrl) {
 
 module.exports = {
   analyze,
+  analyzePhoto,
   headRequest,
   fetchBinary,
   parseVisionResponse,

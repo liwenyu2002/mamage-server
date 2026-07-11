@@ -831,6 +831,8 @@ router.get('/:id', async (req, res) => {
         ph.adjustments,
         ph.tags,
         ph.ai_status AS aiStatus,
+        ph.ai_score AS aiScore,
+        ph.ai_quality AS aiQuality,
         ph.ai_error AS aiError,
         ph.ai_started_at AS aiStartedAt,
         ph.ai_finished_at AS aiFinishedAt,
@@ -854,7 +856,20 @@ router.get('/:id', async (req, res) => {
       photoParams.push(orgId);
     }
     photoSql += ' ORDER BY ph.created_at ASC, ph.id ASC';
-    const [photoRows] = await pool.query(photoSql, photoParams);
+    let photoRows;
+    try {
+      [photoRows] = await pool.query(photoSql, photoParams);
+    } catch (colErr) {
+      // 缺列降级（迁移 20260711_001 尚未执行时）：去掉 ai_score/ai_quality 重查，别把详情页打成 500
+      if (colErr && (colErr.code === 'ER_BAD_FIELD_ERROR' || String(colErr.message || '').includes('Unknown column'))) {
+        const degraded = photoSql
+          .replace('ph.ai_score AS aiScore,', '')
+          .replace('ph.ai_quality AS aiQuality,', '');
+        [photoRows] = await pool.query(degraded, photoParams);
+      } else {
+        throw colErr;
+      }
+    }
 
     project.photos = photoRows.map((p) => ({
       ...p,

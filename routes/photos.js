@@ -520,6 +520,8 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.adjustments,
         p.tags,
         p.ai_status       AS aiStatus,
+        p.ai_score        AS aiScore,
+        p.ai_quality      AS aiQuality,
         p.ai_error        AS aiError,
         p.ai_started_at   AS aiStartedAt,
         p.ai_finished_at  AS aiFinishedAt,
@@ -568,7 +570,20 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
     sql += ' LIMIT ?';
     params.push(limit);
 
-    const [rows] = await pool.query(sql, params);
+    let rows;
+    try {
+      [rows] = await pool.query(sql, params);
+    } catch (colErr) {
+      // 缺列降级（迁移 20260711_001 尚未执行时）：去掉 ai_score/ai_quality 重查
+      if (colErr && (colErr.code === 'ER_BAD_FIELD_ERROR' || String(colErr.message || '').includes('Unknown column'))) {
+        const degraded = sql
+          .replace('p.ai_score        AS aiScore,', '')
+          .replace('p.ai_quality      AS aiQuality,', '');
+        [rows] = await pool.query(degraded, params);
+      } else {
+        throw colErr;
+      }
+    }
 
     const mapped = rows.map((p) => {
       // 如果文件不存在，返回一个内联 SVG 占位图（data URL）以避免浏览器断图
