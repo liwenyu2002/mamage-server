@@ -50,6 +50,9 @@ async function selectRows() {
     if (hasFlag('rescore')) {
       // AI 选片 2.0 重评分：已完成打标但还没有综合分的历史照片
       where.push("(ai_score IS NULL AND ai_status = 'done')");
+    } else if (hasFlag('ocr-missing')) {
+      // OCR 补跑：已打标但还没提取过画面文字的历史照片
+      where.push("(ocr_text IS NULL AND ai_status = 'done')");
     } else {
       where.push(hasFlag('missing')
         // 孤儿 + 打过标但没产出标签的历史照片（旧模型/空结果）

@@ -816,6 +816,7 @@ router.get('/search', async (req, res) => {
         whereClauses.push(`(
           LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(p.description, '')) LIKE ? ESCAPE '#'
+          OR LOWER(COALESCE(p.ocr_text, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(CAST(p.tags AS CHAR), '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(p.url, '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(p.thumb_url, '')) LIKE ? ESCAPE '#'
@@ -827,7 +828,7 @@ router.get('/search', async (req, res) => {
           OR LOWER(COALESCE(CAST(p.photographer_id AS CHAR), '')) LIKE ? ESCAPE '#'
           OR LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#'
         )`);
-        whereParams.push(like, like, like, like, like, like, like, like, like, like, like, like);
+        whereParams.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
       });
     }
 
@@ -880,6 +881,8 @@ router.get('/search', async (req, res) => {
         scoreParts.push(`CASE WHEN LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#' THEN 6 ELSE 0 END`);
         scoreParams.push(containLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(p.description, '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
+        scoreParams.push(containLike);
+        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.ocr_text, '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
         scoreParams.push(containLike);
         scoreParts.push(`CASE WHEN LOWER(COALESCE(CAST(p.tags AS CHAR), '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
         scoreParams.push(containLike);

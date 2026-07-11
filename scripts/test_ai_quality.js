@@ -17,6 +17,8 @@ async function makeSharpImage() {
     ${Array.from({ length: 12 }, (_, i) => `<rect x="${100 + i * 120}" y="${180 + (i % 3) * 260}" width="90" height="90" fill="${i % 2 ? '#f4f0e8' : '#1d232e'}"/>`).join('')}
     <circle cx="800" cy="640" r="210" fill="#e8ddc8" stroke="#22282f" stroke-width="14"/>
     <text x="800" y="1080" font-size="90" text-anchor="middle" fill="#101418" font-family="sans-serif">MaMage QUALITY TEST</text>
+    <rect x="250" y="120" width="1100" height="120" fill="#b91c1c"/>
+    <text x="800" y="200" font-size="72" text-anchor="middle" fill="#ffffff" font-family="sans-serif">2026 校运会 100米决赛</text>
   </svg>`;
   return sharp(Buffer.from(svg)).jpeg({ quality: 92 }).toBuffer();
 }
@@ -53,6 +55,7 @@ async function main() {
       console.log('tech:', JSON.stringify(result.quality && result.quality.tech));
       console.log('tags:', JSON.stringify(result.tags));
       console.log('description:', result.description);
+      console.log('ocrText:', result.ocrText);
     } catch (e) {
       console.error(`\n=== ${name} FAILED ===`, e && e.message ? e.message : e);
       process.exitCode = 1;

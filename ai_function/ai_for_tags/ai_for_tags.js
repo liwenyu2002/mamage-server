@@ -65,8 +65,9 @@ function buildScoredVisionPrompt(tech) {
   return [
     '你是高校摄影社的资深选片编辑。只根据图片客观可见内容判断，不要猜测人物身份。',
     '必须只返回一个 JSON 对象，不要 Markdown，不要解释。所有字段都必须给出。',
-    'JSON 字段固定为：description, standardTags, customTags, quality。',
+    'JSON 字段固定为：description, standardTags, customTags, quality, ocrText。',
     'description：20-40 字中文，客观新闻口吻，只描述画面内容，绝不要提及锐度/曝光/技术检测等数值。',
+    'ocrText：提取画面中清晰可辨认的文字（横幅、海报、屏幕、证书、号码牌、指示牌等），按重要性排列，用空格分隔，最多 200 字；看不清就不要写，绝不编造；没有文字给空字符串 ""。',
     'quality 是一个对象，字段如下：',
     'quality.composition：构图 1-10。三分法/引导线/层次/画面平衡；歪斜、切头切脚、主体贴边低分。',
     'quality.subject：主体 1-10。主体是否突出醒目、与背景分离；找不到主体或主体被杂物淹没低分。',
@@ -537,7 +538,10 @@ async function callOllamaGenerate(prompt, imageBase64) {
 
   const resp = await postJson(`${getOllamaBaseUrl()}/api/generate`, payload, getRequestTimeoutMs());
   if (resp && resp.error) throw new Error(resp.error);
-  return String((resp && resp.response) || '').trim();
+  // qwen3-vl 等思考型模型会把输出写进 thinking 而 response 为空——兜底读取
+  const primary = String((resp && resp.response) || '').trim();
+  if (primary) return primary;
+  return String((resp && resp.thinking) || '').trim();
 }
 
 async function analyzeWithOllama(imageUrl) {
@@ -574,6 +578,10 @@ async function analyzePhoto(imageUrl) {
   const parsed = parseVisionResponse(raw);
   const modelQuality = extractModelQuality(raw);
   const { score, label, quality } = composeQuality(tech, modelQuality);
+  const parsedObj = tryParseJsonObject(raw);
+  const ocrText = parsedObj && typeof parsedObj.ocrText === 'string'
+    ? parsedObj.ocrText.replace(/\s+/g, ' ').trim().slice(0, 500) || null
+    : null;
 
   // 三档标签由服务端算出，替换/前插进 tags（旧数据里的质量标签词表兼容不变）
   const tags = [label, ...(parsed.tags || []).filter((t) => !QUALITY_TAGS.has(t))].slice(0, 10);
@@ -584,6 +592,7 @@ async function analyzePhoto(imageUrl) {
     tags,
     score,
     quality,
+    ocrText,
     provider: 'ollama',
     model: getOllamaModel(),
   };
