@@ -1138,17 +1138,32 @@ router.post('/assign-section', requirePermission('photos.edit'), async (req, res
 });
 
 // POST /api/photos/group-rescue
-// 一键合影救场：body { photoIds: [..] }（同一相似组的连拍），异步任务，返回 { jobId }
+// 合影救场：body { basePhotoId, referencePhotoIds?: [0-4张] }（参考可跨相册；无参考时自动从人脸库找替补）。
+// 兼容旧版 body { photoIds: [..] }（自动选最高分为基底）。异步任务，返回 { jobId }
 router.post('/group-rescue', requirePermission('photos.edit'), async (req, res) => {
   try {
-    const ids = Array.isArray(req.body && req.body.photoIds)
-      ? req.body.photoIds.map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n) && n > 0)
+    const body = req.body || {};
+    const basePhotoId = body.basePhotoId !== undefined ? parseInt(body.basePhotoId, 10) : null;
+    const referencePhotoIds = Array.isArray(body.referencePhotoIds)
+      ? body.referencePhotoIds.map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n) && n > 0)
       : [];
-    if (ids.length < 2) return res.status(400).json({ error: 'NEED_AT_LEAST_2_PHOTOS' });
-    if (ids.length > 5) return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: 5 });
+    const legacyIds = Array.isArray(body.photoIds)
+      ? body.photoIds.map((v) => parseInt(v, 10)).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
+
+    let params = null;
+    if (Number.isFinite(basePhotoId) && basePhotoId > 0) {
+      if (referencePhotoIds.length > 4) return res.status(413).json({ error: 'TOO_MANY_REFERENCES', maxReferences: 4 });
+      params = { basePhotoId, referencePhotoIds };
+    } else if (legacyIds.length >= 2) {
+      if (legacyIds.length > 5) return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: 5 });
+      params = { photoIds: legacyIds };
+    } else {
+      return res.status(400).json({ error: 'NEED_BASE_PHOTO' });
+    }
 
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-    const jobId = require('../lib/group_rescue').startJob(ids, orgId);
+    const jobId = require('../lib/group_rescue').startJob(params, orgId);
     return res.json({ ok: true, jobId });
   } catch (err) {
     console.error('POST /api/photos/group-rescue error:', err);
