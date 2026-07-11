@@ -128,6 +128,7 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/organizations', orgsRouter);
+app.use('/api/auth', require('./routes/auth_dingtalk'));
 app.use('/api/share', shareRouter);
 app.use('/api/similarity', similarityRouter);
 app.use('/api', facesRouter);
