@@ -149,11 +149,36 @@ function testOverMaxBlocksMerged() {
   console.log(`[test_article_import] over-max-blocks merge OK: total=${blockCount}, merged block length=${mergedBlock.length}`);
 }
 
+// 带背景的单一包裹层不能被下钻丢弃（背景复现的核心）：覆盖秀米/135 常见的
+// "先重置再覆盖"写法（background-color:transparent 在前、真实背景在后），确保声明顺序不影响判定。
+function testBackgroundWrapperPreserved() {
+  const cases = [
+    ['纯背景色包裹层', 'background-color: rgb(255, 245, 233); padding: 20px', 'rgb(255, 245, 233)'],
+    ['reset-then-override 背景图', 'background-color: transparent; background-image: url(https://mmbiz.qpic.cn/x.png); padding: 20px', 'mmbiz.qpic.cn'],
+    ['reset-then-override 背景色', 'background: none; padding: 10px; background-color: rgb(240, 240, 240)', 'rgb(240, 240, 240)'],
+    ['带阴影卡片包裹层', 'box-shadow: 0px 2px 6px rgba(0,0,0,0.12); padding: 16px', 'box-shadow'],
+  ];
+  cases.forEach(([name, wrapStyle, needle]) => {
+    const html = `<div id="js_content"><section style="${wrapStyle}"><p>正文内容一</p><p>正文内容二</p></section></div>`;
+    const { blocks } = extractFullArticleFromHtml(html);
+    const joined = blocks.join('');
+    assert.ok(joined.includes(needle), `[${name}] 包裹层样式应保留（含 ${needle}），实际未钻穿丢弃前的输出=${joined.slice(0, 120)}`);
+    assert.ok(joined.includes('正文内容一') && joined.includes('正文内容二'), `[${name}] 正文不能丢`);
+  });
+
+  // 反面：无视觉样式的纯布局包裹层仍应被钻穿，避免整篇塌成一个巨块
+  const plainHtml = '<div id="js_content"><section style="padding: 10px; line-height: 1.6"><p>甲</p><p>乙</p></section></div>';
+  const plain = extractFullArticleFromHtml(plainHtml);
+  assert.strictEqual(plain.blockCount, 2, `无背景的布局包裹层应被钻穿分出 2 块，实际 ${plain.blockCount}`);
+  console.log('[test_article_import] background-wrapper preserved OK (含 reset-then-override + 反面钻穿)');
+}
+
 function main() {
   testMainFixture();
   testMetaFallback();
   testNoContainerThrows();
   testOverMaxBlocksMerged();
+  testBackgroundWrapperPreserved();
   console.log('[test_article_import] ALL PASS');
 }
 
