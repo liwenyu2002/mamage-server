@@ -192,12 +192,18 @@ router.get('/:token', async (req, res) => {
       '.wpv-page img{max-width:100%;height:auto;}' +
       '.wpv-title{font-size:20px;font-weight:600;margin:0 0 8px;color:#222;}' +
       '.wpv-digest{font-size:13px;color:#888;margin:0 0 16px;}' +
+      // 微信文章页 #js_content 实测基线（与前端 canvas.css .cve-raw-host 同源同步）：
+      // 整文导入的 raw 块依赖这套基线；缺失时裸 <p> 吃浏览器默认 margin 1em，行距与原文不一致。
+      // 只作用于 .wpv-content（标题/摘要在外层，不受 p 重置影响）；para/样式块全内联样式不受基线干扰。
+      '.wpv-content{font-size:17px;line-height:1.6;letter-spacing:0.544px;text-align:justify;}' +
+      '.wpv-content p,.wpv-content h1,.wpv-content h2,.wpv-content h3,.wpv-content h4,.wpv-content h5,.wpv-content h6,.wpv-content blockquote,.wpv-content figure,.wpv-content ul,.wpv-content ol{margin:0;padding:0;}' +
+      '.wpv-content p{clear:both;min-height:1em;}' +
       '</style>' +
       '</head><body>' +
       '<div class="wpv-page">' +
       (preview.title ? `<h1 class="wpv-title">${titleHtml}</h1>` : '') +
       (digestHtml ? `<p class="wpv-digest">${digestHtml}</p>` : '') +
-      preview.html +
+      '<div class="wpv-content">' + preview.html + '</div>' +
       '</div>' +
       '</body></html>';
 
