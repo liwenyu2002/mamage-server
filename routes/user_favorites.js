@@ -8,9 +8,13 @@ const router = express.Router();
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
 
-const ALLOWED_KINDS = new Set(['styleBlock', 'photo']);
+// snippet=画布框选收藏的元素片段（payload.blocks 是 DocBlock 数组,可原样再插入画布）
+const ALLOWED_KINDS = new Set(['styleBlock', 'photo', 'snippet']);
 const MAX_REF_KEY_LEN = 64;
-const MAX_PAYLOAD_BYTES = 32 * 1024; // 32KB
+const MAX_PAYLOAD_BYTES = 32 * 1024; // 32KB（styleBlock/photo）
+// 片段可含整段导入的 raw 富 HTML,更可能含图片编辑器导出的 data URL（单张 1280px JPEG ~200-400KB,
+// 多张叠加轻松超 256KB）——放宽到 2MB 避免常态化 413（与手机预览 html 上限同量级）。
+const MAX_SNIPPET_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const MAX_FAVORITES_PER_KIND = 200;
 
 // 服务端正则清洗（与 routes/wechat_style.js 的 sanitizeHtmlTemplate 同步维护）。
@@ -103,13 +107,23 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
       if (typeof payload.htmlTemplate === 'string') {
         payload = { ...payload, htmlTemplate: sanitizeHtmlTemplate(payload.htmlTemplate) };
       }
+      // snippet：payload.blocks 是 DocBlock 数组，其中 raw/para 块的 html 同样落库前清洗
+      if (kind === 'snippet' && Array.isArray(payload.blocks)) {
+        payload = {
+          ...payload,
+          blocks: payload.blocks.map((b) => (
+            b && typeof b.html === 'string' ? { ...b, html: sanitizeHtmlTemplate(b.html) } : b
+          )),
+        };
+      }
       try {
         payloadJson = JSON.stringify(payload);
       } catch (e) {
         return res.status(400).json({ code: 4003, message: 'payload must be JSON-serializable' });
       }
-      if (Buffer.byteLength(payloadJson, 'utf8') > MAX_PAYLOAD_BYTES) {
-        return res.status(413).json({ code: 4133, message: `payload exceeds ${MAX_PAYLOAD_BYTES} bytes` });
+      const cap = kind === 'snippet' ? MAX_SNIPPET_PAYLOAD_BYTES : MAX_PAYLOAD_BYTES;
+      if (Buffer.byteLength(payloadJson, 'utf8') > cap) {
+        return res.status(413).json({ code: 4133, message: `payload exceeds ${cap} bytes` });
       }
     }
 
