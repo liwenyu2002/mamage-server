@@ -1,5 +1,6 @@
 // routes/wechat_style.js
 // 公众号样式块库：POST /extract 从公众号文章链接启发式提取样式块（不落库，预览态）；
+// POST /import-article 把整篇文章内容+排版原样解析成内容块序列（不落库，供画布导入）；
 // GET/POST/DELETE /blocks 管理本组织已保存的样式块。全部接口要求 ai.generate 权限。
 // 挂载于 app.js: app.use('/api/wechat-style', require('./routes/wechat_style'))
 const express = require('express');
@@ -8,6 +9,7 @@ const fetch = require('node-fetch');
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
 const { extractStyleBlocksFromHtml } = require('../lib/wechat_style_extract');
+const { extractFullArticleFromHtml } = require('../lib/wechat_article_import');
 
 // ---- 常量 ----
 const ALLOWED_HOST = 'mp.weixin.qq.com'; // SSRF 白名单：仅公众号文章域，精确匹配（不含子域通配）
@@ -38,6 +40,13 @@ function assertAllowedWechatUrl(rawUrl) {
   }
   if (parsed.hostname !== ALLOWED_HOST) {
     const err = new Error('仅支持公众号文章链接（mp.weixin.qq.com）');
+    err.httpStatus = 400;
+    throw err;
+  }
+  // host 通过后再收紧到文章路径特征，拒绝同域下的其它页面（如登录页/公众号主页）；
+  // 公众号文章的跳转链（短链、迁移链）落地页同样是 /s 路径，重定向校验不会被误伤。
+  if (parsed.pathname !== '/s' && !parsed.pathname.startsWith('/s/')) {
+    const err = new Error('不是公众号推文链接（应形如 https://mp.weixin.qq.com/s/…）');
     err.httpStatus = 400;
     throw err;
   }
@@ -168,6 +177,51 @@ router.post('/extract', requirePermission('ai.generate'), async (req, res) => {
     res.json({ blocks, count: blocks.length });
   } catch (e) {
     console.error('POST /api/wechat-style/extract error', e);
+    res.status(500).json({ code: 5000, message: 'Internal server error' });
+  }
+});
+
+// POST /api/wechat-style/import-article  body: { url }
+// 整文复现：把公众号文章全文内容+排版原样解析成内容块序列，供前端画布导入。
+// 与 /extract（剥文字留模板）互补而非替代，两者共享同一套抓取/校验管线。
+router.post('/import-article', requirePermission('ai.generate'), async (req, res) => {
+  try {
+    const url = req.body && req.body.url;
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ code: 4001, message: 'url is required' });
+    }
+
+    let html;
+    let finalUrl;
+    try {
+      const fetched = await fetchWechatArticleHtml(url);
+      html = fetched.html;
+      finalUrl = fetched.finalUrl;
+    } catch (e) {
+      const status = e && e.httpStatus ? e.httpStatus : 502;
+      return res.status(status).json({ code: status === 400 ? 4002 : 5020, message: (e && e.message) || '抓取失败' });
+    }
+
+    let result;
+    try {
+      result = extractFullArticleFromHtml(html);
+    } catch (e) {
+      // 解析器目前唯一会 throw 的场景：找不到 #js_content 容器，或内容超出体积上限
+      return res.status(422).json({ code: 4221, message: (e && e.message) || '不是有效的公众号文章页' });
+    }
+
+    // 服务端再洗一遍（防止解析器本身的白名单有漏网之鱼），与 POST /blocks 落库前的处理口径一致
+    const blocks = result.blocks.map((b) => sanitizeHtmlTemplate(b));
+    res.json({
+      title: result.title,
+      author: result.author,
+      blocks,
+      imageCount: result.imageCount,
+      blockCount: blocks.length,
+      sourceUrl: finalUrl,
+    });
+  } catch (e) {
+    console.error('POST /api/wechat-style/import-article error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
 });
