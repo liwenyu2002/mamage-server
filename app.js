@@ -64,14 +64,18 @@ const facesRouter = require('./routes/faces');
 const imageProxyRouter = require('./routes/image_proxy');
 const wechatStyleRouter = require('./routes/wechat_style');
 const wechatPreviewRouter = require('./routes/wechat_preview');
+const wechatCompositionsRouter = require('./routes/wechat_compositions');
 const userFavoritesRouter = require('./routes/user_favorites');
 
 const app = express();
 
-// 3mb：给 JSON 包裹开销（字段名/引号/花括号等）留余量，让 /api/wechat-preview 自身的
-// 2MB html 内容上限校验（返回 413 code 4133）真正能命中，而不是被这里的通用限制提前拦截掉。
-app.use(express.json({ limit: '3mb' }));
-app.use(express.urlencoded({ extended: true, limit: '3mb' }));
+// 9mb：给 JSON 包裹开销（字段名/引号/花括号等）留余量，让路由自身的内容上限校验真正能命中，
+// 而不是被这里的通用限制提前拦截掉（body-parser 超限直接抛 Express 内置 413，绕过路由的
+// 自定义错误结构）。目前最大的内容上限来自 /api/wechat-compositions 的 doc（8MB，画布整篇
+// DocBlock[] 快照，raw 块可能含图片编辑器导出的 data URL）；/api/wechat-preview 的 2MB html
+// 上限同样在此范围内。
+app.use(express.json({ limit: '9mb' }));
+app.use(express.urlencoded({ extended: true, limit: '9mb' }));
 
 // ============ CORS ============
 const configuredCorsOrigins = String(process.env.CORS_ORIGIN || '')
@@ -134,6 +138,7 @@ app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/wechat-style', wechatStyleRouter);
 app.use('/api/wechat-preview', wechatPreviewRouter);
+app.use('/api/wechat-compositions', wechatCompositionsRouter);
 app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
