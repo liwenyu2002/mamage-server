@@ -14,7 +14,7 @@ const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB
 const MAX_TITLE_LEN = 255;
 const MAX_DIGEST_LEN = 512;
 const MAX_PREVIEWS_PER_USER = 30;
-const EXPIRES_IN_MS = 7 * 24 * 3600 * 1000; // 7 天
+const EXPIRES_IN_MS = 20 * 60 * 1000; // 20 分钟（按用户要求短时效，过期行由 cleanup 顺手清理）
 
 // 服务端再洗一遍 html（防止绕过前端）。
 // ⚠️ 与 routes/wechat_style.js / routes/user_favorites.js 的同名函数同源同步维护；
