@@ -63,6 +63,7 @@ const similarityRouter = require('./routes/similarity_groups');
 const facesRouter = require('./routes/faces');
 const imageProxyRouter = require('./routes/image_proxy');
 const wechatStyleRouter = require('./routes/wechat_style');
+const userFavoritesRouter = require('./routes/user_favorites');
 
 const app = express();
 
@@ -129,6 +130,7 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/wechat-style', wechatStyleRouter);
+app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
 app.use('/api/share', shareRouter);

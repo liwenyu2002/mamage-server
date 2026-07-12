@@ -120,14 +120,18 @@ async function fetchWechatArticleHtml(rawUrl) {
   throw err;
 }
 
-// 服务端再洗一遍（防止 POST /blocks 直接绕过 /extract 塞入恶意模板）：剥 <script> 与所有 on* 事件属性。
+// 服务端再洗一遍（防止 POST /blocks 直接绕过 /extract 塞入恶意模板）。
+// ⚠️ 与 routes/user_favorites.js 的同名函数同步维护；正则清洗是纵深防御第二道，
+// 真正防线是前端 CanvasEditor 渲染前的 DOMPurify。on* 前缀用 [\s/] 同时覆盖空白与
+// 斜杠分隔（<svg/onload=> 绕过），并剥 iframe/object/embed 与 javascript: 伪协议。
 function sanitizeHtmlTemplate(html) {
   let out = String(html || '');
-  out = out.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
-  out = out.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '');
-  out = out.replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, '');
-  out = out.replace(/\son[a-z]+\s*=\s*'[^']*'/gi, '');
-  out = out.replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, '');
+  out = out.replace(/<(script|style|iframe|object|embed)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+  out = out.replace(/<(iframe|object|embed)\b[^>]*>/gi, '');
+  out = out.replace(/[\s/]on[a-z]+\s*=\s*"[^"]*"/gi, ' ');
+  out = out.replace(/[\s/]on[a-z]+\s*=\s*'[^']*'/gi, ' ');
+  out = out.replace(/[\s/]on[a-z]+\s*=\s*[^\s>]+/gi, ' ');
+  out = out.replace(/(href|src)\s*=\s*(["']?)\s*(?:javascript|vbscript)\s*:[^"'>\s]*/gi, '$1=$2#');
   return out;
 }
 
