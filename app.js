@@ -63,12 +63,15 @@ const similarityRouter = require('./routes/similarity_groups');
 const facesRouter = require('./routes/faces');
 const imageProxyRouter = require('./routes/image_proxy');
 const wechatStyleRouter = require('./routes/wechat_style');
+const wechatPreviewRouter = require('./routes/wechat_preview');
 const userFavoritesRouter = require('./routes/user_favorites');
 
 const app = express();
 
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+// 3mb：给 JSON 包裹开销（字段名/引号/花括号等）留余量，让 /api/wechat-preview 自身的
+// 2MB html 内容上限校验（返回 413 code 4133）真正能命中，而不是被这里的通用限制提前拦截掉。
+app.use(express.json({ limit: '3mb' }));
+app.use(express.urlencoded({ extended: true, limit: '3mb' }));
 
 // ============ CORS ============
 const configuredCorsOrigins = String(process.env.CORS_ORIGIN || '')
@@ -130,6 +133,7 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/wechat-style', wechatStyleRouter);
+app.use('/api/wechat-preview', wechatPreviewRouter);
 app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
