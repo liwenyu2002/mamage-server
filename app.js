@@ -62,6 +62,7 @@ const shareRouter = require('./routes/share');
 const similarityRouter = require('./routes/similarity_groups');
 const facesRouter = require('./routes/faces');
 const imageProxyRouter = require('./routes/image_proxy');
+const wxImageProxyRouter = require('./routes/wx_image_proxy');
 const wechatStyleRouter = require('./routes/wechat_style');
 const wechatPreviewRouter = require('./routes/wechat_preview');
 const wechatCompositionsRouter = require('./routes/wechat_compositions');
@@ -123,6 +124,7 @@ const staticUploadsDir = uploadsAbsDir.replace(/\\/g, '/').toLowerCase().endsWit
   : path.join(uploadsAbsDir, 'uploads');
 
 app.use('/api/image', imageProxyRouter);
+app.use('/api/wx-img', wxImageProxyRouter);
 app.use('/uploads', express.static(staticUploadsDir));
 // ============ 鏃ュ織 ============
 app.use((req, res, next) => {

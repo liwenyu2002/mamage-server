@@ -7,6 +7,37 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
+const cosStorage = require('../lib/cos_storage');
+const { rehostDocImages } = require('../lib/wechat_image_rehost');
+
+// 存档「固化」：保存后在后台把推文里的微信图片(mmbiz)下载转存到自有对象存储，改写为 /api/image，
+// 使存档长期不依赖 mmbiz。非阻塞（不拖慢保存）、best-effort（失败由 /api/wx-img 代理兜底渲染）、
+// 对象存储未配置时整体跳过。读回库里已落盘的 sanitized doc 再改写，避免与请求体的信任问题。
+function scheduleRehost(id, userId) {
+  if (!cosStorage.isConfigured()) return;
+  setImmediate(async () => {
+    try {
+      const [rows] = await pool.query(
+        'SELECT doc FROM wechat_compositions WHERE id = ? AND user_id = ? LIMIT 1',
+        [id, userId]
+      );
+      if (!rows || !rows.length) return;
+      const doc = parseMaybeJson(rows[0].doc, null);
+      if (!Array.isArray(doc)) return;
+      const { doc: newDoc, rehosted, total } = await rehostDocImages(doc, { logger: console });
+      if (rehosted > 0) {
+        // updated_at = updated_at 保持用户保存时间不被后台改写打扰
+        await pool.query(
+          'UPDATE wechat_compositions SET doc = ?, updated_at = updated_at WHERE id = ? AND user_id = ?',
+          [JSON.stringify(newDoc), id, userId]
+        );
+        console.log(`[wx_rehost] composition ${id}: rehosted ${rehosted}/${total} images`);
+      }
+    } catch (e) {
+      console.error('[wx_rehost] background failed for', id, e && e.message ? e.message : e);
+    }
+  });
+}
 
 const MAX_NAME_LEN = 120;
 const MAX_TITLE_LEN = 255;
@@ -214,6 +245,7 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
       [result.insertId]
     );
     const saved = savedRows[0];
+    scheduleRehost(saved.id, userId); // 后台固化微信图片（对象存储未配置时 no-op）
     res.status(201).json({ id: saved.id, name: saved.name, createdAt: saved.created_at, updatedAt: saved.updated_at });
   } catch (e) {
     console.error('[POST /api/wechat-compositions] error', e && e.stack ? e.stack : e);
@@ -312,6 +344,7 @@ router.put('/:id', requirePermission('ai.generate'), async (req, res) => {
       [id]
     );
     const saved = savedRows[0];
+    if (body.doc !== undefined) scheduleRehost(id, userId); // doc 有更新才后台固化图片
     res.json({ id: saved.id, name: saved.name, updatedAt: saved.updated_at });
   } catch (e) {
     console.error('[PUT /api/wechat-compositions/:id] error', e && e.stack ? e.stack : e);
