@@ -132,6 +132,14 @@ function sanitizeHtmlTemplate(html) {
   out = out.replace(/[\s/]on[a-z]+\s*=\s*'[^']*'/gi, ' ');
   out = out.replace(/[\s/]on[a-z]+\s*=\s*[^\s>]+/gi, ' ');
   out = out.replace(/(href|src)\s*=\s*(["']?)\s*(?:javascript|vbscript)\s*:[^"'>\s]*/gi, '$1=$2#');
+  // SMIL <animate>/<set> 能在运行时把祖先 <a> 的 href 改写成 javascript: 伪协议（DOMPurify 默认因此整标签
+  // 剥除；本站放行 SMIL 以保留可点击 SVG 交互，公开预览是服务端直出、不过客户端 DOMPurify，故这里补齐同等
+  // 防线）：剥掉 attributeName 指向 href/xlink:href、或 to/from/by/values 携带伪协议的危险动画元素，保留安全动画。
+  out = out.replace(/<(animate|animatetransform|animatemotion|animatecolor|set)\b[^>]*>(?:[\s\S]*?<\/\1\s*>)?/gi, (m) => {
+    if (/attributeName\s*=\s*["']?\s*(?:xlink:)?href\b/i.test(m)) return '';
+    if (/\b(?:to|from|by|values)\s*=\s*["'][^"']*(?:javascript|vbscript)\s*:/i.test(m)) return '';
+    return m;
+  });
   return out;
 }
 
