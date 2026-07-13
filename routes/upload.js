@@ -761,6 +761,32 @@ async function createThumbBuffer(originalBuffer) {
     .toBuffer();
 }
 
+// HEIC/HEIF：浏览器不能直接显示，且预置 sharp/libvips 缺 HEVC 解码器（format.heif 只认 .avif）。
+// 用 heic-convert（内置 libheif WASM，自带 HEVC 解码）先转成高质量 JPEG，再走后续 sharp 管线。
+const HEIC_JPEG_QUALITY = Math.min(1, Math.max(0.5, envNumber(process.env.HEIC_JPEG_QUALITY, 0.95)));
+
+function looksLikeHeic(buffer, mime, originalname) {
+  if (/^image\/(heic|heif|heic-sequence|heif-sequence)$/i.test(String(mime || ''))) return true;
+  if (/\.(heic|heif)$/i.test(String(originalname || ''))) return true;
+  // ISO-BMFF 魔数：字节 4..8 为 'ftyp'，8..12 为品牌（heic/heix/hevc/mif1/msf1…）
+  if (buffer && buffer.length > 12 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buffer.toString('ascii', 8, 12).toLowerCase();
+    if (/^(heic|heix|hevc|hevx|heim|heis|hevm|hevs|mif1|msf1)$/.test(brand)) return true;
+  }
+  return false;
+}
+
+// 命中 HEIC 则就地把 file.buffer 换成 JPEG、mime 改 image/jpeg、扩展名改 .jpg。返回是否转码。
+async function maybeTranscodeHeic(file) {
+  if (!file || !file.buffer || !looksLikeHeic(file.buffer, file.mimetype, file.originalname)) return false;
+  const convert = require('heic-convert');
+  const jpeg = await convert({ buffer: file.buffer, format: 'JPEG', quality: HEIC_JPEG_QUALITY });
+  file.buffer = Buffer.isBuffer(jpeg) ? jpeg : Buffer.from(jpeg);
+  file.mimetype = 'image/jpeg';
+  file.originalname = `${String(file.originalname || 'photo').replace(/\.(heic|heif)$/i, '')}.jpg`;
+  return true;
+}
+
 function fetchBuffer(url, maxBytes, timeoutMs) {
   return new Promise((resolve, reject) => {
     const client = String(url || '').startsWith('https') ? require('https') : require('http');
@@ -890,6 +916,15 @@ async function processUpload(req, res) {
         error: 'COS_NOT_CONFIGURED',
         message: 'Server is not configured to upload to object storage. Configure COS_SECRET_ID/COS_SECRET_KEY/COS_BUCKET/COS_REGION.',
       });
+    }
+
+    // HEIC/HEIF → 高质量 JPEG（浏览器不能显示 HEIC，预置 sharp 也解不了 HEVC）。失败给明确错误，不让后续 sharp 撞墙。
+    try {
+      const heicStartMs = nowMs();
+      if (await maybeTranscodeHeic(req.file)) timings.heicMs = nowMs() - heicStartMs;
+    } catch (err) {
+      console.error('[upload] HEIC 转码失败:', err && err.message ? err.message : err);
+      return res.status(422).json({ error: 'HEIC_DECODE_FAILED', message: 'HEIC 图片解码失败，请换 JPG/PNG 重试' });
     }
 
     const metadata = readPhotoMetadata(req.body || {});
