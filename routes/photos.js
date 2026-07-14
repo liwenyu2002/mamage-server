@@ -1181,12 +1181,57 @@ router.get('/group-rescue/:jobId', requirePermission('photos.edit'), async (req,
 
 // POST /api/photos/zip
 // 请求 body: { photoIds: [1,2,3], zipName: 'my-photos' }
+// 分享页(公开、无登录态)也要能打包：带 shareCode 时改用"分享码鉴权"，
+// 并把可下载范围严格钉死在该分享自身的照片里（下方 resolveShareZipScope）。
+async function resolveShareZipScope(code) {
+  const [rows] = await pool.query(
+    'SELECT id, code, share_type, project_id, organization_id, expires_at, revoked_at FROM share_links WHERE code = ? LIMIT 1',
+    [String(code || '').trim()]
+  );
+  if (!rows || rows.length === 0) return { error: 'NOT_FOUND', status: 404 };
+  const s = rows[0];
+  if (s.revoked_at) return { error: 'REVOKED', status: 410 };
+  if (s.expires_at && new Date(s.expires_at).getTime() <= Date.now()) return { error: 'EXPIRED', status: 410 };
+
+  let allowed = [];
+  if (s.share_type === 'collection') {
+    const [items] = await pool.query('SELECT photo_id FROM share_link_items WHERE share_id = ?', [s.id]);
+    allowed = (items || []).map((r) => Number(r.photo_id)).filter(Boolean);
+  } else if (s.share_type === 'project') {
+    const [ps] = await pool.query(
+      `SELECT id FROM photos WHERE project_id = ?${s.organization_id === null ? ' AND organization_id IS NULL' : ' AND organization_id = ?'}`,
+      s.organization_id === null ? [s.project_id] : [s.project_id, s.organization_id]
+    );
+    allowed = (ps || []).map((r) => Number(r.id)).filter(Boolean);
+  } else {
+    return { error: 'UNSUPPORTED_SHARE_TYPE', status: 400 };
+  }
+  return { orgId: s.organization_id === null ? null : parseInt(s.organization_id, 10), allowed: new Set(allowed) };
+}
+
 // 返回: application/zip attachment
-router.post('/zip', requirePermission('photos.view'), async (req, res) => {
+router.post('/zip', (req, res, next) => {
+  // 有 shareCode → 走公开分享路径（不要求登录）；否则维持原有登录鉴权
+  if (req.body && req.body.shareCode) return next();
+  return requirePermission('photos.view')(req, res, next);
+}, async (req, res) => {
   try {
-    const ids = Array.isArray(req.body.photoIds)
+    const shareCode = req.body && req.body.shareCode ? String(req.body.shareCode).trim() : '';
+    let shareScope = null;
+    if (shareCode) {
+      shareScope = await resolveShareZipScope(shareCode);
+      if (shareScope.error) return res.status(shareScope.status).json({ error: shareScope.error });
+      if (!shareScope.allowed.size) return res.status(404).json({ error: 'no photos found' });
+    }
+
+    let ids = Array.isArray(req.body.photoIds)
       ? Array.from(new Set(req.body.photoIds.map(n => parseInt(n, 10)).filter(n => !Number.isNaN(n))))
       : [];
+    if (shareScope) {
+      // 未指定就打包整个分享；指定了则取交集——越权 id 一律丢弃
+      ids = ids.length ? ids.filter((id) => shareScope.allowed.has(id)) : Array.from(shareScope.allowed);
+      if (!ids.length) return res.status(403).json({ error: 'PHOTOS_NOT_IN_SHARE' });
+    }
     if (ids.length === 0) return res.status(400).json({ error: 'photoIds must be a non-empty array' });
     if (ids.length > MAX_ZIP_PHOTOS) {
       return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
@@ -1202,9 +1247,11 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     }
 
     // 查询照片及其 project_id
-    // enforce organization scoping for zip
-    const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-    let zipSql = `SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, title, adjustments FROM photos WHERE id IN (?)`;
+    // enforce organization scoping for zip：分享路径没有 req.user，用分享自身的组织，别让它落到 null 扫全库
+    const orgId = shareScope
+      ? shareScope.orgId
+      : (req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null);
+    let zipSql = `SELECT id, project_id AS projectId, timeline_section_id AS sectionId, url, thumb_url AS thumbUrl, title, adjustments FROM photos WHERE id IN (?)`;
     const zipParams = [ids];
     if (orgId === null) {
       zipSql += ' AND organization_id IS NULL';
@@ -1223,6 +1270,21 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
       const [projRows] = await pool.query(`SELECT id, name FROM projects WHERE id IN (?)`, [projIds]);
       for (const p of projRows) {
         projMap[p.id] = p.name || `project-${p.id}`;
+      }
+    }
+
+    // 环节名：带时间线环节的相册，文件名里带上环节，便于下载后直接分辨
+    const sectionIds = [...new Set(rows.map(r => r.sectionId).filter(Boolean))];
+    const sectionMap = {};
+    if (sectionIds.length > 0) {
+      try {
+        const [secRows] = await pool.query('SELECT id, name FROM project_timeline_sections WHERE id IN (?)', [sectionIds]);
+        for (const s of secRows) {
+          const n = String(s.name || '').trim();
+          if (n) sectionMap[s.id] = n;
+        }
+      } catch (e) {
+        console.warn('[photos.zip] load timeline sections failed, fallback to plain naming:', e.message);
       }
     }
 
@@ -1282,6 +1344,11 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
         return await new Promise((resolve) => {
           const req = client.get(url, (response) => {
             activeRequests.delete(req);
+            // ⚠️ 响应已到 → 立刻撤掉空闲超时。zip 是边拉边发的流：客户端慢(公网隧道 ~0.7MB/s)时，
+            // archiver 的背压会把源 socket 按住不动几十秒——那是正常背压，不是故障。
+            // 留着 20s 空闲超时会把正常下载腰斩，客户端看到 ERR_INCOMPLETE_CHUNKED_ENCODING。
+            // 连接/首字节阶段的超时仍由下面那次 setTimeout 负责；客户端断开由 res.on('close') 兜底。
+            try { req.setTimeout(0); if (req.socket) req.socket.setTimeout(0); } catch (e) { /* ignore */ }
             if (response.statusCode >= 200 && response.statusCode < 300) {
               const contentLength = Number(response.headers['content-length'] || 0);
               if (Number.isFinite(contentLength) && contentLength > ZIP_MAX_REMOTE_BYTES) {
@@ -1373,17 +1440,22 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
         const rawProjName = projMap[projId] || `project-${projId}`;
         // sanitize project name for file names
         const safeProjName = String(rawProjName).replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '_') || `project-${projId}`;
+        // 环节名（有才加）：文件名形如 相册-环节-序号.jpg；序号按"每个环节"各自从 1 开始
+        const rawSecName = r.sectionId ? (sectionMap[r.sectionId] || '') : '';
+        const safeSecName = rawSecName ? (String(rawSecName).replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '_')) : '';
+        const namePrefix = safeSecName ? `${safeProjName}-${safeSecName}` : safeProjName;
 
-        counters[projId] = (counters[projId] || 0) + 1;
-        const seq = counters[projId];
+        const counterKey = `${projId}:${r.sectionId || 0}`;
+        counters[counterKey] = (counters[counterKey] || 0) + 1;
+        const seq = counters[counterKey];
         const adjustments = parsePhotoAdjustments(r.adjustments);
         const shouldRenderAdjusted = hasMeaningfulPhotoAdjustments(adjustments);
 
         // 如果是远程 URL（例如 COS 上的图片），通过 HTTP(S) 下载并把响应流追加到 zip
         if (/^https?:\/\//i.test(rawPath)) {
           const ext = getExtFromUrl(rawPath);
-          const originalNameInZip = `${safeProjName}-${seq}${ext}`;
-          const nameInZip = shouldRenderAdjusted ? `${safeProjName}-${seq}.jpg` : originalNameInZip;
+          const originalNameInZip = `${namePrefix}-${seq}${ext}`;
+          const nameInZip = shouldRenderAdjusted ? `${namePrefix}-${seq}.jpg` : originalNameInZip;
           if (shouldRenderAdjusted) {
             const sourceBuffer = await fetchRemoteFileBuffer(rawPath);
             if (sourceBuffer && await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
@@ -1399,8 +1471,8 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
             const fallbackRemoteUrl = buildUploadUrl(rawPath);
             if (/^https?:\/\//i.test(String(fallbackRemoteUrl || ''))) {
               const ext = getExtFromUrl(fallbackRemoteUrl);
-              const originalNameInZip = `${safeProjName}-${seq}${ext}`;
-              const nameInZip = shouldRenderAdjusted ? `${safeProjName}-${seq}.jpg` : originalNameInZip;
+              const originalNameInZip = `${namePrefix}-${seq}${ext}`;
+              const nameInZip = shouldRenderAdjusted ? `${namePrefix}-${seq}.jpg` : originalNameInZip;
               if (shouldRenderAdjusted) {
                 const sourceBuffer = await fetchRemoteFileBuffer(fallbackRemoteUrl);
                 if (sourceBuffer && await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
@@ -1413,8 +1485,8 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
           }
 
           const ext = path.extname(abs) || '';
-          const originalNameInZip = `${safeProjName}-${seq}${ext}`;
-          const nameInZip = shouldRenderAdjusted ? `${safeProjName}-${seq}.jpg` : originalNameInZip;
+          const originalNameInZip = `${namePrefix}-${seq}${ext}`;
+          const nameInZip = shouldRenderAdjusted ? `${namePrefix}-${seq}.jpg` : originalNameInZip;
           if (shouldRenderAdjusted) {
             const stat = await fs.promises.stat(abs).catch(() => null);
             if (stat && stat.size <= ZIP_MAX_RENDER_SOURCE_BYTES) {
