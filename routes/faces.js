@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool, buildUploadUrl } = require('../db');
 const { requirePermission } = require('../lib/permissions');
 const { detectFacesForPhoto } = require('../lib/face_detector');
+const { getFaceAvatarDataUrl } = require('../lib/face_avatar');
 const {
   getOrgFaceClusterConfig,
   MIN_THRESHOLD,
@@ -482,6 +483,16 @@ async function buildFaceProfile({ faceId, personId, orgId }) {
     ? person.name
     : (face ? `人脸#${face.faceNo}` : (person && person.displayName ? person.displayName : '未标注人物'));
 
+  // 人物主图：服务端按 bbox 裁好内联返回，前端直接当头像用（不再下原图 + CSS 缩放）。
+  // 优先用人物封面脸；没有则用当前这张脸。失败返回 null，前端回退旧渲染路径。
+  let avatarFaceRow = faceRow;
+  const coverId = person && person.coverFaceId ? Number(person.coverFaceId) : null;
+  if (coverId && (!faceRow || Number(faceRow.id) !== coverId)) {
+    const coverRow = await getFaceWithPerson(coverId, orgId);
+    if (coverRow) avatarFaceRow = coverRow;
+  }
+  const avatarDataUrl = avatarFaceRow ? await getFaceAvatarDataUrl(avatarFaceRow) : null;
+
   return {
     face,
     person: {
@@ -491,6 +502,8 @@ async function buildFaceProfile({ faceId, personId, orgId }) {
       personName: person && person.personName ? person.personName : null,
       personId: person && person.personId ? person.personId : null,
     },
+    avatarDataUrl,
+    avatarFaceId: avatarFaceRow && avatarDataUrl ? String(avatarFaceRow.id) : null,
     relatedPhotos,
     photos: relatedPhotos,
   };
