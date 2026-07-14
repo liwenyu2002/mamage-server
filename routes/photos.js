@@ -37,7 +37,8 @@ const MAX_SEARCH_PAGE_SIZE = 100;
 const MAX_SEARCH_TOKENS = 5;
 const MAX_SEARCH_QUERY_LEN = 64;
 const MAX_DELETE_PHOTOS = Math.max(1, Number(process.env.PHOTO_DELETE_MAX_IDS || 200));
-const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 50));
+// 与前端中转站容量(transferStore.MAX_COUNT)保持一致；不一致会出现"存得下却打不了包"(413)
+const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 1000));
 const ZIP_REMOTE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_ZIP_REMOTE_TIMEOUT_MS || 20000));
 const ZIP_MAX_REMOTE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_MAX_REMOTE_BYTES || 1024 * 1024 * 1024));
 const ZIP_MAX_RENDER_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
