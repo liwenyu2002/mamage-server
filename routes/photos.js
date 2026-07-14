@@ -1343,6 +1343,11 @@ router.post('/zip', (req, res, next) => {
         const { PassThrough } = require('stream');
         return await new Promise((resolve) => {
           const req = client.get(url, (response) => {
+            // 响应已到达 → 撤掉空闲超时。zip 是边拉边发的流：客户端下载慢时背压会把本 socket
+            // 按住长时间静止，这是正常现象不是故障；不撤的话 20s 空闲即被 destroy，
+            // 表现为下载中途 ERR_INCOMPLETE_CHUNKED_ENCODING（用户实际踩到的 bug）。
+            // 连接/首字节阶段的 20s 超时仍然保留（下方 setTimeout 只在响应前生效）。
+            req.setTimeout(0);
             activeRequests.delete(req);
             // ⚠️ 响应已到 → 立刻撤掉空闲超时。zip 是边拉边发的流：客户端慢(公网隧道 ~0.7MB/s)时，
             // archiver 的背压会把源 socket 按住不动几十秒——那是正常背压，不是故障。
@@ -1369,6 +1374,8 @@ router.post('/zip', (req, res, next) => {
               });
               response.on('error', (err) => {
                 console.error('[photos.zip] remote response error:', remoteUrl, err && err.message ? err.message : err);
+                // 不销毁的话 passthrough 永不 end，archiver 会无限等待、整个 zip 挂死
+                passthrough.destroy(err);
               });
               response.pipe(passthrough);
               archive.append(passthrough, { name: nameInZip, store: true });
