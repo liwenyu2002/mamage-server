@@ -44,8 +44,11 @@ const IMAGE_MIME_BY_EXT = new Map([
   ['.png', 'image/png'],
   ['.webp', 'image/webp'],
   ['.gif', 'image/gif'],
+  ['.avif', 'image/avif'], // 浏览器可显示、sharp 可处理，直存
   ['.heic', 'image/heic'],
   ['.heif', 'image/heif'],
+  ['.tif', 'image/tiff'],  // 浏览器显示不了 → 与 heic 一样转码为 JPEG（sharp 可读）
+  ['.tiff', 'image/tiff'],
 ]);
 const ALLOWED_IMAGE_MIMES = new Set(IMAGE_MIME_BY_EXT.values());
 const VIDEO_MIME_BY_EXT = new Map([
@@ -776,15 +779,39 @@ function looksLikeHeic(buffer, mime, originalname) {
   return false;
 }
 
-// 命中 HEIC 则就地把 file.buffer 换成 JPEG、mime 改 image/jpeg、扩展名改 .jpg。返回是否转码。
-async function maybeTranscodeHeic(file) {
-  if (!file || !file.buffer || !looksLikeHeic(file.buffer, file.mimetype, file.originalname)) return false;
-  const convert = require('heic-convert');
-  const jpeg = await convert({ buffer: file.buffer, format: 'JPEG', quality: HEIC_JPEG_QUALITY });
-  file.buffer = Buffer.isBuffer(jpeg) ? jpeg : Buffer.from(jpeg);
-  file.mimetype = 'image/jpeg';
-  file.originalname = `${String(file.originalname || 'photo').replace(/\.(heic|heif)$/i, '')}.jpg`;
-  return true;
+// TIFF：浏览器 <img> 显示不了，但 sharp/libvips 能读——与 HEIC 一样先转成 JPEG 再走后续管线。
+function looksLikeTiff(buffer, mime, originalname) {
+  if (/^image\/tiff$/i.test(String(mime || ''))) return true;
+  if (/\.(tif|tiff)$/i.test(String(originalname || ''))) return true;
+  // TIFF 魔数：'II' + 0x2A00（小端）或 'MM' + 0x002A（大端）
+  if (buffer && buffer.length > 4) {
+    const b = buffer;
+    if (b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a && b[3] === 0x00) return true;
+    if (b[0] === 0x4d && b[1] === 0x4d && b[2] === 0x00 && b[3] === 0x2a) return true;
+  }
+  return false;
+}
+
+// 把浏览器显示不了的图片格式就地转成 JPEG（buffer/mime/扩展名一并改）。HEIC 走 heic-convert（自带 HEVC
+// 解码，sharp 缺）；TIFF 走 sharp。返回是否转码过。命中不了（jpg/png/webp/gif/avif 等可直显/可直存）返回 false。
+async function maybeTranscodeToJpeg(file) {
+  if (!file || !file.buffer) return false;
+  if (looksLikeHeic(file.buffer, file.mimetype, file.originalname)) {
+    const convert = require('heic-convert');
+    const jpeg = await convert({ buffer: file.buffer, format: 'JPEG', quality: HEIC_JPEG_QUALITY });
+    file.buffer = Buffer.isBuffer(jpeg) ? jpeg : Buffer.from(jpeg);
+    file.mimetype = 'image/jpeg';
+    file.originalname = `${String(file.originalname || 'photo').replace(/\.(heic|heif)$/i, '')}.jpg`;
+    return true;
+  }
+  if (looksLikeTiff(file.buffer, file.mimetype, file.originalname)) {
+    const jpeg = await sharp(file.buffer, { failOn: 'none' }).rotate().jpeg({ quality: 95, mozjpeg: true }).toBuffer();
+    file.buffer = jpeg;
+    file.mimetype = 'image/jpeg';
+    file.originalname = `${String(file.originalname || 'photo').replace(/\.(tif|tiff)$/i, '')}.jpg`;
+    return true;
+  }
+  return false;
 }
 
 function fetchBuffer(url, maxBytes, timeoutMs) {
@@ -918,13 +945,13 @@ async function processUpload(req, res) {
       });
     }
 
-    // HEIC/HEIF → 高质量 JPEG（浏览器不能显示 HEIC，预置 sharp 也解不了 HEVC）。失败给明确错误，不让后续 sharp 撞墙。
+    // 浏览器显示不了的图片格式(HEIC/HEIF/TIFF) → 高质量 JPEG。失败给明确错误，不让后续 sharp 撞墙。
     try {
       const heicStartMs = nowMs();
-      if (await maybeTranscodeHeic(req.file)) timings.heicMs = nowMs() - heicStartMs;
+      if (await maybeTranscodeToJpeg(req.file)) timings.heicMs = nowMs() - heicStartMs;
     } catch (err) {
-      console.error('[upload] HEIC 转码失败:', err && err.message ? err.message : err);
-      return res.status(422).json({ error: 'HEIC_DECODE_FAILED', message: 'HEIC 图片解码失败，请换 JPG/PNG 重试' });
+      console.error('[upload] 图片转码失败:', err && err.message ? err.message : err);
+      return res.status(422).json({ error: 'IMAGE_DECODE_FAILED', message: '图片解码失败，请换 JPG/PNG 重试' });
     }
 
     const metadata = readPhotoMetadata(req.body || {});
