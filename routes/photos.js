@@ -1272,10 +1272,14 @@ router.post('/zip', requirePermission('photos.view'), async (req, res) => {
     const appendRemoteFileToArchive = async (remoteUrl, nameInZip) => {
       try {
         if (clientClosed) return false;
-        const client = remoteUrl.startsWith('https') ? require('https') : require('http');
+        // ⚠️ 必须走内网回环：照片已迁 S3、本地磁盘无文件，调用方给的是 buildUploadUrl 的公网地址，
+        // 直接 GET 会让 Mini 经 cloudflared 绕公网一圈回来取自己的图（实测 1.3MB/s vs 内网 16-27MB/s，慢 15 倍）。
+        // buildInternalMediaUrl 只改写本站域名，外站 URL 原样返回，安全。
+        const url = buildInternalMediaUrl(remoteUrl) || remoteUrl;
+        const client = url.startsWith('https') ? require('https') : require('http');
         const { PassThrough } = require('stream');
         return await new Promise((resolve) => {
-          const req = client.get(remoteUrl, (response) => {
+          const req = client.get(url, (response) => {
             activeRequests.delete(req);
             if (response.statusCode >= 200 && response.statusCode < 300) {
               const contentLength = Number(response.headers['content-length'] || 0);
