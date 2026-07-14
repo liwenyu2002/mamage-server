@@ -49,6 +49,16 @@ const IMAGE_MIME_BY_EXT = new Map([
   ['.heif', 'image/heif'],
   ['.tif', 'image/tiff'],  // 浏览器显示不了 → 与 heic 一样转码为 JPEG（sharp 可读）
   ['.tiff', 'image/tiff'],
+  // 各厂 RAW：浏览器显示不了、sharp 也解不了传感器数据 → 抽内嵌 JPEG 预览转码（见 extractLargestEmbeddedJpeg）
+  ['.dng', 'image/x-adobe-dng'], ['.cr2', 'image/x-canon-cr2'], ['.cr3', 'image/x-canon-cr3'],
+  ['.crw', 'image/x-canon-crw'], ['.nef', 'image/x-nikon-nef'], ['.nrw', 'image/x-nikon-nrw'],
+  ['.arw', 'image/x-sony-arw'], ['.sr2', 'image/x-sony-sr2'], ['.srf', 'image/x-sony-srf'],
+  ['.raf', 'image/x-fuji-raf'], ['.orf', 'image/x-olympus-orf'], ['.rw2', 'image/x-panasonic-rw2'],
+  ['.raw', 'image/x-panasonic-raw'], ['.pef', 'image/x-pentax-pef'], ['.srw', 'image/x-samsung-srw'],
+  ['.x3f', 'image/x-sigma-x3f'], ['.rwl', 'image/x-leica-rwl'], ['.3fr', 'image/x-hasselblad-3fr'],
+  ['.fff', 'image/x-hasselblad-fff'], ['.iiq', 'image/x-phaseone-iiq'], ['.mrw', 'image/x-minolta-mrw'],
+  ['.dcr', 'image/x-kodak-dcr'], ['.kdc', 'image/x-kodak-kdc'], ['.mos', 'image/x-leaf-mos'],
+  ['.erf', 'image/x-epson-erf'],
 ]);
 const ALLOWED_IMAGE_MIMES = new Set(IMAGE_MIME_BY_EXT.values());
 const VIDEO_MIME_BY_EXT = new Map([
@@ -792,8 +802,44 @@ function looksLikeTiff(buffer, mime, originalname) {
   return false;
 }
 
+// 各厂 RAW（dng/cr2/nef/arw/raf/orf/rw2/…）：sharp/libvips 解不了传感器原始数据，但绝大多数 RAW 文件都内嵌
+// 一张相机现拍的 JPEG 预览（常为全尺寸）。零依赖做法：扫描文件里所有 JPEG 段（FF D8 FF <marker>），交给 sharp
+// 验证尺寸、取面积最大的那张干净重编码。覆盖 DNG/CR2/CR3/NEF/ARW/RAF/ORF/RW2/PEF/… 常见机型。
+const RAW_EXTS = new Set(['.dng', '.cr2', '.cr3', '.crw', '.nef', '.nrw', '.arw', '.sr2', '.srf', '.raf',
+  '.orf', '.rw2', '.raw', '.pef', '.srw', '.x3f', '.rwl', '.3fr', '.fff', '.iiq', '.mrw', '.dcr', '.kdc', '.mos', '.erf']);
+function looksLikeRaw(mime, originalname) {
+  const ext = path.extname(String(originalname || '')).toLowerCase();
+  if (RAW_EXTS.has(ext)) return true;
+  return /^image\/x-(adobe-dng|canon|nikon|sony|fuji|olympus|panasonic|pentax|samsung|sigma|leica|hasselblad|phaseone|minolta|kodak|leaf|epson)/i.test(String(mime || ''));
+}
+async function extractLargestEmbeddedJpeg(buffer) {
+  if (!buffer || buffer.length < 8) return null;
+  // 收集 JPEG 起点：FF D8 FF <合法段标记>（DB 量化表 / E0-EF 应用段），过滤传感器数据里的随机 FFD8FF
+  const sois = [];
+  for (let i = 0; i + 3 < buffer.length; i += 1) {
+    if (buffer[i] === 0xff && buffer[i + 1] === 0xd8 && buffer[i + 2] === 0xff) {
+      const m = buffer[i + 3];
+      if (m === 0xdb || (m >= 0xe0 && m <= 0xef) || m === 0xc0 || m === 0xc4) sois.push(i);
+      if (sois.length >= 64) break; // 兜底封顶，别在超大文件上试太多次
+    }
+  }
+  let best = null; let bestArea = 0;
+  for (const soi of sois) {
+    const slice = buffer.subarray(soi);
+    try {
+      const meta = await sharp(slice, { failOn: 'none' }).metadata();
+      const area = (meta.width || 0) * (meta.height || 0);
+      if (meta.format === 'jpeg' && area > bestArea) { bestArea = area; best = slice; }
+    } catch (e) { /* 该起点不是有效 JPEG，跳过 */ }
+  }
+  if (!best) return null;
+  // 干净重编码（去掉 EOI 之后的 RAW 尾料，统一走 rotate 摆正）
+  return sharp(best, { failOn: 'none' }).rotate().jpeg({ quality: 92, mozjpeg: true }).toBuffer();
+}
+
 // 把浏览器显示不了的图片格式就地转成 JPEG（buffer/mime/扩展名一并改）。HEIC 走 heic-convert（自带 HEVC
-// 解码，sharp 缺）；TIFF 走 sharp。返回是否转码过。命中不了（jpg/png/webp/gif/avif 等可直显/可直存）返回 false。
+// 解码，sharp 缺）；RAW 抽内嵌 JPEG 预览；TIFF 走 sharp。返回是否转码过。命中不了（jpg/png/webp/gif/avif
+// 等可直显/可直存）返回 false。RAW 必须在 TIFF 之前判——DNG 也是 TIFF 魔数打头，会被 looksLikeTiff 误命中。
 async function maybeTranscodeToJpeg(file) {
   if (!file || !file.buffer) return false;
   if (looksLikeHeic(file.buffer, file.mimetype, file.originalname)) {
@@ -802,6 +848,14 @@ async function maybeTranscodeToJpeg(file) {
     file.buffer = Buffer.isBuffer(jpeg) ? jpeg : Buffer.from(jpeg);
     file.mimetype = 'image/jpeg';
     file.originalname = `${String(file.originalname || 'photo').replace(/\.(heic|heif)$/i, '')}.jpg`;
+    return true;
+  }
+  if (looksLikeRaw(file.mimetype, file.originalname)) {
+    const jpeg = await extractLargestEmbeddedJpeg(file.buffer);
+    if (!jpeg) { const err = new Error('RAW_NO_EMBEDDED_JPEG'); err.rawNoPreview = true; throw err; }
+    file.buffer = jpeg;
+    file.mimetype = 'image/jpeg';
+    file.originalname = `${String(file.originalname || 'photo').replace(/\.[a-z0-9]+$/i, '')}.jpg`;
     return true;
   }
   if (looksLikeTiff(file.buffer, file.mimetype, file.originalname)) {
@@ -951,6 +1005,9 @@ async function processUpload(req, res) {
       if (await maybeTranscodeToJpeg(req.file)) timings.heicMs = nowMs() - heicStartMs;
     } catch (err) {
       console.error('[upload] 图片转码失败:', err && err.message ? err.message : err);
+      if (err && err.rawNoPreview) {
+        return res.status(422).json({ error: 'RAW_NO_PREVIEW', message: '这张 RAW 里没有可提取的内嵌预览图，请用相机导出的 JPG 版本' });
+      }
       return res.status(422).json({ error: 'IMAGE_DECODE_FAILED', message: '图片解码失败，请换 JPG/PNG 重试' });
     }
 
