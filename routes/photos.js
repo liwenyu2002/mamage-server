@@ -1296,6 +1296,39 @@ router.post('/zip', (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(zipName)}"; filename*=UTF-8''${encodeURIComponent(zipName)}`);
     res.setHeader('X-Accel-Buffering', 'no');
 
+    // 总量预估：对每个对象 HEAD 一次(内网 S3,毫秒级,并发 10)求和,给前端进度条一个总量。
+    // store 模式 zip ≈ Σ文件大小 + 每文件 ~160B 头部开销;是估算值(调色照会重渲染变大小),
+    // 前端把它当参考画百分比。取不到(部分 HEAD 失败/非 S3 存储)就不发头,前端退回不定长动画条。
+    try {
+      if (cosStorage.isConfigured && cosStorage.isConfigured()) {
+        const keys = rows
+          .map((r) => (r.url && !/^https?:\/\//i.test(String(r.url)) ? cosStorage.keyFromUrlOrPath(String(r.url)) : null))
+          .filter(Boolean);
+        let summed = 0;
+        let okCount = 0;
+        const queue = keys.slice();
+        const worker = async () => {
+          for (;;) {
+            const key = queue.shift();
+            if (!key) return;
+            try {
+              const head = await cosStorage.headObject(key);
+              const len = Number(head && head.ContentLength);
+              if (Number.isFinite(len) && len > 0) { summed += len; okCount += 1; }
+            } catch (e) { /* 单个失败不影响总量估算 */ }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(10, keys.length) }, worker));
+        if (okCount > 0) {
+          const estimate = summed + okCount * 160 + 512;
+          res.setHeader('X-Zip-Total-Bytes', String(estimate));
+          res.setHeader('X-Zip-Sized-Files', `${okCount}/${rows.length}`);
+        }
+      }
+    } catch (e) {
+      console.warn('[photos.zip] total size estimate failed:', e.message);
+    }
+
     const archive = archiver('zip', { store: true, zlib: { level: 0 } });
     const activeRequests = new Set();
     let clientClosed = false;
