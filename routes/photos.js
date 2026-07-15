@@ -1210,11 +1210,26 @@ async function resolveShareZipScope(code) {
 }
 
 // 返回: application/zip attachment
+// GET 版（仅分享码场景）：给浏览器原生下载用——手机/内网 http 没有 showSaveFilePicker(需安全上下文),
+// 前端退化为 <a href> 直接交给浏览器下载管理器,立即可见下载条。登录态不开 GET(避免 token 进 URL)。
+router.get('/zip', (req, res, next) => {
+  const sc = req.query && req.query.shareCode ? String(req.query.shareCode).trim() : '';
+  if (!sc) return res.status(401).json({ error: 'SHARE_CODE_REQUIRED' });
+  req.body = {
+    shareCode: sc,
+    zipName: req.query.zipName ? String(req.query.zipName) : undefined,
+    photoIds: req.query.photoIds ? String(req.query.photoIds).split(',') : undefined,
+  };
+  return next();
+}, handleZipRequest);
+
 router.post('/zip', (req, res, next) => {
   // 有 shareCode → 走公开分享路径（不要求登录）；否则维持原有登录鉴权
   if (req.body && req.body.shareCode) return next();
   return requirePermission('photos.view')(req, res, next);
-}, async (req, res) => {
+}, handleZipRequest);
+
+async function handleZipRequest(req, res) {
   try {
     const shareCode = req.body && req.body.shareCode ? String(req.body.shareCode).trim() : '';
     let shareScope = null;
@@ -1552,7 +1567,7 @@ router.post('/zip', (req, res, next) => {
     console.error('POST /api/photos/zip error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
 
 
 // POST /api/photos/:id/rendered
