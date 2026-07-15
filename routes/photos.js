@@ -33,9 +33,10 @@ const skipLocalFileCheck = (() => {
 // ========= 1) 照片列表接口：支持 projectId + random =========
 // 如果挂在 /api/photos 下：GET /api/photos?projectId=1&limit=4&random=1&type=normal(可选)
 const { requirePermission, requireAdmin, hasPermissionForUserId } = require('../lib/permissions');
-const MAX_SEARCH_PAGE_SIZE = 100;
-const MAX_SEARCH_TOKENS = 5;
-const MAX_SEARCH_QUERY_LEN = 64;
+const { searchPhotos: runPhotoSearch } = require('../lib/photo_search');
+const AI_SEARCH_RATE_WINDOW_MS = Math.max(10000, Number(process.env.AI_SEARCH_RATE_WINDOW_MS || 60000));
+const AI_SEARCH_RATE_MAX = Math.max(1, Number(process.env.AI_SEARCH_RATE_MAX || 20));
+const aiSearchRateBuckets = new Map();
 const MAX_DELETE_PHOTOS = Math.max(1, Number(process.env.PHOTO_DELETE_MAX_IDS || 200));
 // 与前端中转站容量(transferStore.MAX_COUNT)保持一致；不一致会出现"存得下却打不了包"(413)
 const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 1000));
@@ -45,6 +46,24 @@ const ZIP_MAX_RENDER_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHO
 const RENDER_SOURCE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_RENDER_SOURCE_TIMEOUT_MS || 20000));
 const RENDER_MAX_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
 const TONE_ENGINE = 'mamage-tone-v2-acr-like';
+
+function allowAiSearchForUser(userId) {
+  if (!userId) return false;
+  const now = Date.now();
+  const key = String(userId);
+  let bucket = aiSearchRateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= AI_SEARCH_RATE_WINDOW_MS) {
+    bucket = { startedAt: now, count: 0 };
+  }
+  bucket.count += 1;
+  aiSearchRateBuckets.set(key, bucket);
+  if (aiSearchRateBuckets.size > 1000) {
+    for (const [id, value] of aiSearchRateBuckets) {
+      if (now - value.startedAt >= AI_SEARCH_RATE_WINDOW_MS) aiSearchRateBuckets.delete(id);
+    }
+  }
+  return bucket.count <= AI_SEARCH_RATE_MAX;
+}
 
 async function cleanupDeletedPhotoRows(rows, context = {}) {
   const deletedFiles = [];
@@ -134,24 +153,6 @@ function getScopedOrgIdFromReq(req) {
   const demoOrgId = parseInt(String(demoOrgRaw).trim(), 10);
   if (!Number.isFinite(demoOrgId) || demoOrgId <= 0) return null;
   return demoOrgId;
-}
-
-function escapeLikeToken(input) {
-  return String(input || '').replace(/[#%_]/g, '#$&');
-}
-
-function tokenizeSearchQuery(query) {
-  const normalized = String(query || '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, MAX_SEARCH_QUERY_LEN);
-  if (!normalized) return [];
-  return normalized
-    .split(' ')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, MAX_SEARCH_TOKENS);
 }
 
 function parsePhotoTags(rawTags) {
@@ -761,8 +762,8 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
 
 // 基于数据库的权限检查（使用 role_permissions 表）
 
-// 照片删除（仅 admin）
-// GET /api/photos/search?q=xxx&page=1&pageSize=20&projectId=1&sort=relevance|newest
+// 智能照片检索
+// GET /api/photos/search?q=xxx&page=1&pageSize=20&projectId=1&sort=relevance|newest&smart=1
 router.get('/search', async (req, res) => {
   try {
     await populateReqUserFromAuthIfPresent(req);
@@ -774,17 +775,6 @@ router.get('/search', async (req, res) => {
       return res.status(401).json({ error: 'Missing Authorization Bearer token' });
     }
 
-    let page = parseInt(req.query.page, 10);
-    let pageSize = parseInt(req.query.pageSize, 10);
-    const rawSort = String(req.query.sort || '').toLowerCase();
-    const sort = rawSort === 'newest' ? 'newest' : 'relevance';
-    const tokens = tokenizeSearchQuery(req.query.q || '');
-
-    if (!Number.isFinite(page) || page <= 0) page = 1;
-    if (!Number.isFinite(pageSize) || pageSize <= 0 || pageSize > MAX_SEARCH_PAGE_SIZE) {
-      pageSize = 20;
-    }
-
     const hasProjectIdParam = req.query.projectId !== undefined && req.query.projectId !== null && String(req.query.projectId).trim() !== '';
     let projectId = null;
     if (hasProjectIdParam) {
@@ -794,189 +784,27 @@ router.get('/search', async (req, res) => {
       }
     }
 
-    const whereClauses = [];
-    const whereParams = [];
-
     const orgId = getScopedOrgIdFromReq(req);
-    if (orgId === null) {
-      whereClauses.push('p.organization_id IS NULL');
-    } else {
-      whereClauses.push('p.organization_id = ?');
-      whereParams.push(orgId);
-    }
-
-    if (projectId) {
-      whereClauses.push('p.project_id = ?');
-      whereParams.push(projectId);
-    }
-
-    if (tokens.length > 0) {
-      tokens.forEach((token) => {
-        const escaped = escapeLikeToken(token);
-        const like = `%${escaped}%`;
-        whereClauses.push(`(
-          LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(p.description, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(p.ocr_text, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(CAST(p.tags AS CHAR), '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(p.url, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(p.thumb_url, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(pts.name, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(u.student_no, '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(CAST(p.photographer_id AS CHAR), '')) LIKE ? ESCAPE '#'
-          OR LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#'
-        )`);
-        whereParams.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
-      });
-    }
-
-    const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const baseFromSql = `
-      FROM photos p
-      LEFT JOIN users u ON p.photographer_id = u.id
-      LEFT JOIN projects pr ON p.project_id = pr.id
-      LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
-    `;
-
-    const [countRows] = await pool.query(
-      `SELECT COUNT(*) AS total ${baseFromSql} ${whereSql}`,
-      whereParams
-    );
-    const total = (countRows && countRows[0] && Number(countRows[0].total)) || 0;
-    const offset = (page - 1) * pageSize;
-
-    const scoreParts = [];
-    const scoreParams = [];
-    if (tokens.length > 0) {
-      tokens.forEach((token) => {
-        const escaped = escapeLikeToken(token);
-        const prefixLike = `${escaped}%`;
-        const containLike = `%${escaped}%`;
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#' THEN 30 ELSE 0 END`);
-        scoreParams.push(prefixLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#' THEN 26 ELSE 0 END`);
-        scoreParams.push(prefixLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(pts.name, '')) LIKE ? ESCAPE '#' THEN 25 ELSE 0 END`);
-        scoreParams.push(prefixLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#' THEN 24 ELSE 0 END`);
-        scoreParams.push(prefixLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#' THEN 24 ELSE 0 END`);
-        scoreParams.push(prefixLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.title, '')) LIKE ? ESCAPE '#' THEN 16 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(pr.name, '')) LIKE ? ESCAPE '#' THEN 14 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(pts.name, '')) LIKE ? ESCAPE '#' THEN 13 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.name, '')) LIKE ? ESCAPE '#' THEN 12 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.nickname, '')) LIKE ? ESCAPE '#' THEN 12 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(u.student_no, '')) LIKE ? ESCAPE '#' THEN 8 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(CAST(p.photographer_id AS CHAR), '')) LIKE ? ESCAPE '#' THEN 6 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(CONCAT('摄影师#', CAST(p.photographer_id AS CHAR)), '')) LIKE ? ESCAPE '#' THEN 6 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.description, '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.ocr_text, '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(CAST(p.tags AS CHAR), '')) LIKE ? ESCAPE '#' THEN 10 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.url, '')) LIKE ? ESCAPE '#' THEN 4 ELSE 0 END`);
-        scoreParams.push(containLike);
-        scoreParts.push(`CASE WHEN LOWER(COALESCE(p.thumb_url, '')) LIKE ? ESCAPE '#' THEN 4 ELSE 0 END`);
-        scoreParams.push(containLike);
-      });
-    }
-    const relevanceScoreSql = scoreParts.length ? scoreParts.join(' + ') : '0';
-    const orderBySql = sort === 'relevance' && tokens.length > 0
-      ? 'ORDER BY relevanceScore DESC, p.created_at DESC, p.id DESC'
-      : 'ORDER BY p.created_at DESC, p.id DESC';
-
-    const selectSql = `
-      SELECT
-        p.id,
-        p.uuid,
-        p.project_id AS projectId,
-        pr.name AS projectName,
-        p.timeline_section_id AS timelineSectionId,
-        pts.name AS timelineSectionName,
-        pts.section_time AS timelineSectionTime,
-        p.url,
-        p.thumb_url AS thumbUrl,
-        p.playback_url AS playbackUrl,
-        p.title,
-        p.description,
-        p.adjustments,
-        p.tags,
-        p.ai_status AS aiStatus,
-        p.ai_error AS aiError,
-        p.ai_started_at AS aiStartedAt,
-        p.ai_finished_at AS aiFinishedAt,
-        p.type,
-        p.photographer_id AS photographerId,
-        COALESCE(NULLIF(u.name, ''), NULLIF(u.nickname, '')) AS photographerName,
-        p.created_at AS createdAt,
-        p.updated_at AS updatedAt,
-        ${relevanceScoreSql} AS relevanceScore
-      ${baseFromSql}
-      ${whereSql}
-      ${orderBySql}
-      LIMIT ? OFFSET ?
-    `;
-    const selectParams = [...scoreParams, ...whereParams, pageSize, offset];
-    const [rows] = await pool.query(selectSql, selectParams);
-
-    const list = (rows || []).map((p) => ({
-      id: p.id,
-      uuid: p.uuid,
-      projectId: p.projectId,
-      projectName: p.projectName || null,
-      timelineSectionId: p.timelineSectionId || null,
-      timelineSectionName: p.timelineSectionName || null,
-      timelineSectionTime: p.timelineSectionTime || null,
-      url: p.url ? buildUploadUrl(p.url) : null,
-      thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
-      playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
-      playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
-      title: p.title || null,
-      description: p.description || null,
-      adjustments: parsePhotoAdjustments(p.adjustments),
-      tags: parsePhotoTags(p.tags),
-      aiStatus: p.aiStatus || null,
-      aiError: p.aiError || null,
-      aiStartedAt: p.aiStartedAt || null,
-      aiFinishedAt: p.aiFinishedAt || null,
-      type: p.type,
-      photographerId: p.photographerId || null,
-      photographerName: p.photographerName || null,
-      createdAt: p.createdAt,
-      updatedAt: p.updatedAt,
-      relevanceScore: Number(p.relevanceScore) || 0,
-    }));
-
-    const hasMore = page * pageSize < total;
-    res.json({
-      list,
-      page,
-      pageSize,
-      total,
-      hasMore,
-      q: String(req.query.q || '').trim(),
-      tokens,
-      sort,
+    const smartRaw = String(req.query.smart || req.query.mode || '').trim().toLowerCase();
+    const smart = smartRaw === '1' || smartRaw === 'true' || smartRaw === 'smart' || smartRaw === 'ai';
+    const result = await runPhotoSearch({
+      q: req.query.q || '',
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+      projectId,
+      sort: req.query.sort,
+      orgId,
+      // 公开演示口禁用付费模型，登录用户显式 smart=1 才调用；无论如何都有增强检索兜底。
+      enableAi: Boolean(userId && smart && allowAiSearchForUser(userId)),
     });
+    res.json(result);
   } catch (err) {
     console.error('GET /api/photos/search error:', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// 照片删除
 router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
   let rows = [];
   let foundIds = [];
