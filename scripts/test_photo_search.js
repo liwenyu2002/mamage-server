@@ -20,10 +20,15 @@ function run() {
   assert.ok(exclude.mustTerms.includes('演讲'));
   assert.ok(exclude.excludeTerms.includes('合影'));
 
+  const personOnly = heuristicPhotoSearchPlan('画面里只有王婧琦的照片');
+  assert.strictEqual(personOnly.peopleOnly, true);
+  assert.deepStrictEqual(personOnly.mustTerms, ['王婧琦']);
+
   const normalized = normalizePhotoSearchPlan({
     mustTerms: ['演讲', '演讲', ' 讲台 '],
     people: ['田心原'],
     peopleMode: 'all',
+    peopleOnly: true,
     mediaType: 'INVALID',
     quality: 'recommended',
     dateFrom: '2026-02-30',
@@ -31,6 +36,7 @@ function run() {
   assert.deepStrictEqual(normalized.mustTerms, ['演讲', '讲台']);
   assert.deepStrictEqual(normalized.people, ['田心原']);
   assert.strictEqual(normalized.peopleMode, 'all');
+  assert.strictEqual(normalized.peopleOnly, true);
   assert.strictEqual(normalized.mediaType, 'all');
   assert.strictEqual(normalized.quality, 'recommended');
   assert.strictEqual(normalized.dateFrom, null);
