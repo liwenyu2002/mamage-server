@@ -1117,4 +1117,72 @@ router.post('/photos/:photoId/faces', requirePermission('photos.view'), async (r
   }
 });
 
+// ---------------------------------------------------------------------------
+// 拍照找我：上传单人照 → 检测 → 在相册/分享范围内按人脸相似度找本人照片。
+// 自拍不入库不进对象存储（lib/find_me 临时文件用完即删）。
+// ---------------------------------------------------------------------------
+const multer = require('multer');
+const { findMe, FindMeError, checkRateLimit } = require('../lib/find_me');
+const findMeUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }).single('photo');
+
+function findMeErrorResponse(res, err) {
+  if (err instanceof FindMeError) {
+    return res.status(err.status).json({ error: err.code, ...(err.extra || {}) });
+  }
+  console.error('[find-me] error:', err && err.stack ? err.stack : err);
+  return res.status(500).json({ error: 'Internal server error' });
+}
+
+// 登录态：在指定相册里找我
+router.post('/faces/find-me', requirePermission('photos.view'), (req, res) => {
+  findMeUpload(req, res, async (mErr) => {
+    if (mErr) return res.status(400).json({ error: mErr.code === 'LIMIT_FILE_SIZE' ? 'FILE_TOO_LARGE' : 'UPLOAD_FAILED' });
+    try {
+      if (!checkRateLimit(req.ip)) return res.status(429).json({ error: 'RATE_LIMITED' });
+      const projectId = Number(req.body && req.body.projectId);
+      if (!Number.isFinite(projectId) || projectId <= 0) return res.status(400).json({ error: 'projectId is required' });
+      const orgId = getOrgIdFromReq(req);
+      const result = await findMe(req.file && req.file.buffer, { projectId, orgId });
+      return res.json(result);
+    } catch (err) {
+      return findMeErrorResponse(res, err);
+    }
+  });
+});
+
+// 公开分享页：用分享码鉴权，范围钉死在该分享的照片内（无登录态）
+router.post('/faces/find-me/share', (req, res) => {
+  findMeUpload(req, res, async (mErr) => {
+    if (mErr) return res.status(400).json({ error: mErr.code === 'LIMIT_FILE_SIZE' ? 'FILE_TOO_LARGE' : 'UPLOAD_FAILED' });
+    try {
+      if (!checkRateLimit(req.ip)) return res.status(429).json({ error: 'RATE_LIMITED' });
+      const code = String((req.body && req.body.shareCode) || '').trim();
+      if (!code) return res.status(400).json({ error: 'shareCode is required' });
+
+      const [rows] = await pool.query(
+        'SELECT id, share_type, project_id, organization_id, expires_at, revoked_at FROM share_links WHERE code = ? LIMIT 1', [code]
+      );
+      if (!rows || !rows.length) return res.status(404).json({ error: 'NOT_FOUND' });
+      const s = rows[0];
+      if (s.revoked_at) return res.status(410).json({ error: 'REVOKED' });
+      if (s.expires_at && new Date(s.expires_at).getTime() <= Date.now()) return res.status(410).json({ error: 'EXPIRED' });
+
+      let scope;
+      if (s.share_type === 'collection') {
+        const [items] = await pool.query('SELECT photo_id FROM share_link_items WHERE share_id = ?', [s.id]);
+        scope = { photoIds: (items || []).map((r) => Number(r.photo_id)).filter(Boolean) };
+      } else if (s.share_type === 'project') {
+        scope = { projectId: Number(s.project_id), orgId: s.organization_id === null ? null : Number(s.organization_id) };
+      } else {
+        return res.status(400).json({ error: 'UNSUPPORTED_SHARE_TYPE' });
+      }
+
+      const result = await findMe(req.file && req.file.buffer, scope);
+      return res.json(result);
+    } catch (err) {
+      return findMeErrorResponse(res, err);
+    }
+  });
+});
+
 module.exports = router;
