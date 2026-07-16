@@ -102,8 +102,33 @@ function getDirectZipObjectKey(job) {
   return `${DIRECT_ZIP_PREFIX}/${datePart}/${job.id}.zip`;
 }
 
+function sameDirectZipPhotoIds(left, right) {
+  const a = Array.from(new Set((left || []).map(Number).filter(Number.isFinite))).sort((x, y) => x - y);
+  const b = Array.from(new Set((right || []).map(Number).filter(Number.isFinite))).sort((x, y) => x - y);
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+function getDirectZipQueueAhead(job) {
+  if (!job || job.status !== 'queued') return 0;
+  const index = directZipQueue.indexOf(job.id);
+  // 当前正在执行的任务也会占用一个名额，因此第一个排队任务的前方至少有 active 个。
+  return Math.max(0, activeDirectZipJobs) + (index >= 0 ? index : 0);
+}
+
+function findReusableDirectZipJob(userId, organizationId, photoIds) {
+  const requestedOrg = organizationId === null || organizationId === undefined ? null : Number(organizationId);
+  for (const job of directZipJobs.values()) {
+    const jobOrg = job.organizationId === null || job.organizationId === undefined ? null : Number(job.organizationId);
+    if (Number(job.userId) !== Number(userId) || jobOrg !== requestedOrg) continue;
+    if (!['queued', 'packing', 'ready'].includes(job.status)) continue;
+    if (sameDirectZipPhotoIds(job.photoIds, photoIds)) return job;
+  }
+  return null;
+}
+
 function getDirectZipPublicState(job) {
   if (!job) return null;
+  const queueAhead = getDirectZipQueueAhead(job);
   const result = {
     id: job.id,
     status: job.status,
@@ -114,8 +139,20 @@ function getDirectZipPublicState(job) {
     readyAt: job.readyAt || null,
     expiresAt: job.expiresAt || null,
     error: job.status === 'failed' ? (job.error || 'ZIP_PREPARATION_FAILED') : null,
+    queueAhead,
+    queuePosition: job.status === 'queued' ? queueAhead + 1 : 0,
   };
   return result;
+}
+
+async function getDirectZipResponse(job) {
+  const response = getDirectZipPublicState(job);
+  if (job.status !== 'ready' || !job.objectKey) return response;
+  const signed = await cosStorage.signedGetUrl(job.objectKey, {
+    expires: Math.max(60, Number(process.env.DIRECT_ZIP_DOWNLOAD_EXPIRES_SECONDS || 900)),
+    downloadName: job.zipName,
+  });
+  return { ...response, downloadUrl: signed.signedUrl, downloadExpiresIn: signed.expiresIn };
 }
 
 function cleanupDirectZipJobs() {
@@ -1251,7 +1288,7 @@ router.post('/zip-ticket', requirePermission('photos.view'), (req, res) => {
 
 // 校园网 HTTP 页面可直接从对象存储下载。先在服务端流式生成临时 ZIP，再给浏览器一条短时
 // 签名下载链接，避免最终下载回流经过 Mac mini 或堆积在浏览器内存。
-router.post('/zip-direct', requirePermission('photos.view'), (req, res) => {
+router.post('/zip-direct', requirePermission('photos.view'), async (req, res) => {
   if (!canUseDirectStorage(req)) {
     return res.status(409).json({ error: 'DIRECT_STORAGE_UNAVAILABLE' });
   }
@@ -1264,6 +1301,16 @@ router.post('/zip-direct', requirePermission('photos.view'), (req, res) => {
   }
 
   cleanupDirectZipJobs();
+  const organizationId = req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id);
+  const reusable = findReusableDirectZipJob(req.user.id, organizationId, ids);
+  if (reusable) {
+    try {
+      return res.json({ ...(await getDirectZipResponse(reusable)), reused: true });
+    } catch (err) {
+      console.error('[photos.zip-direct] reuse response failed:', reusable.id, err && err.stack ? err.stack : err);
+      return res.status(500).json({ error: 'DIRECT_ZIP_SIGN_FAILED' });
+    }
+  }
   if (directZipQueue.length + activeDirectZipJobs >= 20) {
     return res.status(429).json({ error: 'DIRECT_ZIP_QUEUE_BUSY', retryAfterSeconds: 20 });
   }
@@ -1273,7 +1320,7 @@ router.post('/zip-direct', requirePermission('photos.view'), (req, res) => {
   const job = {
     id: getDirectZipJobKey(),
     userId: req.user.id,
-    organizationId: req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id),
+    organizationId,
     photoIds: ids,
     zipName,
     status: 'queued',
@@ -1301,14 +1348,8 @@ router.get('/zip-direct/:jobId', requirePermission('photos.view'), async (req, r
   if (Number(job.userId) !== Number(req.user.id) || Number(job.organizationId) !== Number(userOrgId)) {
     return res.status(403).json({ error: 'DIRECT_ZIP_JOB_FORBIDDEN' });
   }
-  if (job.status !== 'ready' || !job.objectKey) return res.json(getDirectZipPublicState(job));
-
   try {
-    const signed = await cosStorage.signedGetUrl(job.objectKey, {
-      expires: Math.max(60, Number(process.env.DIRECT_ZIP_DOWNLOAD_EXPIRES_SECONDS || 900)),
-      downloadName: job.zipName,
-    });
-    return res.json({ ...getDirectZipPublicState(job), downloadUrl: signed.signedUrl, downloadExpiresIn: signed.expiresIn });
+    return res.json(await getDirectZipResponse(job));
   } catch (err) {
     console.error('[photos.zip-direct] sign download failed:', job.id, err && err.stack ? err.stack : err);
     return res.status(500).json({ error: 'DIRECT_ZIP_SIGN_FAILED' });
