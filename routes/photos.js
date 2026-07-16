@@ -138,7 +138,7 @@ function getDirectZipPublicState(job) {
     createdAt: job.createdAt,
     readyAt: job.readyAt || null,
     expiresAt: job.expiresAt || null,
-    error: job.status === 'failed' ? (job.error || 'ZIP_PREPARATION_FAILED') : null,
+    error: job.status === 'failed' ? (job.error || 'ZIP_PREPARATION_FAILED') : (job.status === 'cancelled' ? 'DIRECT_ZIP_CANCELLED' : null),
     queueAhead,
     queuePosition: job.status === 'queued' ? queueAhead + 1 : 0,
   };
@@ -153,6 +153,22 @@ async function getDirectZipResponse(job) {
     downloadName: job.zipName,
   });
   return { ...response, downloadUrl: signed.signedUrl, downloadExpiresIn: signed.expiresIn };
+}
+
+function cancelDirectZipJob(job) {
+  if (!job || ['ready', 'failed', 'cancelled'].includes(job.status)) return false;
+  job.cancelRequested = true;
+  job.status = 'cancelled';
+  job.updatedAt = Date.now();
+  job.expiresAt = job.updatedAt + 2 * 60 * 1000;
+  const index = directZipQueue.indexOf(job.id);
+  if (index >= 0) directZipQueue.splice(index, 1);
+  if (job.abortController && typeof job.abortController.abort === 'function') {
+    try { job.abortController.abort(); } catch (e) { /* ignore */ }
+  }
+  if (job.objectKey) cosStorage.deleteObjects([job.objectKey]).catch(() => {});
+  scheduleDirectZipCleanup(2 * 60 * 1000 + 1000);
+  return true;
 }
 
 function cleanupDirectZipJobs() {
@@ -177,8 +193,11 @@ function scheduleDirectZipCleanup(delayMs = DIRECT_ZIP_JOB_TTL_MS + 1000) {
 }
 
 async function runDirectZipJob(job) {
+  if (job.cancelRequested) return;
   job.status = 'packing';
   job.updatedAt = Date.now();
+  const abortController = new AbortController();
+  job.abortController = abortController;
   const token = jwt.sign({ id: job.userId }, JWT_SECRET, { expiresIn: '20m' });
   const endpoint = `${getDirectZipLoopbackBaseUrl()}/api/photos/zip`;
   let response = null;
@@ -193,6 +212,7 @@ async function runDirectZipJob(job) {
       },
       body: JSON.stringify({ photoIds: job.photoIds, zipName: job.zipName }),
       timeout: 0,
+      signal: abortController.signal,
     });
     if (!response || !response.ok || !response.body) {
       let detail = '';
@@ -224,8 +244,10 @@ async function runDirectZipJob(job) {
         job.uploadedBytes = Math.max(job.uploadedBytes || 0, Number(event && event.loaded) || 0);
         job.updatedAt = Date.now();
       },
+      signal: abortController.signal,
     });
 
+    if (job.cancelRequested || abortController.signal.aborted) throw new Error('DIRECT_ZIP_CANCELLED');
     job.status = 'ready';
     job.readyAt = Date.now();
     job.expiresAt = job.readyAt + DIRECT_ZIP_JOB_TTL_MS;
@@ -233,6 +255,15 @@ async function runDirectZipJob(job) {
     scheduleDirectZipCleanup();
   } catch (err) {
     if (response && response.body && typeof response.body.destroy === 'function') response.body.destroy();
+    if (job.cancelRequested || abortController.signal.aborted) {
+      job.status = 'cancelled';
+      job.error = null;
+      job.updatedAt = Date.now();
+      job.expiresAt = job.updatedAt + 2 * 60 * 1000;
+      if (job.objectKey) cosStorage.deleteObjects([job.objectKey]).catch(() => {});
+      scheduleDirectZipCleanup(2 * 60 * 1000 + 1000);
+      return;
+    }
     job.status = 'failed';
     job.error = err && err.message ? err.message : 'ZIP_PREPARATION_FAILED';
     job.updatedAt = Date.now();
@@ -242,6 +273,8 @@ async function runDirectZipJob(job) {
       cosStorage.deleteObjects([job.objectKey]).catch(() => {});
     }
     console.error('[photos.zip-direct] job failed:', job.id, err && err.stack ? err.stack : err);
+  } finally {
+    delete job.abortController;
   }
 }
 
@@ -1338,6 +1371,19 @@ router.post('/zip-direct', requirePermission('photos.view'), async (req, res) =>
   directZipQueue.push(job.id);
   scheduleDirectZipJobs();
   return res.status(202).json(getDirectZipPublicState(job));
+});
+
+router.post('/zip-direct/:jobId/cancel', requirePermission('photos.view'), (req, res) => {
+  cleanupDirectZipJobs();
+  const job = directZipJobs.get(String(req.params.jobId || ''));
+  if (!job) return res.status(404).json({ error: 'DIRECT_ZIP_JOB_NOT_FOUND' });
+  const userOrgId = req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id);
+  if (Number(job.userId) !== Number(req.user.id) || Number(job.organizationId) !== Number(userOrgId)) {
+    return res.status(403).json({ error: 'DIRECT_ZIP_JOB_FORBIDDEN' });
+  }
+  const cancelled = cancelDirectZipJob(job);
+  if (cancelled) scheduleDirectZipJobs();
+  return res.json({ ...getDirectZipPublicState(job), cancelled: job.status === 'cancelled' });
 });
 
 router.get('/zip-direct/:jobId', requirePermission('photos.view'), async (req, res) => {
