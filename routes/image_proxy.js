@@ -71,6 +71,8 @@ function inferContentType(key, object) {
 
 function setObjectHeaders(res, key, object) {
   res.setHeader('Content-Type', inferContentType(key, object));
+  // 大视频必须边从对象存储读取边转发，避免 Nginx 先写临时文件再交给浏览器。
+  res.setHeader('X-Accel-Buffering', 'no');
   if (object.ContentLength !== undefined && object.ContentLength !== null) {
     res.setHeader('Content-Length', String(object.ContentLength));
   }
