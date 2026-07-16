@@ -1386,6 +1386,29 @@ router.post('/zip-direct/:jobId/cancel', requirePermission('photos.view'), (req,
   return res.json({ ...getDirectZipPublicState(job), cancelled: job.status === 'cancelled' });
 });
 
+// 刷新页面后由中转站自动接回当前用户的任务；任务仍在进程内，绝不因为页面刷新而重新排队。
+router.get('/zip-direct', requirePermission('photos.view'), async (req, res) => {
+  cleanupDirectZipJobs();
+  const userOrgId = req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id);
+  const jobs = Array.from(directZipJobs.values())
+    .filter((job) => (
+      Number(job.userId) === Number(req.user.id)
+      && Number(job.organizationId) === Number(userOrgId)
+      && ['queued', 'packing', 'ready'].includes(job.status)
+    ))
+    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0));
+  try {
+    const states = await Promise.all(jobs.map(async (job) => ({
+      ...(await getDirectZipResponse(job)),
+      fileCount: Array.isArray(job.photoIds) ? job.photoIds.length : 0,
+    })));
+    return res.json({ jobs: states });
+  } catch (err) {
+    console.error('[photos.zip-direct] active list failed:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'DIRECT_ZIP_LIST_FAILED' });
+  }
+});
+
 router.get('/zip-direct/:jobId', requirePermission('photos.view'), async (req, res) => {
   cleanupDirectZipJobs();
   const job = directZipJobs.get(String(req.params.jobId || ''));
