@@ -137,7 +137,8 @@ function cleanupDirectVideoUploads() {
   for (const [id, session] of directVideoUploads) {
     if (!session || session.expiresAt > now) continue;
     directVideoUploads.delete(id);
-    cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+    if (session.storageUploadId) cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+    else cosStorage.deleteObjects([session.originalKey]).catch(() => null);
   }
 }
 
@@ -1583,6 +1584,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
     if (session) {
       directVideoUploads.delete(session.id);
       if (session.storageUploadId) await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+      else await cosStorage.deleteObjects([session.originalKey]).catch(() => null);
     }
     console.error('POST /api/upload/video/direct/complete error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'DIRECT_VIDEO_COMPLETE_FAILED' });
@@ -1594,6 +1596,7 @@ router.post('/video/direct/abort', requirePermission('upload.photo'), async (req
   if (!session) return res.json({ ok: true });
   directVideoUploads.delete(session.id);
   if (session.storageUploadId) await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+  else await cosStorage.deleteObjects([session.originalKey]).catch(() => null);
   return res.json({ ok: true });
 });
 
