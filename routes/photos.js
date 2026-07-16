@@ -133,6 +133,12 @@ function cleanupDirectZipJobs() {
   }
 }
 
+function scheduleDirectZipCleanup(delayMs = DIRECT_ZIP_JOB_TTL_MS + 1000) {
+  const timer = setTimeout(cleanupDirectZipJobs, Math.max(1000, delayMs));
+  // 任务只做清理，不应在正常停服时强行拖住 Node 进程。
+  if (timer && typeof timer.unref === 'function') timer.unref();
+}
+
 async function runDirectZipJob(job) {
   job.status = 'packing';
   job.updatedAt = Date.now();
@@ -187,12 +193,14 @@ async function runDirectZipJob(job) {
     job.readyAt = Date.now();
     job.expiresAt = job.readyAt + DIRECT_ZIP_JOB_TTL_MS;
     job.updatedAt = job.readyAt;
+    scheduleDirectZipCleanup();
   } catch (err) {
     if (response && response.body && typeof response.body.destroy === 'function') response.body.destroy();
     job.status = 'failed';
     job.error = err && err.message ? err.message : 'ZIP_PREPARATION_FAILED';
     job.updatedAt = Date.now();
     job.expiresAt = job.updatedAt + Math.min(DIRECT_ZIP_JOB_TTL_MS, 10 * 60 * 1000);
+    scheduleDirectZipCleanup(Math.min(DIRECT_ZIP_JOB_TTL_MS, 10 * 60 * 1000) + 1000);
     if (job.objectKey) {
       cosStorage.deleteObjects([job.objectKey]).catch(() => {});
     }
