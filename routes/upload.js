@@ -7,6 +7,7 @@ const path = require('path');
 const net = require('net');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const { pipeline } = require('stream/promises');
 const multer = require('multer');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
@@ -71,6 +72,11 @@ const VIDEO_MIME_BY_EXT = new Map([
 ]);
 const ALLOWED_VIDEO_MIMES = new Set(VIDEO_MIME_BY_EXT.values());
 const VIDEO_UPLOAD_TMP_DIR = process.env.UPLOAD_VIDEO_TMP_DIR || path.join(os.tmpdir(), 'mamage-video-uploads');
+const DIRECT_VIDEO_PART_SIZE = Math.max(5 * 1024 * 1024, envNumber(process.env.DIRECT_VIDEO_PART_SIZE_MB, 16) * 1024 * 1024);
+const DIRECT_VIDEO_MAX_PARTS = 10000;
+const DIRECT_VIDEO_SESSION_TTL_MS = Math.max(10 * 60 * 1000, envNumber(process.env.DIRECT_VIDEO_SESSION_TTL_MINUTES, 180) * 60 * 1000);
+const DIRECT_VIDEO_PART_URL_BATCH = Math.min(32, Math.max(1, envNumber(process.env.DIRECT_VIDEO_PART_URL_BATCH, 12)));
+const directVideoUploads = new Map();
 
 function parseEnvBoolean(value) {
   const raw = String(value || '').trim().toLowerCase();
@@ -124,6 +130,29 @@ function getDirectUploadUnavailableReason() {
   }
 
   return null;
+}
+
+function cleanupDirectVideoUploads() {
+  const now = Date.now();
+  for (const [id, session] of directVideoUploads) {
+    if (!session || session.expiresAt > now) continue;
+    directVideoUploads.delete(id);
+    cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+  }
+}
+
+function getDirectVideoSession(req, sessionId) {
+  cleanupDirectVideoUploads();
+  const session = directVideoUploads.get(String(sessionId || ''));
+  if (!session) return null;
+  const orgId = getOrgId(req);
+  if (Number(session.userId) !== Number(req.user && req.user.id) || Number(session.orgId) !== Number(orgId)) return null;
+  return session;
+}
+
+function scheduleDirectVideoCleanup() {
+  const timer = setTimeout(cleanupDirectVideoUploads, DIRECT_VIDEO_SESSION_TTL_MS + 1000);
+  if (timer && typeof timer.unref === 'function') timer.unref();
 }
 
 try {
@@ -431,6 +460,78 @@ function enqueueVideoPlaybackTranscode({ sourceFilePath, cleanupPaths, playbackK
   });
   drainPlaybackQueue();
 
+  return true;
+}
+
+// 直传视频先落对象存储，随后才由 Mac Mini 从内网对象存储取回做 faststart、封面和播放转码。
+// 这样用户上传不再经过本机临时盘；本机磁盘只承担受并发队列限制的后处理工作区。
+function enqueueDirectVideoPostProcess({ sourceKey, mimeType, thumbKey, thumbRel, playbackKey, playbackRel, insertedId }) {
+  if (!insertedId || !sourceKey || (!VIDEO_PREVIEW_ENABLED && !VIDEO_PLAYBACK_ENABLED)) return false;
+  playbackJobsWaiting.push(async () => {
+    const ext = path.extname(String(sourceKey || '')).toLowerCase() || '.mp4';
+    const sourcePath = path.join(VIDEO_UPLOAD_TMP_DIR, `${uuidv4()}-direct-source${ext}`);
+    let preparedVideo = null;
+    let posterImage = null;
+    let playbackVideo = null;
+    try {
+      const head = await cosStorage.headObject(sourceKey);
+      const sourceBytes = Number(head && head.ContentLength) || 0;
+      const freeBytes = await tmpDirFreeBytes();
+      const requiredBytes = Math.max(sourceBytes * 2, VIDEO_TMP_MIN_FREE_BYTES);
+      if (freeBytes !== null && freeBytes < requiredBytes) throw new Error('INSUFFICIENT_STORAGE_FOR_VIDEO_PROCESSING');
+
+      const source = await cosStorage.getObject(sourceKey);
+      if (!source || !source.Body) throw new Error('DIRECT_VIDEO_SOURCE_UNAVAILABLE');
+      await pipeline(source.Body, fs.createWriteStream(sourcePath));
+
+      preparedVideo = await prepareVideoForStreaming(sourcePath, mimeType);
+      const workPath = preparedVideo.filePath || sourcePath;
+      if (preparedVideo.fastStarted && workPath !== sourcePath) {
+        await cosStorage.uploadFile(sourceKey, workPath, {
+          contentType: mimeType,
+          contentLength: preparedVideo.size,
+          cacheControl: UPLOAD_CACHE_CONTROL,
+        });
+      }
+
+      if (VIDEO_PREVIEW_ENABLED && thumbKey && thumbRel) {
+        posterImage = await createVideoPosterForPreview(workPath);
+        if (posterImage) {
+          await cosStorage.uploadFile(thumbKey, posterImage.filePath, {
+            contentType: 'image/jpeg', contentLength: posterImage.size, cacheControl: UPLOAD_CACHE_CONTROL,
+          });
+          const [posterUpdate] = await pool.query(
+            'UPDATE photos SET thumb_url = ? WHERE id = ? AND (thumb_url IS NULL OR thumb_url = \'\')',
+            [thumbRel, insertedId]
+          );
+          if (!posterUpdate || !posterUpdate.affectedRows) await cosStorage.deleteObjects([thumbKey]).catch(() => null);
+        }
+      }
+
+      if (VIDEO_PLAYBACK_ENABLED && playbackKey && playbackRel) {
+        playbackVideo = await createVideoPlaybackForWeb(workPath);
+        if (playbackVideo) {
+          await cosStorage.uploadFile(playbackKey, playbackVideo.filePath, {
+            contentType: 'video/mp4', contentLength: playbackVideo.size, cacheControl: UPLOAD_CACHE_CONTROL,
+          });
+          const [playbackUpdate] = await pool.query(
+            'UPDATE photos SET playback_url = ? WHERE id = ? AND (playback_url IS NULL OR playback_url = \'\')',
+            [playbackRel, insertedId]
+          );
+          if (!playbackUpdate || !playbackUpdate.affectedRows) await cosStorage.deleteObjects([playbackKey]).catch(() => null);
+        }
+      }
+      console.log('[upload.video] direct post-process ready', { mediaId: insertedId });
+    } catch (err) {
+      console.error('[upload.video] direct post-process failed:', insertedId, err && err.stack ? err.stack : err);
+    } finally {
+      if (playbackVideo && playbackVideo.filePath) unlinkFileQuiet(playbackVideo.filePath);
+      if (posterImage && posterImage.filePath) unlinkFileQuiet(posterImage.filePath);
+      if (preparedVideo && preparedVideo.cleanupPath) unlinkFileQuiet(preparedVideo.cleanupPath);
+      unlinkFileQuiet(sourcePath);
+    }
+  });
+  drainPlaybackQueue();
   return true;
 }
 
@@ -1395,6 +1496,122 @@ router.post('/photo/direct/abort', requirePermission('upload.photo'), async (req
     console.error('POST /api/upload/photo/direct/abort error:', err && err.message ? err.message : err);
     res.status(500).json({ error: 'DIRECT_UPLOAD_ABORT_FAILED' });
   }
+});
+
+// 视频直传：浏览器只持有短时分片 PUT URL，访问密钥始终留在 Mac Mini。
+router.post('/video/direct/init', requirePermission('upload.photo'), async (req, res) => {
+  try {
+    if (!cosStorage.isConfigured()) return res.status(503).json({ error: 'COS_NOT_CONFIGURED' });
+    const unavailable = getDirectUploadUnavailableReason();
+    if (unavailable) return res.status(409).json({ error: 'DIRECT_UPLOAD_UNAVAILABLE', reason: unavailable, fallback: 'api-upload' });
+
+    const metadata = readPhotoMetadata(req.body || {});
+    metadata.type = 'video';
+    const orgId = getOrgId(req);
+    await ensureProjectInScope(pool, metadata.projectId, orgId);
+    await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
+    const fileName = trimText(req.body && req.body.fileName, 255) || 'video.mp4';
+    const fileSize = Number(req.body && req.body.fileSize);
+    const mimeType = inferVideoMime(req.body && req.body.mimeType, fileName);
+    if (!mimeType) return res.status(415).json({ error: 'UNSUPPORTED_VIDEO_TYPE' });
+    if (!Number.isFinite(fileSize) || fileSize <= 0) return res.status(400).json({ error: 'INVALID_FILE_SIZE' });
+    if (fileSize > MAX_VIDEO_UPLOAD_BYTES) return res.status(413).json({ error: 'VIDEO_FILE_TOO_LARGE', maxFileBytes: MAX_VIDEO_UPLOAD_BYTES });
+
+    const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'video');
+    const multipart = await cosStorage.createMultipartUpload(originalKey, { contentType: mimeType, cacheControl: UPLOAD_CACHE_CONTROL });
+    const partCount = Math.ceil(fileSize / DIRECT_VIDEO_PART_SIZE);
+    if (partCount > DIRECT_VIDEO_MAX_PARTS) {
+      await cosStorage.abortMultipartUpload(originalKey, multipart.uploadId).catch(() => null);
+      return res.status(413).json({ error: 'VIDEO_TOO_MANY_PARTS' });
+    }
+    const sessionId = uuidv4();
+    directVideoUploads.set(sessionId, {
+      id: sessionId, userId: req.user.id, orgId, metadata, fileName, fileSize, mimeType,
+      originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel,
+      storageUploadId: multipart.uploadId, partCount, createdAt: Date.now(), expiresAt: Date.now() + DIRECT_VIDEO_SESSION_TTL_MS,
+      status: 'uploading',
+    });
+    scheduleDirectVideoCleanup();
+    return res.json({ uploadMode: 'direct-video-multipart', sessionId, partSize: DIRECT_VIDEO_PART_SIZE, partCount, expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS });
+  } catch (err) {
+    console.error('POST /api/upload/video/direct/init error:', err && err.stack ? err.stack : err);
+    return res.status(err.status || 500).json({ error: err.message || 'DIRECT_VIDEO_INIT_FAILED' });
+  }
+});
+
+router.post('/video/direct/parts', requirePermission('upload.photo'), async (req, res) => {
+  try {
+    const session = getDirectVideoSession(req, req.body && req.body.sessionId);
+    if (!session || session.status !== 'uploading') return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
+    const requested = Array.from(new Set(Array.isArray(req.body && req.body.partNumbers) ? req.body.partNumbers.map(Number) : []))
+      .filter((partNumber) => Number.isInteger(partNumber) && partNumber >= 1 && partNumber <= session.partCount)
+      .slice(0, DIRECT_VIDEO_PART_URL_BATCH);
+    if (!requested.length) return res.status(400).json({ error: 'INVALID_PART_NUMBERS' });
+    const parts = await Promise.all(requested.map(async (partNumber) => {
+      const signed = await cosStorage.signedUploadPartUrl(session.originalKey, session.storageUploadId, partNumber, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS });
+      return { partNumber, uploadUrl: signed.signedUrl, expiresIn: signed.expiresIn };
+    }));
+    return res.json({ sessionId: session.id, parts });
+  } catch (err) {
+    console.error('POST /api/upload/video/direct/parts error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'DIRECT_VIDEO_PART_URL_FAILED' });
+  }
+});
+
+router.post('/video/direct/complete', requirePermission('upload.photo'), async (req, res) => {
+  let session = null;
+  try {
+    session = getDirectVideoSession(req, req.body && req.body.sessionId);
+    if (!session || session.status !== 'uploading') return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
+    const parts = Array.from(req.body && req.body.parts || []).map((part) => ({ partNumber: Number(part && part.partNumber), etag: String(part && part.etag || '').trim() }))
+      .filter((part) => Number.isInteger(part.partNumber) && part.partNumber >= 1 && part.partNumber <= session.partCount && part.etag)
+      .sort((a, b) => a.partNumber - b.partNumber);
+    if (parts.length !== session.partCount || parts.some((part, index) => part.partNumber !== index + 1)) {
+      return res.status(400).json({ error: 'DIRECT_VIDEO_PARTS_INCOMPLETE' });
+    }
+    session.status = 'completing';
+    await cosStorage.completeMultipartUpload(session.originalKey, session.storageUploadId, parts);
+    const head = await cosStorage.headObject(session.originalKey);
+    if (!head || Number(head.ContentLength) !== Number(session.fileSize)) throw new Error('DIRECT_VIDEO_SIZE_MISMATCH');
+
+    const photographerId = req.user && req.user.id ? req.user.id : null;
+    let insertedId;
+    try {
+      insertedId = await createPhotoRecordWithRetry({
+        ...session.metadata, relPath: session.relPath, thumbRel: null, playbackRel: null, aiStatus: 'skipped', photographerId, orgId: session.orgId,
+      });
+    } catch (dbErr) {
+      await cosStorage.deleteObjects([session.originalKey]).catch(() => null);
+      throw dbErr;
+    }
+    directVideoUploads.delete(session.id);
+    setImmediate(() => appendPhotoIdToProjectBestEffort(session.metadata.projectId, insertedId).catch((err) => console.warn('[upload.video] project photo_ids async sync failed:', err && err.message ? err.message : err)));
+    const photographerName = await getPhotographerName(photographerId);
+    const playbackQueued = enqueueDirectVideoPostProcess({
+      sourceKey: session.originalKey, mimeType: session.mimeType, thumbKey: session.thumbKey, thumbRel: session.thumbRel,
+      playbackKey: session.playbackKey, playbackRel: session.playbackRel, insertedId,
+    });
+    return res.json(makeResponsePayload({
+      insertedId, projectId: session.metadata.projectId, timelineSectionId: session.metadata.timelineSectionId,
+      relPath: session.relPath, thumbRel: null, playbackRel: null, playbackQueued,
+      title: session.metadata.title, type: 'video', mediaType: 'video', photographerId, photographerName,
+    }));
+  } catch (err) {
+    if (session) {
+      directVideoUploads.delete(session.id);
+      await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+    }
+    console.error('POST /api/upload/video/direct/complete error:', err && err.stack ? err.stack : err);
+    return res.status(err.status || 500).json({ error: err.message || 'DIRECT_VIDEO_COMPLETE_FAILED' });
+  }
+});
+
+router.post('/video/direct/abort', requirePermission('upload.photo'), async (req, res) => {
+  const session = getDirectVideoSession(req, req.body && req.body.sessionId);
+  if (!session) return res.json({ ok: true });
+  directVideoUploads.delete(session.id);
+  await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+  return res.json({ ok: true });
 });
 
 router.post('/photo', requirePermission('upload.photo'), handleUploadMiddleware, processUpload);
