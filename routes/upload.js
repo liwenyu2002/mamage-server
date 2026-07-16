@@ -1390,18 +1390,9 @@ router.post('/photo/direct/init', requirePermission('upload.photo'), async (req,
     }
 
     const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, fileName, mimeType);
-    const originalHeaders = {
-      'Content-Type': mimeType,
-      'Cache-Control': UPLOAD_CACHE_CONTROL,
-    };
-    const thumbHeaders = {
-      'Content-Type': 'image/jpeg',
-      'Cache-Control': UPLOAD_CACHE_CONTROL,
-    };
-
     const [original, thumb] = await Promise.all([
-      cosStorage.signedPutUrl(originalKey, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS, headers: originalHeaders }),
-      cosStorage.signedPutUrl(thumbKey, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS, headers: thumbHeaders }),
+      cosStorage.signedPost(originalKey, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS, contentType: mimeType, cacheControl: UPLOAD_CACHE_CONTROL, maxBytes: fileSize }),
+      cosStorage.signedPost(thumbKey, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS, contentType: 'image/jpeg', cacheControl: UPLOAD_CACHE_CONTROL, maxBytes: Math.max(1024 * 1024, Math.min(fileSize, 16 * 1024 * 1024)) }),
     ]);
 
     res.json({
@@ -1410,17 +1401,17 @@ router.post('/photo/direct/init', requirePermission('upload.photo'), async (req,
       expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS,
       original: {
         key: original.key,
-        uploadUrl: original.signedUrl,
+        uploadUrl: original.postUrl,
         url: original.publicUrl,
         relPath,
-        headers: originalHeaders,
+        formFields: original.fields,
       },
       thumb: {
         key: thumb.key,
-        uploadUrl: thumb.signedUrl,
+        uploadUrl: thumb.postUrl,
         url: thumb.publicUrl,
         relPath: thumbRel,
-        headers: thumbHeaders,
+        formFields: thumb.fields,
       },
     });
   } catch (err) {
@@ -1518,21 +1509,20 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
     if (fileSize > MAX_VIDEO_UPLOAD_BYTES) return res.status(413).json({ error: 'VIDEO_FILE_TOO_LARGE', maxFileBytes: MAX_VIDEO_UPLOAD_BYTES });
 
     const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'video');
-    const multipart = await cosStorage.createMultipartUpload(originalKey, { contentType: mimeType, cacheControl: UPLOAD_CACHE_CONTROL });
-    const partCount = Math.ceil(fileSize / DIRECT_VIDEO_PART_SIZE);
-    if (partCount > DIRECT_VIDEO_MAX_PARTS) {
-      await cosStorage.abortMultipartUpload(originalKey, multipart.uploadId).catch(() => null);
-      return res.status(413).json({ error: 'VIDEO_TOO_MANY_PARTS' });
-    }
+    // 该对象存储网关会错误拒绝跨域 PUT 的 OPTIONS 预检；采用标准 S3 presigned POST，
+    // 浏览器可直接提交 FormData 到存储，不经过 Mac Mini，也不会触发 PUT 预检。
+    const post = await cosStorage.signedPost(originalKey, {
+      expires: SIGNED_UPLOAD_EXPIRES_SECONDS, contentType: mimeType, cacheControl: UPLOAD_CACHE_CONTROL, maxBytes: fileSize,
+    });
     const sessionId = uuidv4();
     directVideoUploads.set(sessionId, {
       id: sessionId, userId: req.user.id, orgId, metadata, fileName, fileSize, mimeType,
       originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel,
-      storageUploadId: multipart.uploadId, partCount, createdAt: Date.now(), expiresAt: Date.now() + DIRECT_VIDEO_SESSION_TTL_MS,
+      storageUploadId: null, partCount: 1, createdAt: Date.now(), expiresAt: Date.now() + DIRECT_VIDEO_SESSION_TTL_MS,
       status: 'uploading',
     });
     scheduleDirectVideoCleanup();
-    return res.json({ uploadMode: 'direct-video-multipart', sessionId, partSize: DIRECT_VIDEO_PART_SIZE, partCount, expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS });
+    return res.json({ uploadMode: 'direct-video-post', sessionId, expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS, upload: { uploadUrl: post.postUrl, formFields: post.fields } });
   } catch (err) {
     console.error('POST /api/upload/video/direct/init error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'DIRECT_VIDEO_INIT_FAILED' });
@@ -1563,14 +1553,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
   try {
     session = getDirectVideoSession(req, req.body && req.body.sessionId);
     if (!session || session.status !== 'uploading') return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
-    const parts = Array.from(req.body && req.body.parts || []).map((part) => ({ partNumber: Number(part && part.partNumber), etag: String(part && part.etag || '').trim() }))
-      .filter((part) => Number.isInteger(part.partNumber) && part.partNumber >= 1 && part.partNumber <= session.partCount && part.etag)
-      .sort((a, b) => a.partNumber - b.partNumber);
-    if (parts.length !== session.partCount || parts.some((part, index) => part.partNumber !== index + 1)) {
-      return res.status(400).json({ error: 'DIRECT_VIDEO_PARTS_INCOMPLETE' });
-    }
     session.status = 'completing';
-    await cosStorage.completeMultipartUpload(session.originalKey, session.storageUploadId, parts);
     const head = await cosStorage.headObject(session.originalKey);
     if (!head || Number(head.ContentLength) !== Number(session.fileSize)) throw new Error('DIRECT_VIDEO_SIZE_MISMATCH');
 
@@ -1599,7 +1582,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
   } catch (err) {
     if (session) {
       directVideoUploads.delete(session.id);
-      await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+      if (session.storageUploadId) await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
     }
     console.error('POST /api/upload/video/direct/complete error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'DIRECT_VIDEO_COMPLETE_FAILED' });
@@ -1610,7 +1593,7 @@ router.post('/video/direct/abort', requirePermission('upload.photo'), async (req
   const session = getDirectVideoSession(req, req.body && req.body.sessionId);
   if (!session) return res.json({ ok: true });
   directVideoUploads.delete(session.id);
-  await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
+  if (session.storageUploadId) await cosStorage.abortMultipartUpload(session.originalKey, session.storageUploadId).catch(() => null);
   return res.json({ ok: true });
 });
 
