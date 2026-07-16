@@ -3,8 +3,10 @@ const router = express.Router();
 const { pool, buildUploadUrl, buildInternalMediaUrl } = require('../db');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const fetch = require('node-fetch');
+const { Transform } = require('stream');
 const keys = require('../config/keys');
 const cosStorage = require('../lib/cos_storage');
 const JWT_SECRET = keys.JWT_SECRET;
@@ -41,11 +43,13 @@ const MAX_DELETE_PHOTOS = Math.max(1, Number(process.env.PHOTO_DELETE_MAX_IDS ||
 // 与前端中转站容量(transferStore.MAX_COUNT)保持一致；不一致会出现"存得下却打不了包"(413)
 const MAX_ZIP_PHOTOS = Math.max(1, Number(process.env.PHOTO_ZIP_MAX_IDS || 1000));
 const ZIP_REMOTE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_ZIP_REMOTE_TIMEOUT_MS || 20000));
-const ZIP_MAX_REMOTE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_MAX_REMOTE_BYTES || 1024 * 1024 * 1024));
+const ZIP_MAX_REMOTE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_MAX_REMOTE_BYTES || 5 * 1024 * 1024 * 1024));
 const ZIP_MAX_RENDER_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_ZIP_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
 const RENDER_SOURCE_TIMEOUT_MS = Math.max(1000, Number(process.env.PHOTO_RENDER_SOURCE_TIMEOUT_MS || 20000));
 const RENDER_MAX_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_RENDER_MAX_SOURCE_BYTES || 128 * 1024 * 1024));
 const TONE_ENGINE = 'mamage-tone-v2-acr-like';
+const ZIP_TICKET_TTL_MS = Math.max(15000, Number(process.env.PHOTO_ZIP_TICKET_TTL_MS || 2 * 60 * 1000));
+const zipDownloadTickets = new Map();
 
 function allowAiSearchForUser(userId) {
   if (!userId) return false;
@@ -1038,16 +1042,59 @@ async function resolveShareZipScope(code) {
 }
 
 // 返回: application/zip attachment
+// 内网 HTTP 不是 secure context，浏览器没有 showSaveFilePicker。先用带 Bearer 的 POST
+// 换一个短时、一次性票据，再让浏览器原生下载管理器通过 GET 边收边落盘，避免把数 GB ZIP
+// 全部堆进页面内存。票据只保存在本进程，过期或使用一次后立即失效。
+router.post('/zip-ticket', requirePermission('photos.view'), (req, res) => {
+  const ids = Array.isArray(req.body && req.body.photoIds)
+    ? Array.from(new Set(req.body.photoIds.map((n) => parseInt(n, 10)).filter((n) => !Number.isNaN(n))))
+    : [];
+  if (!ids.length) return res.status(400).json({ error: 'photoIds must be a non-empty array' });
+  if (ids.length > MAX_ZIP_PHOTOS) {
+    return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
+  }
+
+  const now = Date.now();
+  for (const [key, entry] of zipDownloadTickets) {
+    if (!entry || entry.expiresAt <= now) zipDownloadTickets.delete(key);
+  }
+  const ticket = crypto.randomBytes(24).toString('base64url');
+  zipDownloadTickets.set(ticket, {
+    expiresAt: now + ZIP_TICKET_TTL_MS,
+    user: {
+      id: req.user.id,
+      role: req.user.role,
+      organization_id: req.user.organization_id,
+    },
+    body: {
+      photoIds: ids,
+      zipName: req.body && req.body.zipName ? String(req.body.zipName) : undefined,
+    },
+  });
+  return res.json({ ticket, expiresInSeconds: Math.floor(ZIP_TICKET_TTL_MS / 1000) });
+});
+
 // GET 版（仅分享码场景）：给浏览器原生下载用——手机/内网 http 没有 showSaveFilePicker(需安全上下文),
-// 前端退化为 <a href> 直接交给浏览器下载管理器,立即可见下载条。登录态不开 GET(避免 token 进 URL)。
+// 前端退化为 <a href> 直接交给浏览器下载管理器,立即可见下载条。登录态使用一次性票据，
+// Bearer token 不进入 URL。
 router.get('/zip', (req, res, next) => {
   const sc = req.query && req.query.shareCode ? String(req.query.shareCode).trim() : '';
-  if (!sc) return res.status(401).json({ error: 'SHARE_CODE_REQUIRED' });
-  req.body = {
-    shareCode: sc,
-    zipName: req.query.zipName ? String(req.query.zipName) : undefined,
-    photoIds: req.query.photoIds ? String(req.query.photoIds).split(',') : undefined,
-  };
+  if (sc) {
+    req.body = {
+      shareCode: sc,
+      zipName: req.query.zipName ? String(req.query.zipName) : undefined,
+      photoIds: req.query.photoIds ? String(req.query.photoIds).split(',') : undefined,
+    };
+    return next();
+  }
+
+  const ticket = req.query && req.query.ticket ? String(req.query.ticket).trim() : '';
+  const entry = ticket ? zipDownloadTickets.get(ticket) : null;
+  if (!entry) return res.status(401).json({ error: 'DOWNLOAD_TICKET_REQUIRED' });
+  zipDownloadTickets.delete(ticket);
+  if (entry.expiresAt <= Date.now()) return res.status(410).json({ error: 'DOWNLOAD_TICKET_EXPIRED' });
+  req.user = entry.user;
+  req.body = entry.body;
   return next();
 }, handleZipRequest);
 
@@ -1174,6 +1221,7 @@ async function handleZipRequest(req, res) {
 
     const archive = archiver('zip', { store: true, zlib: { level: 0 } });
     const activeRequests = new Set();
+    const activeStreams = new Set();
     let clientClosed = false;
 
     res.on('close', () => {
@@ -1181,6 +1229,9 @@ async function handleZipRequest(req, res) {
       clientClosed = true;
       for (const activeReq of activeRequests) {
         try { activeReq.destroy(new Error('CLIENT_CLOSED')); } catch (e) { }
+      }
+      for (const activeStream of activeStreams) {
+        try { activeStream.destroy(new Error('CLIENT_CLOSED')); } catch (e) { }
       }
       try { archive.abort(); } catch (e) { }
     });
@@ -1206,6 +1257,68 @@ async function handleZipRequest(req, res) {
       } catch (e) {
         return path.extname(String(u || '')) || '';
       }
+    };
+
+    const appendStorageObjectToArchive = async (source, nameInZip) => {
+      if (clientClosed || !cosStorage.isConfigured || !cosStorage.isConfigured()) return false;
+      const objectKey = cosStorage.keyFromUrlOrPath(source);
+      if (!objectKey) return false;
+
+      let object;
+      try {
+        object = await cosStorage.getObject(objectKey);
+      } catch (e) {
+        console.warn('[photos.zip] direct storage read failed, fallback to media proxy:', objectKey, e.message);
+        return false;
+      }
+
+      const contentLength = Number(object && object.ContentLength);
+      if (Number.isFinite(contentLength) && contentLength > ZIP_MAX_REMOTE_BYTES) {
+        console.warn('[photos.zip] storage object too large, skip:', objectKey, contentLength);
+        if (object.Body && typeof object.Body.destroy === 'function') object.Body.destroy();
+        return false;
+      }
+      if (!object.Body || typeof object.Body.pipe !== 'function') {
+        console.warn('[photos.zip] storage object body is not streamable:', objectKey);
+        return false;
+      }
+
+      const sourceStream = object.Body;
+      let received = 0;
+      const sizeGuard = new Transform({
+        transform(chunk, encoding, callback) {
+          received += chunk.length;
+          if (received > ZIP_MAX_REMOTE_BYTES) {
+            callback(new Error('REMOTE_FILE_TOO_LARGE'));
+            return;
+          }
+          callback(null, chunk);
+        },
+      });
+      activeStreams.add(sourceStream);
+      activeStreams.add(sizeGuard);
+
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (ok, err) => {
+          if (settled) return;
+          settled = true;
+          activeStreams.delete(sourceStream);
+          activeStreams.delete(sizeGuard);
+          if (err && !clientClosed) {
+            console.error('[photos.zip] direct storage stream failed:', objectKey, err.message || err);
+          }
+          resolve(ok);
+        };
+        sourceStream.once('error', (err) => sizeGuard.destroy(err));
+        sizeGuard.once('end', () => finish(true));
+        // 流已经加入 archive 后不能再用同名文件走 HTTP fallback，否则 ZIP 会出现重复项。
+        // 这里把“已经接管”返回为 true；archive 自己的 error 监听负责终止损坏响应。
+        sizeGuard.once('error', (err) => finish(true, err));
+        sourceStream.pipe(sizeGuard);
+        archive.append(sizeGuard, { name: nameInZip, store: true });
+        addedFileCount += 1;
+      });
     };
 
     const appendRemoteFileToArchive = async (remoteUrl, nameInZip) => {
@@ -1279,7 +1392,37 @@ async function handleZipRequest(req, res) {
       }
     };
 
+    const streamToLimitedBuffer = async (stream, maxBytes) => {
+      const chunks = [];
+      let received = 0;
+      for await (const chunk of stream) {
+        received += chunk.length;
+        if (received > maxBytes) {
+          if (typeof stream.destroy === 'function') stream.destroy();
+          throw new Error('REMOTE_FILE_TOO_LARGE');
+        }
+        chunks.push(Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks, received);
+    };
+
     const fetchRemoteFileBuffer = async (remoteUrl) => {
+      if (cosStorage.isConfigured && cosStorage.isConfigured()) {
+        const objectKey = cosStorage.keyFromUrlOrPath(remoteUrl);
+        if (objectKey) {
+          try {
+            const object = await cosStorage.getObject(objectKey);
+            const contentLength = Number(object && object.ContentLength);
+            if (Number.isFinite(contentLength) && contentLength > ZIP_MAX_RENDER_SOURCE_BYTES) {
+              if (object.Body && typeof object.Body.destroy === 'function') object.Body.destroy();
+              return null;
+            }
+            if (object.Body) return await streamToLimitedBuffer(object.Body, ZIP_MAX_RENDER_SOURCE_BYTES);
+          } catch (e) {
+            console.warn('[photos.zip] direct storage render read failed, fallback to media proxy:', objectKey, e.message);
+          }
+        }
+      }
       const response = await fetch(buildInternalMediaUrl(remoteUrl), { timeout: ZIP_REMOTE_TIMEOUT_MS });
       if (!response || !response.ok) {
         console.warn('[photos.zip] remote file not available for render:', remoteUrl, response && response.status);
@@ -1343,7 +1486,9 @@ async function handleZipRequest(req, res) {
             const sourceBuffer = await fetchRemoteFileBuffer(rawPath);
             if (sourceBuffer && await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
           }
-          await appendRemoteFileToArchive(rawPath, originalNameInZip);
+          if (!await appendStorageObjectToArchive(rawPath, originalNameInZip)) {
+            await appendRemoteFileToArchive(rawPath, originalNameInZip);
+          }
         } else {
           // 本地文件处理（保留原有行为）
           let rel = rawPath.replace(/^\/?uploads[\\\/]/i, '');
@@ -1360,7 +1505,9 @@ async function handleZipRequest(req, res) {
                 const sourceBuffer = await fetchRemoteFileBuffer(fallbackRemoteUrl);
                 if (sourceBuffer && await appendAdjustedBufferToArchive(sourceBuffer, adjustments, nameInZip)) continue;
               }
-              await appendRemoteFileToArchive(fallbackRemoteUrl, originalNameInZip);
+              if (!await appendStorageObjectToArchive(rawPath, originalNameInZip)) {
+                await appendRemoteFileToArchive(fallbackRemoteUrl, originalNameInZip);
+              }
               continue;
             }
             console.warn('[photos.zip] file not found and no remote fallback URL:', rawPath);
