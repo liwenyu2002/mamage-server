@@ -50,6 +50,173 @@ const RENDER_MAX_SOURCE_BYTES = Math.max(1024 * 1024, Number(process.env.PHOTO_R
 const TONE_ENGINE = 'mamage-tone-v2-acr-like';
 const ZIP_TICKET_TTL_MS = Math.max(15000, Number(process.env.PHOTO_ZIP_TICKET_TTL_MS || 2 * 60 * 1000));
 const zipDownloadTickets = new Map();
+const DIRECT_STORAGE_READ_ENABLED = String(process.env.DIRECT_STORAGE_READ_ENABLED || '1').trim() !== '0';
+const DIRECT_STORAGE_ALLOWED_HOSTS = new Set(String(
+  process.env.DIRECT_STORAGE_ALLOWED_HOSTS || '10.100.83.67,10.11.12.63'
+).split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
+const DIRECT_ZIP_JOB_TTL_MS = Math.max(5 * 60 * 1000, Number(process.env.DIRECT_ZIP_JOB_TTL_MS || 30 * 60 * 1000));
+const DIRECT_ZIP_MAX_CONCURRENCY = Math.max(1, Number(process.env.DIRECT_ZIP_MAX_CONCURRENCY || 1));
+const DIRECT_ZIP_PREFIX = String(process.env.DIRECT_ZIP_PREFIX || 'mamage-temp-zips').replace(/^\/+|\/+$/g, '') || 'mamage-temp-zips';
+const directZipJobs = new Map();
+const directZipQueue = [];
+let activeDirectZipJobs = 0;
+
+function requestHostName(req) {
+  const raw = String((req && req.get && req.get('host')) || '').trim().toLowerCase();
+  if (!raw) return '';
+  if (raw.startsWith('[')) return raw.replace(/^\[|\].*$/g, '');
+  return raw.split(':')[0];
+}
+
+function requestProtocol(req) {
+  const forwarded = String((req && req.get && req.get('x-forwarded-proto')) || '').split(',')[0].trim().toLowerCase();
+  return forwarded || String((req && req.protocol) || '').toLowerCase();
+}
+
+function canUseDirectStorage(req) {
+  return Boolean(
+    DIRECT_STORAGE_READ_ENABLED
+    && cosStorage.isConfigured && cosStorage.isConfigured()
+    && requestProtocol(req) === 'http'
+    && DIRECT_STORAGE_ALLOWED_HOSTS.has(requestHostName(req))
+  );
+}
+
+function getExtFromStorageKey(key) {
+  const ext = path.extname(String(key || '').split('?')[0]);
+  return ext && /^[.][a-z0-9]{2,8}$/i.test(ext) ? ext : '';
+}
+
+function getDirectZipJobKey() {
+  return crypto.randomBytes(18).toString('base64url');
+}
+
+function getDirectZipLoopbackBaseUrl() {
+  const configured = String(process.env.DIRECT_ZIP_LOOPBACK_URL || '').trim().replace(/\/+$/, '');
+  if (configured) return configured;
+  return `http://127.0.0.1:${Number(process.env.PORT) || 8000}`;
+}
+
+function getDirectZipObjectKey(job) {
+  const datePart = new Date().toISOString().slice(0, 10);
+  return `${DIRECT_ZIP_PREFIX}/${datePart}/${job.id}.zip`;
+}
+
+function getDirectZipPublicState(job) {
+  if (!job) return null;
+  const result = {
+    id: job.id,
+    status: job.status,
+    totalBytes: job.totalBytes || 0,
+    processedBytes: job.processedBytes || 0,
+    uploadedBytes: job.uploadedBytes || 0,
+    createdAt: job.createdAt,
+    readyAt: job.readyAt || null,
+    expiresAt: job.expiresAt || null,
+    error: job.status === 'failed' ? (job.error || 'ZIP_PREPARATION_FAILED') : null,
+  };
+  return result;
+}
+
+function cleanupDirectZipJobs() {
+  const now = Date.now();
+  for (const [id, job] of directZipJobs) {
+    const stalePreparing = job.status !== 'ready' && job.status !== 'failed' && now - job.createdAt > (3 * 60 * 60 * 1000);
+    const expired = job.expiresAt && job.expiresAt <= now;
+    if (!stalePreparing && !expired) continue;
+    directZipJobs.delete(id);
+    if (job.objectKey) {
+      cosStorage.deleteObjects([job.objectKey]).catch((err) => {
+        console.warn('[photos.zip-direct] temporary archive cleanup failed:', err && err.message ? err.message : err);
+      });
+    }
+  }
+}
+
+async function runDirectZipJob(job) {
+  job.status = 'packing';
+  job.updatedAt = Date.now();
+  const token = jwt.sign({ id: job.userId }, JWT_SECRET, { expiresIn: '20m' });
+  const endpoint = `${getDirectZipLoopbackBaseUrl()}/api/photos/zip`;
+  let response = null;
+
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'X-MaMage-Direct-Zip-Worker': '1',
+      },
+      body: JSON.stringify({ photoIds: job.photoIds, zipName: job.zipName }),
+      timeout: 0,
+    });
+    if (!response || !response.ok || !response.body) {
+      let detail = '';
+      try { detail = response ? await response.text() : ''; } catch (e) { /* ignore */ }
+      throw new Error(`ZIP_SOURCE_${response ? response.status : 'UNAVAILABLE'}${detail ? `: ${detail.slice(0, 180)}` : ''}`);
+    }
+
+    job.totalBytes = Math.max(0, Number(response.headers.get('x-zip-total-bytes') || 0));
+    job.objectKey = getDirectZipObjectKey(job);
+    let lastProgressUpdate = 0;
+    const progress = new Transform({
+      transform(chunk, encoding, callback) {
+        job.processedBytes += chunk.length;
+        const now = Date.now();
+        if (now - lastProgressUpdate >= 350) {
+          lastProgressUpdate = now;
+          job.updatedAt = now;
+        }
+        callback(null, chunk);
+      },
+    });
+    response.body.once('error', (err) => progress.destroy(err));
+    response.body.pipe(progress);
+    await cosStorage.uploadStream(job.objectKey, progress, {
+      contentType: 'application/zip',
+      queueSize: 2,
+      partSize: 8 * 1024 * 1024,
+      onProgress: (event) => {
+        job.uploadedBytes = Math.max(job.uploadedBytes || 0, Number(event && event.loaded) || 0);
+        job.updatedAt = Date.now();
+      },
+    });
+
+    job.status = 'ready';
+    job.readyAt = Date.now();
+    job.expiresAt = job.readyAt + DIRECT_ZIP_JOB_TTL_MS;
+    job.updatedAt = job.readyAt;
+  } catch (err) {
+    if (response && response.body && typeof response.body.destroy === 'function') response.body.destroy();
+    job.status = 'failed';
+    job.error = err && err.message ? err.message : 'ZIP_PREPARATION_FAILED';
+    job.updatedAt = Date.now();
+    job.expiresAt = job.updatedAt + Math.min(DIRECT_ZIP_JOB_TTL_MS, 10 * 60 * 1000);
+    if (job.objectKey) {
+      cosStorage.deleteObjects([job.objectKey]).catch(() => {});
+    }
+    console.error('[photos.zip-direct] job failed:', job.id, err && err.stack ? err.stack : err);
+  }
+}
+
+function scheduleDirectZipJobs() {
+  cleanupDirectZipJobs();
+  while (activeDirectZipJobs < DIRECT_ZIP_MAX_CONCURRENCY && directZipQueue.length) {
+    const jobId = directZipQueue.shift();
+    const job = directZipJobs.get(jobId);
+    if (!job || job.status !== 'queued') continue;
+    activeDirectZipJobs += 1;
+    runDirectZipJob(job)
+      .catch((err) => {
+        console.error('[photos.zip-direct] unexpected worker failure:', err && err.stack ? err.stack : err);
+      })
+      .finally(() => {
+        activeDirectZipJobs = Math.max(0, activeDirectZipJobs - 1);
+        scheduleDirectZipJobs();
+      });
+  }
+}
 
 function allowAiSearchForUser(userId) {
   if (!userId) return false;
@@ -409,7 +576,7 @@ async function renderAdjustedPhotoBuffer(inputBuffer, adjustments, options = {})
 
 async function getScopedPhotoSourceRow(req, id) {
   const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-  let sql = 'SELECT id, url, thumb_url AS thumbUrl, title, adjustments FROM photos WHERE id = ?';
+  let sql = 'SELECT id, url, thumb_url AS thumbUrl, playback_url AS playbackUrl, title, type, adjustments FROM photos WHERE id = ?';
   const params = [id];
   if (orgId === null) {
     sql += ' AND organization_id IS NULL';
@@ -1074,6 +1241,72 @@ router.post('/zip-ticket', requirePermission('photos.view'), (req, res) => {
   return res.json({ ticket, expiresInSeconds: Math.floor(ZIP_TICKET_TTL_MS / 1000) });
 });
 
+// 校园网 HTTP 页面可直接从对象存储下载。先在服务端流式生成临时 ZIP，再给浏览器一条短时
+// 签名下载链接，避免最终下载回流经过 Mac mini 或堆积在浏览器内存。
+router.post('/zip-direct', requirePermission('photos.view'), (req, res) => {
+  if (!canUseDirectStorage(req)) {
+    return res.status(409).json({ error: 'DIRECT_STORAGE_UNAVAILABLE' });
+  }
+  const ids = Array.isArray(req.body && req.body.photoIds)
+    ? Array.from(new Set(req.body.photoIds.map((n) => parseInt(n, 10)).filter((n) => Number.isFinite(n) && n > 0)))
+    : [];
+  if (!ids.length) return res.status(400).json({ error: 'photoIds must be a non-empty array' });
+  if (ids.length > MAX_ZIP_PHOTOS) {
+    return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
+  }
+
+  cleanupDirectZipJobs();
+  if (directZipQueue.length + activeDirectZipJobs >= 20) {
+    return res.status(429).json({ error: 'DIRECT_ZIP_QUEUE_BUSY', retryAfterSeconds: 20 });
+  }
+  const rawZipName = String((req.body && req.body.zipName) || `photos-${Date.now()}`).trim();
+  const safeZipBase = rawZipName.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_').slice(0, 96) || `photos-${Date.now()}`;
+  const zipName = safeZipBase.toLowerCase().endsWith('.zip') ? safeZipBase : `${safeZipBase}.zip`;
+  const job = {
+    id: getDirectZipJobKey(),
+    userId: req.user.id,
+    organizationId: req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id),
+    photoIds: ids,
+    zipName,
+    status: 'queued',
+    totalBytes: 0,
+    processedBytes: 0,
+    uploadedBytes: 0,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    readyAt: null,
+    expiresAt: null,
+    objectKey: null,
+    error: null,
+  };
+  directZipJobs.set(job.id, job);
+  directZipQueue.push(job.id);
+  scheduleDirectZipJobs();
+  return res.status(202).json(getDirectZipPublicState(job));
+});
+
+router.get('/zip-direct/:jobId', requirePermission('photos.view'), async (req, res) => {
+  cleanupDirectZipJobs();
+  const job = directZipJobs.get(String(req.params.jobId || ''));
+  if (!job) return res.status(404).json({ error: 'DIRECT_ZIP_JOB_NOT_FOUND' });
+  const userOrgId = req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id);
+  if (Number(job.userId) !== Number(req.user.id) || Number(job.organizationId) !== Number(userOrgId)) {
+    return res.status(403).json({ error: 'DIRECT_ZIP_JOB_FORBIDDEN' });
+  }
+  if (job.status !== 'ready' || !job.objectKey) return res.json(getDirectZipPublicState(job));
+
+  try {
+    const signed = await cosStorage.signedGetUrl(job.objectKey, {
+      expires: Math.max(60, Number(process.env.DIRECT_ZIP_DOWNLOAD_EXPIRES_SECONDS || 900)),
+      downloadName: job.zipName,
+    });
+    return res.json({ ...getDirectZipPublicState(job), downloadUrl: signed.signedUrl, downloadExpiresIn: signed.expiresIn });
+  } catch (err) {
+    console.error('[photos.zip-direct] sign download failed:', job.id, err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'DIRECT_ZIP_SIGN_FAILED' });
+  }
+});
+
 // GET 版（仅分享码场景）：给浏览器原生下载用——手机/内网 http 没有 showSaveFilePicker(需安全上下文),
 // 前端退化为 <a href> 直接交给浏览器下载管理器,立即可见下载条。登录态使用一次性票据，
 // Bearer token 不进入 URL。
@@ -1657,6 +1890,53 @@ router.get('/:id/pixel-source', requirePermission('photos.view'), async (req, re
   } catch (err) {
     console.error('GET /api/photos/:id/pixel-source error:', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 内网对象存储直连：只在受控的 HTTP 校园网入口启用。公网 HTTPS 页面不能加载 HTTP
+// 对象存储，继续走本站代理，避免浏览器 mixed-content 拦截。
+router.get('/direct-status', requirePermission('photos.view'), (req, res) => {
+  const eligible = canUseDirectStorage(req);
+  return res.json({
+    eligible,
+    reason: eligible ? null : 'DIRECT_STORAGE_REQUIRES_INTERNAL_HTTP_ENTRY',
+  });
+});
+
+router.get('/:id/direct-url', requirePermission('photos.view'), async (req, res) => {
+  try {
+    if (!canUseDirectStorage(req)) {
+      return res.status(409).json({ error: 'DIRECT_STORAGE_UNAVAILABLE' });
+    }
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
+    const row = await getScopedPhotoSourceRow(req, id);
+    if (!row) return res.status(404).json({ error: 'photo not found' });
+
+    const variant = String(req.query.variant || 'original').trim().toLowerCase();
+    if (!['original', 'thumb', 'playback'].includes(variant)) {
+      return res.status(400).json({ error: 'invalid variant' });
+    }
+    const raw = variant === 'thumb'
+      ? (row.thumbUrl || row.url)
+      : (variant === 'playback' ? (row.playbackUrl || row.url || row.thumbUrl) : (row.url || row.thumbUrl));
+    const key = cosStorage.keyFromUrlOrPath(raw);
+    if (!key) return res.status(404).json({ error: 'photo source not found' });
+
+    const download = String(req.query.download || '') === '1';
+    const fallbackName = `${String(row.title || `photo-${id}`).replace(/[\\/:*?"<>|]/g, '_') || `photo-${id}`}${getExtFromStorageKey(key)}`;
+    const signed = await cosStorage.signedGetUrl(key, {
+      expires: Math.max(60, Number(process.env.COS_SIGNED_READ_EXPIRES_SECONDS || 900)),
+      downloadName: download ? fallbackName : undefined,
+    });
+    return res.json({
+      url: signed.signedUrl,
+      expiresIn: signed.expiresIn,
+      variant,
+    });
+  } catch (err) {
+    console.error('GET /api/photos/:id/direct-url error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'DIRECT_STORAGE_FAILED' });
   }
 });
 

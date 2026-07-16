@@ -15,6 +15,7 @@
     "face:backfill": "node scripts/backfill_faces.js",
     "image:backfill": "node scripts/backfill_image_embeddings.js",
     "video:playback:backfill": "node scripts/backfill_video_playback.js",
+    "storage:cors": "node scripts/configure_storage_cors.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "ai:tags:backfill": "node scripts/backfill_ai_tags.js"
   },
@@ -24,6 +25,7 @@
   "type": "commonjs",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1075.0",
+    "@aws-sdk/lib-storage": "3.1075.0",
     "@aws-sdk/s3-request-presigner": "^3.1075.0",
     "archiver": "^7.0.1",
     "axios": "^1.13.3",
