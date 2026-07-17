@@ -17,6 +17,7 @@
     "video:playback:backfill": "node scripts/backfill_video_playback.js",
     "storage:cors": "node scripts/configure_storage_cors.js",
     "test": "echo \"Error: no test specified\" && exit 1",
+    "test:ai-timeout": "node scripts/test_ai_request_timeout.js",
     "ai:tags:backfill": "node scripts/backfill_ai_tags.js"
   },
   "keywords": [],

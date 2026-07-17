@@ -239,39 +239,85 @@ async function fetchBinary(url, opts = {}) {
 
 async function postJson(url, payload, timeoutMs) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let request = null;
+    let deadlineTimer = null;
+
+    const clearDeadline = () => {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      reject(err);
+    };
+    const succeed = (value) => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      resolve(value);
+    };
+
     try {
       const u = new URL(url);
       const lib = u.protocol === 'https:' ? https : http;
       const body = Buffer.from(JSON.stringify(payload));
-      const req = lib.request(u, {
+      const totalTimeoutMs = Math.max(100, Number(timeoutMs) || 120000);
+      request = lib.request(u, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           'content-length': body.length,
         },
-        timeout: timeoutMs,
+        timeout: totalTimeoutMs,
       }, (res) => {
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          if (settled) return;
           const text = Buffer.concat(chunks).toString('utf8');
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject(new Error(`HTTP ${res.statusCode}: ${text.slice(0, 1000)}`));
+            const err = new Error(`HTTP ${res.statusCode}: ${text.slice(0, 1000)}`);
+            err.statusCode = res.statusCode;
+            fail(err);
             return;
           }
           try {
-            resolve(JSON.parse(text));
+            succeed(JSON.parse(text));
           } catch (e) {
-            reject(new Error('Invalid JSON response: ' + text.slice(0, 1000)));
+            fail(new Error('Invalid JSON response: ' + text.slice(0, 1000)));
           }
         });
+        res.on('aborted', () => {
+          const err = new Error('AI response aborted');
+          err.code = 'AI_REQUEST_ABORTED';
+          fail(err);
+        });
+        res.on('error', fail);
       });
-      req.on('timeout', () => req.destroy(new Error('Request timeout')));
-      req.on('error', reject);
-      req.write(body);
-      req.end();
+      // request timeout 只覆盖 socket 空闲；模型推理时会保持连接但长期无响应。
+      // 总时限确保单张图绝不会永久占住串行分析队列。
+      deadlineTimer = setTimeout(() => {
+        const err = new Error(`AI request deadline exceeded after ${totalTimeoutMs}ms`);
+        err.code = 'AI_REQUEST_TIMEOUT';
+        if (request) request.destroy(err);
+        fail(err);
+      }, totalTimeoutMs);
+      request.on('timeout', () => {
+        const err = new Error(`AI request socket timeout after ${totalTimeoutMs}ms`);
+        err.code = 'AI_REQUEST_TIMEOUT';
+        request.destroy(err);
+        fail(err);
+      });
+      request.on('error', fail);
+      request.write(body);
+      request.end();
     } catch (e) {
-      reject(e);
+      fail(e);
     }
   });
 }
@@ -627,4 +673,5 @@ module.exports = {
   analyzeWithOllama,
   analyzeWithDashScope,
   callOllamaGenerate,
+  postJson,
 };

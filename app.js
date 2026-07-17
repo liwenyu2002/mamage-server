@@ -181,6 +181,18 @@ async function startup() {
         console.warn('AI requeue on boot failed:', e && e.message ? e.message : e);
       }
     }, 15000);
+
+    // 运行中的服务也要兜底扫描：上传过程中短暂重启、内存队列异常或模型断连后，
+    // 遗留的 pending/running 任务能自行回到队列，不必等待下一次部署重启。
+    const requeueIntervalMs = Math.max(30000, Math.min(3600000, Number(process.env.AI_REQUEUE_INTERVAL_MS) || 120000));
+    const requeueTimer = setInterval(() => {
+      try {
+        require('./lib/ai_tags_worker').requeueStuckPhotos({ limit: Number(process.env.AI_REQUEUE_LIMIT) || 200 });
+      } catch (e) {
+        console.warn('AI periodic requeue failed:', e && e.message ? e.message : e);
+      }
+    }, requeueIntervalMs);
+    if (typeof requeueTimer.unref === 'function') requeueTimer.unref();
   }
 }
 
