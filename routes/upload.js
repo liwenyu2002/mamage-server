@@ -474,6 +474,7 @@ function enqueueDirectVideoPostProcess({ sourceKey, mimeType, thumbKey, thumbRel
     let preparedVideo = null;
     let posterImage = null;
     let playbackVideo = null;
+    let posterReadyForAnalysis = false;
     try {
       const head = await cosStorage.headObject(sourceKey);
       const sourceBytes = Number(head && head.ContentLength) || 0;
@@ -505,8 +506,16 @@ function enqueueDirectVideoPostProcess({ sourceKey, mimeType, thumbKey, thumbRel
             'UPDATE photos SET thumb_url = ? WHERE id = ? AND (thumb_url IS NULL OR thumb_url = \'\')',
             [thumbRel, insertedId]
           );
-          if (!posterUpdate || !posterUpdate.affectedRows) await cosStorage.deleteObjects([thumbKey]).catch(() => null);
+          if (!posterUpdate || !posterUpdate.affectedRows) {
+            await cosStorage.deleteObjects([thumbKey]).catch(() => null);
+          } else {
+            posterReadyForAnalysis = true;
+          }
         }
+      }
+      // 封面就绪即可进行低优先级语义分析，不必等更耗时的播放转码完成。
+      if (posterReadyForAnalysis) {
+        await enableVideoSemanticAnalysis({ insertedId, thumbRel });
       }
 
       if (VIDEO_PLAYBACK_ENABLED && playbackKey && playbackRel) {
@@ -1033,8 +1042,39 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
   }
 }
 
-function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, playbackRel, playbackQueued, title, type, mediaType, photographerId, photographerName }) {
+function enqueueVideoSemanticAnalysis({ insertedId, thumbRel }) {
+  if (!insertedId || !thumbRel) return false;
+  try {
+    const aiWorker = require('../lib/ai_tags_worker');
+    // 视频语义只看转码生成的封面帧，并放到低优先级队列；照片、人脸等常规任务优先。
+    aiWorker.enqueue({ id: insertedId, relPath: thumbRel, isVideo: true, priority: 'low' });
+    return true;
+  } catch (err) {
+    console.error('[upload.video] enqueue semantic analysis failed:', err && err.message ? err.message : err);
+    return false;
+  }
+}
+
+async function enableVideoSemanticAnalysis({ insertedId, thumbRel }) {
+  if (!insertedId || !thumbRel) return false;
+  try {
+    const [result] = await pool.query(
+      `UPDATE photos
+       SET ai_status = 'pending', ai_error = NULL, ai_started_at = NULL, ai_finished_at = NULL
+       WHERE id = ? AND type = 'video'`,
+      [insertedId]
+    );
+    if (!result || !result.affectedRows) return false;
+    return enqueueVideoSemanticAnalysis({ insertedId, thumbRel });
+  } catch (err) {
+    console.error('[upload.video] enable semantic analysis failed:', insertedId, err && err.message ? err.message : err);
+    return false;
+  }
+}
+
+function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath, thumbRel, playbackRel, playbackQueued, title, type, mediaType, aiStatus, photographerId, photographerName }) {
   const isVideo = type === 'video' || mediaType === 'video';
+  const resolvedAiStatus = aiStatus || (isVideo ? 'skipped' : 'pending');
   // 只有真正排了转码任务才报 transcoding，否则（如 VIDEO_PLAYBACK_ENABLED=0）前端会白等占位
   const processingStatus = isVideo && !playbackRel && playbackQueued ? 'transcoding' : null;
   return {
@@ -1053,8 +1093,8 @@ function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath
     media_type: mediaType || (isVideo ? 'video' : 'image'),
     processingStatus,
     processing_status: processingStatus,
-    aiStatus: isVideo ? 'skipped' : 'pending',
-    ai_status: isVideo ? 'skipped' : 'pending',
+    aiStatus: resolvedAiStatus,
+    ai_status: resolvedAiStatus,
     photographerId: photographerId || null,
     photographerName: photographerName || null,
   };
@@ -1285,7 +1325,7 @@ async function processVideoUpload(req, res) {
         relPath,
         thumbRel: playbackThumbRel,
         playbackRel: webPlaybackRel,
-        aiStatus: 'skipped',
+        aiStatus: playbackThumbRel ? 'pending' : 'skipped',
         photographerId,
         orgId,
       });
@@ -1304,6 +1344,9 @@ async function processVideoUpload(req, res) {
     });
 
     const photographerName = await getPhotographerName(photographerId);
+    if (playbackThumbRel) {
+      enqueueVideoSemanticAnalysis({ insertedId, thumbRel: playbackThumbRel });
+    }
     playbackJobScheduled = enqueueVideoPlaybackTranscode({
       sourceFilePath: uploadFilePath,
       cleanupPaths: [filePath, processedVideo && processedVideo.cleanupPath],
@@ -1335,6 +1378,7 @@ async function processVideoUpload(req, res) {
       title: metadata.title,
       type: 'video',
       mediaType: 'video',
+      aiStatus: playbackThumbRel ? 'pending' : 'skipped',
       photographerId,
       photographerName,
     }));
@@ -1578,7 +1622,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
     return res.json(makeResponsePayload({
       insertedId, projectId: session.metadata.projectId, timelineSectionId: session.metadata.timelineSectionId,
       relPath: session.relPath, thumbRel: null, playbackRel: null, playbackQueued,
-      title: session.metadata.title, type: 'video', mediaType: 'video', photographerId, photographerName,
+      title: session.metadata.title, type: 'video', mediaType: 'video', aiStatus: 'skipped', photographerId, photographerName,
     }));
   } catch (err) {
     if (session) {
