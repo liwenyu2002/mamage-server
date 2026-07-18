@@ -1178,8 +1178,14 @@ router.post('/faces/find-me/share', (req, res) => {
       }
 
       const result = await findMe(req.file && req.file.buffer, scope);
-      // 公开口不外泄人物姓名/内部 id，只表达"已按人物档案聚合"
-      if (result && result.person) result.person = { matched: true, bestSim: result.person.bestSim };
+      // 分享者明确开放“拍照找我”后，返回命中的人物档案姓名用于提示；不暴露内部人物 id。
+      if (result && result.person) {
+        result.person = {
+          matched: true,
+          bestSim: result.person.bestSim,
+          name: result.person.name || null,
+        };
+      }
       return res.json(result);
     } catch (err) {
       return findMeErrorResponse(res, err);
