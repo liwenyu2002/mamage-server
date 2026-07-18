@@ -175,6 +175,7 @@ CREATE TABLE `photos` (
   `project_id` int unsigned DEFAULT NULL COMMENT '关联项目ID，指向 projects.id',
   `url` varchar(255) NOT NULL COMMENT '原图相对 URL',
   `thumb_url` varchar(255) DEFAULT NULL COMMENT '缩略图相对 URL',
+  `public_download_url` varchar(255) DEFAULT NULL COMMENT '公网下载版相对 URL（全尺寸，最多 5MB）',
   `title` varchar(200) DEFAULT NULL COMMENT '标题',
   `tags` json DEFAULT NULL COMMENT '标签 JSON，比如 ["毕业","合影"]',
   `type` varchar(50) NOT NULL DEFAULT 'normal' COMMENT '类型，如 normal/cover 等',

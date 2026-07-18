@@ -824,6 +824,7 @@ router.get('/:id', async (req, res) => {
         ph.timeline_section_id AS timelineSectionId,
         ph.url,
         ph.thumb_url AS thumbUrl,
+        ph.public_download_url AS publicDownloadUrl,
         ph.playback_url AS playbackUrl,
         /* local_path column removed from schema; do not select it */
         ph.title,
@@ -875,6 +876,7 @@ router.get('/:id', async (req, res) => {
       ...p,
       url: p.url ? buildUploadUrl(p.url) : null,
       thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
+      publicDownloadUrl: p.publicDownloadUrl ? buildUploadUrl(p.publicDownloadUrl) : null,
       playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
       playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
       fullUrl: p.url ? buildUploadUrl(p.url) : null,
@@ -1397,7 +1399,7 @@ router.delete('/:id', requirePermission('projects.delete'), async (req, res) => 
       }
 
       const [photoRows] = await conn.query(
-        `SELECT id, url, thumb_url AS thumbUrl, playback_url AS playbackUrl
+        `SELECT id, url, thumb_url AS thumbUrl, public_download_url AS publicDownloadUrl, playback_url AS playbackUrl
          FROM photos
          WHERE project_id = ?`,
         [id]

@@ -302,6 +302,7 @@ router.get('/:code', async (req, res) => {
 							pts.section_time  AS timelineSectionTime,
 							p.url,
 							p.thumb_url       AS thumbUrl,
+							p.public_download_url AS publicDownloadUrl,
 						p.playback_url    AS playbackUrl,
 						p.title,
 						p.description,
@@ -333,6 +334,7 @@ router.get('/:code', async (req, res) => {
 							pts.section_time  AS timelineSectionTime,
 							p.url,
 						p.thumb_url       AS thumbUrl,
+						p.public_download_url AS publicDownloadUrl,
 						p.playback_url    AS playbackUrl,
 						p.title,
 						p.description,
@@ -360,6 +362,7 @@ router.get('/:code', async (req, res) => {
             ...p,
             url: p.url ? buildUploadUrl(p.url) : null,
             thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
+            publicDownloadUrl: p.publicDownloadUrl ? buildUploadUrl(p.publicDownloadUrl) : null,
             playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
             playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null
         }));

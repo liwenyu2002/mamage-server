@@ -654,7 +654,7 @@ async function renderAdjustedPhotoBuffer(inputBuffer, adjustments, options = {})
 
 async function getScopedPhotoSourceRow(req, id) {
   const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
-  let sql = 'SELECT id, url, thumb_url AS thumbUrl, playback_url AS playbackUrl, title, type, adjustments FROM photos WHERE id = ?';
+  let sql = 'SELECT id, url, thumb_url AS thumbUrl, public_download_url AS publicDownloadUrl, playback_url AS playbackUrl, title, type, adjustments FROM photos WHERE id = ?';
   const params = [id];
   if (orgId === null) {
     sql += ' AND organization_id IS NULL';
@@ -1086,7 +1086,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
     try {
       await conn.beginTransaction();
 
-      let selSql = 'SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, playback_url AS playbackUrl FROM photos WHERE id IN (?)';
+      let selSql = 'SELECT id, project_id AS projectId, url, thumb_url AS thumbUrl, public_download_url AS publicDownloadUrl, playback_url AS playbackUrl FROM photos WHERE id IN (?)';
       const selParams = [ids];
       if (orgId === null) {
         selSql += ' AND organization_id IS NULL';
@@ -2032,12 +2032,14 @@ router.get('/:id/direct-url', requirePermission('photos.view'), async (req, res)
     if (!row) return res.status(404).json({ error: 'photo not found' });
 
     const variant = String(req.query.variant || 'original').trim().toLowerCase();
-    if (!['original', 'thumb', 'playback'].includes(variant)) {
+    if (!['original', 'thumb', 'public', 'playback'].includes(variant)) {
       return res.status(400).json({ error: 'invalid variant' });
     }
     const raw = variant === 'thumb'
       ? (row.thumbUrl || row.url)
-      : (variant === 'playback' ? (row.playbackUrl || row.url || row.thumbUrl) : (row.url || row.thumbUrl));
+      : (variant === 'public'
+        ? (row.publicDownloadUrl || row.url || row.thumbUrl)
+        : (variant === 'playback' ? (row.playbackUrl || row.url || row.thumbUrl) : (row.url || row.thumbUrl)));
     const key = cosStorage.keyFromUrlOrPath(raw);
     if (!key) return res.status(404).json({ error: 'photo source not found' });
 
@@ -2077,6 +2079,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         pts.section_time AS timelineSectionTime,
         p.url,
         p.thumb_url AS thumbUrl,
+        p.public_download_url AS publicDownloadUrl,
         p.playback_url AS playbackUrl,
         p.title,
         p.description,
@@ -2132,6 +2135,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       timelineSectionTime: p.timelineSectionTime || null,
       url: resolveUrl(p.url),
       thumbUrl: resolveUrl(p.thumbUrl),
+      publicDownloadUrl: resolveUrl(p.publicDownloadUrl),
       playbackUrl: resolveUrl(p.playbackUrl),
       playback_url: resolveUrl(p.playbackUrl),
       title: p.title,
@@ -2228,7 +2232,7 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
     const [rows] = await pool.query(
       `SELECT p.id, p.project_id AS projectId, p.timeline_section_id AS timelineSectionId,
               pts.name AS timelineSectionName, pts.section_time AS timelineSectionTime,
-              p.url, p.thumb_url AS thumbUrl, p.playback_url AS playbackUrl, p.title, p.description, p.adjustments, p.tags,
+              p.url, p.thumb_url AS thumbUrl, p.public_download_url AS publicDownloadUrl, p.playback_url AS playbackUrl, p.title, p.description, p.adjustments, p.tags,
               ai_status AS aiStatus, ai_error AS aiError,
               ai_started_at AS aiStartedAt, ai_finished_at AS aiFinishedAt
        FROM photos p
@@ -2251,6 +2255,7 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
       timelineSectionTime: p.timelineSectionTime || null,
       url: buildUploadUrl(p.url),
       thumbUrl: buildUploadUrl(p.thumbUrl),
+      publicDownloadUrl: p.publicDownloadUrl ? buildUploadUrl(p.publicDownloadUrl) : null,
       playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
       playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
       title: p.title,

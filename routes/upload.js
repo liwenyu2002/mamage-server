@@ -14,6 +14,7 @@ const { v4: uuidv4 } = require('uuid');
 const { pool, buildUploadUrl } = require('../db');
 const cosStorage = require('../lib/cos_storage');
 const { requirePermission } = require('../lib/permissions');
+const { createPublicDownloadBuffer, readStreamToBuffer, DEFAULT_MAX_BYTES: DEFAULT_PUBLIC_DOWNLOAD_MAX_BYTES } = require('../lib/public_download_variant');
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +23,10 @@ const MAX_VIDEO_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_VIDEO_M
 const THUMB_MAX_DIMENSION = Math.max(320, Number(process.env.UPLOAD_THUMB_MAX_DIMENSION || process.env.UPLOAD_THUMB_MAX_WIDTH || 800));
 const THUMB_QUALITY = Math.min(95, Math.max(50, Number(process.env.UPLOAD_THUMB_JPEG_QUALITY || 80)));
 const UPLOAD_CACHE_CONTROL = process.env.UPLOAD_CACHE_CONTROL || 'public, max-age=31536000, immutable';
+const PUBLIC_DOWNLOAD_ENABLED = parseEnvBoolean(process.env.PUBLIC_DOWNLOAD_ENABLED) !== false;
+const PUBLIC_DOWNLOAD_MAX_BYTES = Math.max(256 * 1024, envNumber(process.env.PUBLIC_DOWNLOAD_MAX_BYTES, DEFAULT_PUBLIC_DOWNLOAD_MAX_BYTES));
+const PUBLIC_DOWNLOAD_SOURCE_MAX_BYTES = Math.max(PUBLIC_DOWNLOAD_MAX_BYTES, envNumber(process.env.PUBLIC_DOWNLOAD_SOURCE_MAX_BYTES, 128 * 1024 * 1024));
+const PUBLIC_DOWNLOAD_CONCURRENCY = Math.max(1, Math.min(2, envNumber(process.env.PUBLIC_DOWNLOAD_CONCURRENCY, 1)));
 const SIGNED_UPLOAD_EXPIRES_SECONDS = Number(process.env.COS_SIGNED_UPLOAD_EXPIRES_SECONDS || 900);
 const UPLOAD_TIMING_LOGS = parseEnvBoolean(process.env.UPLOAD_TIMING_LOGS) === true;
 const VIDEO_FASTSTART_ENABLED = parseEnvBoolean(process.env.VIDEO_FASTSTART_ENABLED) !== false;
@@ -390,6 +395,10 @@ const VIDEO_PLAYBACK_CONCURRENCY = Math.max(1, envNumber(process.env.VIDEO_PLAYB
 let playbackJobsActive = 0;
 const playbackJobsWaiting = [];
 
+// 下载版与视频转码分开排队：图片压缩只跑一条，避免和人脸/视频任务争抢 CPU 与内存。
+let publicDownloadJobsActive = 0;
+const publicDownloadJobsWaiting = [];
+
 function drainPlaybackQueue() {
   while (playbackJobsActive < VIDEO_PLAYBACK_CONCURRENCY && playbackJobsWaiting.length) {
     const job = playbackJobsWaiting.shift();
@@ -402,6 +411,69 @@ function drainPlaybackQueue() {
         drainPlaybackQueue();
       });
   }
+}
+
+function drainPublicDownloadQueue() {
+  while (publicDownloadJobsActive < PUBLIC_DOWNLOAD_CONCURRENCY && publicDownloadJobsWaiting.length) {
+    const job = publicDownloadJobsWaiting.shift();
+    publicDownloadJobsActive += 1;
+    Promise.resolve()
+      .then(job)
+      .catch((err) => console.error('[upload.public-download] job crashed:', err && err.stack ? err.stack : err))
+      .finally(() => {
+        publicDownloadJobsActive -= 1;
+        drainPublicDownloadQueue();
+      });
+  }
+}
+
+function buildPublicDownloadKeyFromOriginalKey(originalKey) {
+  const normalized = cosStorage.normalizeKey(originalKey);
+  const ext = path.posix.extname(normalized);
+  const stem = path.posix.basename(normalized, ext);
+  return `${path.posix.dirname(normalized)}/public/public_${stem}.jpg`;
+}
+
+function enqueuePublicDownloadDerivative({ insertedId, sourceKey, publicDownloadKey, publicDownloadRel }) {
+  if (!PUBLIC_DOWNLOAD_ENABLED || !insertedId || !sourceKey || !publicDownloadKey || !publicDownloadRel) return false;
+
+  publicDownloadJobsWaiting.push(async () => {
+    let uploaded = false;
+    try {
+      const source = await cosStorage.getObject(sourceKey);
+      const originalBuffer = await readStreamToBuffer(source && source.Body, { maxBytes: PUBLIC_DOWNLOAD_SOURCE_MAX_BYTES });
+      const output = await createPublicDownloadBuffer(originalBuffer, { maxBytes: PUBLIC_DOWNLOAD_MAX_BYTES });
+      await cosStorage.uploadBuffer(publicDownloadKey, output.buffer, {
+        contentType: 'image/jpeg',
+        cacheControl: UPLOAD_CACHE_CONTROL,
+      });
+      uploaded = true;
+
+      const [update] = await pool.query(
+        "UPDATE photos SET public_download_url = ? WHERE id = ? AND (public_download_url IS NULL OR public_download_url = '')",
+        [publicDownloadRel, insertedId]
+      );
+      if (!update || !update.affectedRows) {
+        const [rows] = await pool.query('SELECT public_download_url AS publicDownloadUrl FROM photos WHERE id = ? LIMIT 1', [insertedId]);
+        const current = rows && rows[0] ? rows[0].publicDownloadUrl : null;
+        if (current !== publicDownloadRel) await cosStorage.deleteObjects([publicDownloadKey]).catch(() => null);
+        return;
+      }
+
+      console.log('[upload.public-download] ready', {
+        photoId: insertedId,
+        bytes: output.bytes,
+        quality: output.quality,
+        width: output.width,
+        height: output.height,
+      });
+    } catch (err) {
+      if (uploaded) await cosStorage.deleteObjects([publicDownloadKey]).catch(() => null);
+      console.error('[upload.public-download] failed:', insertedId, err && err.stack ? err.stack : err);
+    }
+  });
+  drainPublicDownloadQueue();
+  return true;
 }
 
 async function tmpDirFreeBytes() {
@@ -622,15 +694,20 @@ function buildObjectKeys(projectId, originalName, mimeType, mediaType = 'image')
   const thumbKey = mediaType === 'video'
     ? `${keyPrefix}/previews/poster_${path.basename(filename, ext)}.jpg`
     : `${keyPrefix}/thumbs/thumb_${path.basename(filename, ext)}.jpg`;
+  const publicDownloadKey = mediaType === 'image'
+    ? `${keyPrefix}/public/public_${path.basename(filename, ext)}.jpg`
+    : null;
   const playbackKey = mediaType === 'video'
     ? `${keyPrefix}/playback/playback_${path.basename(filename, ext)}.mp4`
     : null;
   return {
     originalKey,
     thumbKey,
+    publicDownloadKey,
     playbackKey,
     relPath: `/${originalKey}`,
     thumbRel: thumbKey ? `/${thumbKey}` : null,
+    publicDownloadRel: publicDownloadKey ? `/${publicDownloadKey}` : null,
     playbackRel: playbackKey ? `/${playbackKey}` : null,
   };
 }
@@ -1161,7 +1238,7 @@ async function processUpload(req, res) {
     timings.scopeMs = nowMs() - startMs;
 
     const mimeType = inferImageMime(req.file.mimetype, req.file.originalname);
-    const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType);
+    const { originalKey, thumbKey, publicDownloadKey, relPath, thumbRel, publicDownloadRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType);
 
     let thumbBuffer = null;
     try {
@@ -1217,6 +1294,7 @@ async function processUpload(req, res) {
 
     const photographerName = await getPhotographerName(photographerId);
     enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographerId });
+    enqueuePublicDownloadDerivative({ insertedId, sourceKey: originalKey, publicDownloadKey, publicDownloadRel });
     setImmediate(() => {
       appendPhotoIdToProjectBestEffort(metadata.projectId, insertedId).catch((err) => {
         console.warn('[upload] project photo_ids async sync failed:', err && err.message ? err.message : err);
@@ -1498,6 +1576,13 @@ router.post('/photo/direct/complete', requirePermission('upload.photo'), async (
 
     const photographerName = await getPhotographerName(photographerId);
     enqueuePostUploadJobs({ insertedId, thumbRel: `/${thumbKey}`, thumbBuffer: null, photographerId });
+    const publicDownloadKey = buildPublicDownloadKeyFromOriginalKey(originalKey);
+    enqueuePublicDownloadDerivative({
+      insertedId,
+      sourceKey: originalKey,
+      publicDownloadKey,
+      publicDownloadRel: `/${publicDownloadKey}`,
+    });
     setImmediate(() => {
       appendPhotoIdToProjectBestEffort(metadata.projectId, insertedId).catch((err) => {
         console.warn('[upload] project photo_ids async sync failed:', err && err.message ? err.message : err);

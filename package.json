@@ -18,6 +18,7 @@
     "storage:cors": "node scripts/configure_storage_cors.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:ai-timeout": "node scripts/test_ai_request_timeout.js",
+    "test:public-download": "node scripts/test_public_download_variant.js",
     "ai:tags:backfill": "node scripts/backfill_ai_tags.js"
   },
   "keywords": [],
