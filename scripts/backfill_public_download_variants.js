@@ -22,6 +22,7 @@ const limit = Math.max(0, Number(argValue('--limit', '0')) || 0);
 const dryRun = args.includes('--dry-run');
 const maxBytes = Math.max(256 * 1024, Number(argValue('--max-bytes', process.env.PUBLIC_DOWNLOAD_MAX_BYTES || DEFAULT_MAX_BYTES)) || DEFAULT_MAX_BYTES);
 const sourceMaxBytes = Math.max(maxBytes, Number(process.env.PUBLIC_DOWNLOAD_SOURCE_MAX_BYTES || 128 * MB) || 128 * MB);
+const priorityProjectName = String(argValue('--priority-project', process.env.PUBLIC_DOWNLOAD_PRIORITY_PROJECT || '团代会')).trim();
 
 function buildPublicKey(originalKey) {
   const normalized = cosStorage.normalizeKey(originalKey);
@@ -54,9 +55,22 @@ async function runOne(row) {
 async function main() {
   if (!cosStorage.isConfigured()) throw new Error('OBJECT_STORAGE_NOT_CONFIGURED');
   const clauses = ["(public_download_url IS NULL OR public_download_url = '')", "(type IS NULL OR type <> 'video')"];
-  const sql = `SELECT id, url FROM photos WHERE ${clauses.join(' AND ')} ORDER BY id ASC${limit ? ' LIMIT ?' : ''}`;
-  const [rows] = await pool.query(sql, limit ? [limit] : []);
-  console.log(`[public-download-backfill] candidates=${rows.length} target=${(maxBytes / MB).toFixed(2)}MB dryRun=${dryRun}`);
+  const params = [];
+  let prioritySql = '0';
+  if (priorityProjectName) {
+    prioritySql = 'CASE WHEN p.name LIKE ? THEN 0 ELSE 1 END';
+    params.push(`%${priorityProjectName}%`);
+  }
+  const sql = `
+    SELECT ph.id, ph.url, p.name AS projectName
+    FROM photos ph
+    LEFT JOIN projects p ON p.id = ph.project_id
+    WHERE ${clauses.map((clause) => clause.replace(/\bpublic_download_url\b/g, 'ph.public_download_url').replace(/\btype\b/g, 'ph.type')).join(' AND ')}
+    ORDER BY ${prioritySql}, ph.id ASC${limit ? ' LIMIT ?' : ''}
+  `;
+  if (limit) params.push(limit);
+  const [rows] = await pool.query(sql, params);
+  console.log(`[public-download-backfill] candidates=${rows.length} target=${(maxBytes / MB).toFixed(2)}MB priority=${priorityProjectName || 'none'} dryRun=${dryRun}`);
 
   let succeeded = 0;
   let failed = 0;
@@ -64,7 +78,7 @@ async function main() {
     try {
       const result = await runOne(row);
       succeeded += 1;
-      console.log(`[public-download-backfill] photo=${result.id} ${result.dryRun ? result.publicRel : `${(result.bytes / MB).toFixed(2)}MB q=${result.quality} updated=${result.updated}`}`);
+      console.log(`[public-download-backfill] photo=${result.id} project=${row.projectName || '未归档'} ${result.dryRun ? result.publicRel : `${(result.bytes / MB).toFixed(2)}MB q=${result.quality} updated=${result.updated}`}`);
     } catch (err) {
       failed += 1;
       console.error(`[public-download-backfill] photo=${row.id} failed:`, err && err.message ? err.message : err);
