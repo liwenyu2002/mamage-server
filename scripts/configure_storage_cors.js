@@ -4,7 +4,7 @@ const storage = require('../lib/cos_storage');
 
 const defaultOrigins = [
   'http://10.100.83.67:3000',
-  'http://10.11.12.63:3000',
+  'http://10.100.65.147:3000',
 ];
 
 function getOrigins() {
