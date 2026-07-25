@@ -157,7 +157,9 @@ async function generateFromPrompt({ prompt, options }) {
   }
 
   {
-    const baseURL = process.env.DASHSCOPE_BASE_URL || process.env.AI_TEXT_BASE_URL || undefined;
+    // Text and vision providers are independent. Prefer the dedicated text base URL
+    // so switching the news/search model never redirects the local vision pipeline.
+    const baseURL = process.env.AI_TEXT_BASE_URL || process.env.DASHSCOPE_BASE_URL || undefined;
     const client = baseURL ? new OpenAI({ apiKey, baseURL }) : new OpenAI({ apiKey });
 
     const systemPrompt = buildSystemPrompt(options);

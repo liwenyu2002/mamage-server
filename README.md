@@ -133,6 +133,7 @@ UPLOAD_SKIP_LOCAL_FILE_CHECK=1
 ```env
 # 文本生成（AI 新闻）
 OPENAI_API_KEY= 或 AI_TEXT_API_KEY=
+AI_TEXT_BASE_URL=  # 可选，OpenAI 兼容文本接口基址，例如 https://example.com/v1
 AI_TEXT_MODEL=
 
 # 视觉分析（AI 打标）：本地 Ollama（推荐，省云端视觉费用）

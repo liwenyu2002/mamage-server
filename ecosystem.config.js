@@ -46,6 +46,7 @@ module.exports = {
         DASHSCOPE_BASE_URL: process.env.DASHSCOPE_BASE_URL || '',
         OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
         AI_TEXT_API_KEY: process.env.AI_TEXT_API_KEY || '',
+        AI_TEXT_BASE_URL: process.env.AI_TEXT_BASE_URL || '',
         AI_TEXT_MODEL: process.env.AI_TEXT_MODEL || '',
         AI_VISION_PROVIDER: process.env.AI_VISION_PROVIDER || 'dashscope',
         AI_VISION_MODEL: process.env.AI_VISION_MODEL || 'qwen2-vl-72b-instruct',
