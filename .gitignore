@@ -2,7 +2,6 @@ node_modules/
 .vscode/
 uploads/
 .env
-.env.example
 *.log
 .DS_Store
 __pycache__/

@@ -1,10 +1,11 @@
 ﻿# MaMage Server
 
-Node.js + Express + MySQL 的图片管理后端服务。
+Node.js + Express + MySQL 的全媒体管理后端服务，统一承载图库、文本生成、视频工程、对象存储和 FFmpeg 渲染。
 
 - 默认端口：`8000`
 - 健康检查：`GET /api/health` -> `{ "status": "ok" }`
 - 前端对接文档：[`docs/API.md`](./docs/API.md)
+- 生产整合版更新：[`RELEASE_NOTES.md`](./RELEASE_NOTES.md)
 
 ---
 
@@ -20,6 +21,9 @@ Node.js + Express + MySQL 的图片管理后端服务。
 - 相似图分组（基于 embedding）
 - AI 新闻生成（可选）
 - AI 图片打标（可选）
+- 视频工程、素材上传和自动保存
+- AI 视频编排与自动粗剪
+- FFmpeg 视频渲染和 Bucket 成品存储
 
 ---
 
@@ -133,7 +137,6 @@ UPLOAD_SKIP_LOCAL_FILE_CHECK=1
 ```env
 # 文本生成（AI 新闻）
 OPENAI_API_KEY= 或 AI_TEXT_API_KEY=
-AI_TEXT_BASE_URL=  # 可选，OpenAI 兼容文本接口基址，例如 https://example.com/v1
 AI_TEXT_MODEL=
 
 # 视觉分析（AI 打标）：本地 Ollama（推荐，省云端视觉费用）

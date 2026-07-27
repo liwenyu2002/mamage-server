@@ -57,6 +57,8 @@ const photosRouter = require('./routes/photos');
 const uploadRouter = require('./routes/upload');
 const usersRouter = require('./routes/users');
 const aiNewsRouter = require('./routes/ai_news');
+const aiVideoRouter = require('./routes/ai_video');
+const videoProjectsRouter = require('./routes/video_projects');
 const orgsRouter = require('./routes/organizations');
 const shareRouter = require('./routes/share');
 const similarityRouter = require('./routes/similarity_groups');
@@ -88,7 +90,7 @@ const defaultCorsOrigins = [
   'http://127.0.0.1:5173',
   'http://localhost:5188',
   'http://127.0.0.1:5188',
-  'http://10.100.65.147:3000',
+  'http://10.11.12.63:3000',
   'http://10.100.83.67:3000',
   'https://mamage.wenyuli.site',
   'https://lan.mamage.wenyuli.site',
@@ -108,7 +110,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Private-Network', 'true');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Range,If-None-Match,If-Modified-Since');
   if (req.method === 'OPTIONS') {
     return originAllowed || !origin ? res.status(204).end() : res.status(403).end();
   }
@@ -138,6 +140,8 @@ app.use('/api/photos', photosRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
+app.use('/api/ai/video', aiVideoRouter);
+app.use('/api/video-projects', videoProjectsRouter);
 app.use('/api/wechat-style', wechatStyleRouter);
 app.use('/api/wechat-preview', wechatPreviewRouter);
 app.use('/api/wechat-compositions', wechatCompositionsRouter);

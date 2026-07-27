@@ -18,6 +18,7 @@ module.exports = {
       // 确保在 ECS 启动脚本或 systemd service 中设置了这些环境变量
       env: {
         NODE_ENV: 'production',
+        PORT: process.env.PORT || '3000',
         // 数据库配置
         DB_HOST: process.env.DB_HOST || 'localhost',
         DB_PORT: process.env.DB_PORT || '3306',
@@ -35,6 +36,21 @@ module.exports = {
         COS_BUCKET: process.env.COS_BUCKET || '',
         COS_REGION: process.env.COS_REGION || '',
         COS_BASE_URL: process.env.COS_BASE_URL || '',
+        COS_FORCE_PATH_STYLE: process.env.COS_FORCE_PATH_STYLE || '1',
+        COS_TLS_REJECT_UNAUTHORIZED: process.env.COS_TLS_REJECT_UNAUTHORIZED || '1',
+        MEDIA_URL_SIGNING: process.env.MEDIA_URL_SIGNING || '1',
+        MEDIA_URL_SECRET: process.env.MEDIA_URL_SECRET || '',
+        MEDIA_URL_TTL_DAYS: process.env.MEDIA_URL_TTL_DAYS || '8',
+        IMAGE_PROXY_KEY_PREFIXES: process.env.IMAGE_PROXY_KEY_PREFIXES || 'uploads/',
+
+        // 视频编辑器：临时工作目录必须位于代码目录之外
+        VIDEO_WORK_DIR: process.env.VIDEO_WORK_DIR || '/home/liwy/mamage-data/video-work',
+        VIDEO_WORK_MAX_AGE_MS: process.env.VIDEO_WORK_MAX_AGE_MS || '86400000',
+        VIDEO_UPLOAD_MAX_MB: process.env.VIDEO_UPLOAD_MAX_MB || '2048',
+        VIDEO_RENDER_CONCURRENCY: process.env.VIDEO_RENDER_CONCURRENCY || '1',
+        VIDEO_RENDER_RECOVER_ON_BOOT: process.env.VIDEO_RENDER_RECOVER_ON_BOOT || '1',
+        FFMPEG_PATH: process.env.FFMPEG_PATH || '/usr/bin/ffmpeg',
+        FFPROBE_PATH: process.env.FFPROBE_PATH || '/usr/bin/ffprobe',
         
         // 本地上传目录（可选）
         UPLOAD_ABS_DIR: process.env.UPLOAD_ABS_DIR || '',
@@ -46,8 +62,9 @@ module.exports = {
         DASHSCOPE_BASE_URL: process.env.DASHSCOPE_BASE_URL || '',
         OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
         AI_TEXT_API_KEY: process.env.AI_TEXT_API_KEY || '',
-        AI_TEXT_BASE_URL: process.env.AI_TEXT_BASE_URL || '',
         AI_TEXT_MODEL: process.env.AI_TEXT_MODEL || '',
+        AI_VIDEO_MODEL: process.env.AI_VIDEO_MODEL || '',
+        VIDEO_AI_REQUIRE_MODEL: process.env.VIDEO_AI_REQUIRE_MODEL || '1',
         AI_VISION_PROVIDER: process.env.AI_VISION_PROVIDER || 'dashscope',
         AI_VISION_MODEL: process.env.AI_VISION_MODEL || 'qwen2-vl-72b-instruct',
         AI_VISION_FALLBACK_PROVIDER: process.env.AI_VISION_FALLBACK_PROVIDER || '',
@@ -62,7 +79,7 @@ module.exports = {
           'http://127.0.0.1:5173',
           'http://localhost:5188',
           'http://127.0.0.1:5188',
-          'http://10.100.65.147:3000',
+          'http://10.11.12.63:3000',
           'http://10.100.83.67:3000',
           'https://mamage.wenyuli.site',
           'https://lan.mamage.wenyuli.site',
@@ -72,8 +89,8 @@ module.exports = {
       },
       
       // ===== 日志配置 =====
-      output: '/Users/liwenyu/mamage-server/logs/out.log',
-      error: '/Users/liwenyu/mamage-server/logs/error.log',
+      output: '/home/liwy/mamage_server/logs/out.log',
+      error: '/home/liwy/mamage_server/logs/error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       
       // ===== 自动重启策略 =====
@@ -83,7 +100,7 @@ module.exports = {
       
       // ===== 优雅关闭 =====
       kill_timeout: 5000,
-      wait_ready: true,
+      wait_ready: false,
       
       // ===== 监听特定端口以判断应用是否就绪 =====
       listen_timeout: 10000
