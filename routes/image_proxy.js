@@ -87,7 +87,8 @@ function setObjectHeaders(res, key, object) {
   if (object.ContentDisposition) res.setHeader('Content-Disposition', object.ContentDisposition);
   if (object.ContentEncoding) res.setHeader('Content-Encoding', object.ContentEncoding);
   res.setHeader('Accept-Ranges', object.AcceptRanges || 'bytes');
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (!res.getHeader('Access-Control-Allow-Origin')) res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges,Content-Length,Content-Range,Content-Type,ETag,Last-Modified');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   res.setHeader('X-Content-Type-Options', 'nosniff');
 }

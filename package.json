@@ -15,10 +15,12 @@
     "face:backfill": "node scripts/backfill_faces.js",
     "image:backfill": "node scripts/backfill_image_embeddings.js",
     "video:playback:backfill": "node scripts/backfill_video_playback.js",
+    "video:validate": "node scripts/validate_video_production.js",
     "storage:cors": "node scripts/configure_storage_cors.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:ai-timeout": "node scripts/test_ai_request_timeout.js",
     "test:public-download": "node scripts/test_public_download_variant.js",
+    "test:video": "node scripts/test_video_production_logic.js",
     "ai:tags:backfill": "node scripts/backfill_ai_tags.js"
   },
   "keywords": [],
