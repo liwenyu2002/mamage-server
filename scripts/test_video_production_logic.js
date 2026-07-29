@@ -41,6 +41,36 @@ async function main() {
     const duration = Number(execFileSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', blankOutput], { encoding: 'utf8' }).trim());
     assert(duration >= 0.2 && duration <= 0.5);
 
+    const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
+    const firstSource = path.join(tempDir, 'first.mp4');
+    const secondSource = path.join(tempDir, 'second.mp4');
+    [
+      [firstSource, 'red'],
+      [secondSource, 'blue'],
+    ].forEach(([target, color]) => execFileSync(ffmpeg, [
+      '-hide_banner', '-y', '-f', 'lavfi', '-i', `color=c=${color}:s=320x320:r=12`, '-t', '0.8',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', target,
+    ], { stdio: 'ignore' }));
+    const transitionOutput = path.join(tempDir, 'transition.mp4');
+    await renderProject({
+      project: {
+        aspectRatio: '1:1',
+        sources: [{ id: 'source-a', assetId: '21' }, { id: 'source-b', assetId: '22' }],
+        clips: [
+          { sourceId: 'source-a', inPoint: 0, outPoint: 0.8, transition: 'none' },
+          { sourceId: 'source-b', inPoint: 0, outPoint: 0.8, transition: 'dissolve' },
+        ],
+      },
+      assetRows: [
+        { id: 21, storage_path: firstSource, duration_seconds: 0.8, has_audio: 0 },
+        { id: 22, storage_path: secondSource, duration_seconds: 0.8, has_audio: 0 },
+      ],
+      outputPath: transitionOutput,
+      options: { width: 320, height: 320, fps: 12, preset: 'ultrafast' },
+    });
+    const transitionDuration = Number(execFileSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', transitionOutput], { encoding: 'utf8' }).trim());
+    assert(transitionDuration >= 1 && transitionDuration <= 1.4, `unexpected transition duration ${transitionDuration}`);
+
     const localMaterialized = await videoStorage.materializeAsset(rows[0], tempDir);
     assert.strictEqual(localMaterialized, fakeVideo);
     console.log('[test:video] production video logic passed');

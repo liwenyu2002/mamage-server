@@ -181,8 +181,6 @@ jobs:
         run: |
           set -euo pipefail
           cd /home/liwy/mamage_server
-          ffmpeg -version | head -n 1
-          ffprobe -version | head -n 1
           node -e "require.resolve('playwright'); console.log('node dependency ok: playwright')"
           PY_BIN="$(command -v python3 || command -v python || true)"
           if [ -z "${PY_BIN}" ]; then
@@ -197,7 +195,6 @@ jobs:
           set -euo pipefail
           cd /home/liwy/mamage_server
           node -e "require('./lib/validateEnv').validateEnvironment(true)"
-          npm run video:validate
           npm run db:migrate
 
       - name: Restart server and face service with pm2

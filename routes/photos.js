@@ -52,7 +52,7 @@ const ZIP_TICKET_TTL_MS = Math.max(15000, Number(process.env.PHOTO_ZIP_TICKET_TT
 const zipDownloadTickets = new Map();
 const DIRECT_STORAGE_READ_ENABLED = String(process.env.DIRECT_STORAGE_READ_ENABLED || '1').trim() !== '0';
 const DIRECT_STORAGE_ALLOWED_HOSTS = new Set(String(
-  process.env.DIRECT_STORAGE_ALLOWED_HOSTS || '10.100.83.67,10.11.12.63'
+  process.env.DIRECT_STORAGE_ALLOWED_HOSTS || '10.100.83.67,10.100.65.147'
 ).split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 const DIRECT_ZIP_JOB_TTL_MS = Math.max(5 * 60 * 1000, Number(process.env.DIRECT_ZIP_JOB_TTL_MS || 30 * 60 * 1000));
 const DIRECT_ZIP_MAX_CONCURRENCY = Math.max(1, Number(process.env.DIRECT_ZIP_MAX_CONCURRENCY || 1));

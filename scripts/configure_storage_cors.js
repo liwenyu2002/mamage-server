@@ -3,8 +3,14 @@ require('dotenv').config();
 const storage = require('../lib/cos_storage');
 
 const defaultOrigins = [
+  'https://mamage.wenyuli.site',
+  'http://mamage.wenyuli.site',
   'http://10.100.83.67:3000',
-  'http://10.11.12.63:3000',
+  'http://10.100.65.147:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5188',
+  'http://127.0.0.1:5188',
 ];
 
 function getOrigins() {

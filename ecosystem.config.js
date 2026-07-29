@@ -1,7 +1,8 @@
 // ecosystem.config.js
 // PM2 生态配置文件
 // 在 ECS 上使用此配置可以自动从系统环境变量读取密钥并注入到应用进程
-require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 module.exports = {
   apps: [
@@ -18,7 +19,7 @@ module.exports = {
       // 确保在 ECS 启动脚本或 systemd service 中设置了这些环境变量
       env: {
         NODE_ENV: 'production',
-        PORT: process.env.PORT || '3000',
+        PORT: process.env.PORT || '8080',
         // 数据库配置
         DB_HOST: process.env.DB_HOST || 'localhost',
         DB_PORT: process.env.DB_PORT || '3306',
@@ -44,13 +45,16 @@ module.exports = {
         IMAGE_PROXY_KEY_PREFIXES: process.env.IMAGE_PROXY_KEY_PREFIXES || 'uploads/',
 
         // 视频编辑器：临时工作目录必须位于代码目录之外
-        VIDEO_WORK_DIR: process.env.VIDEO_WORK_DIR || '/home/liwy/mamage-data/video-work',
+        VIDEO_WORK_DIR: process.env.VIDEO_WORK_DIR || path.join(process.env.HOME || __dirname, 'mamage-data', 'video-work'),
         VIDEO_WORK_MAX_AGE_MS: process.env.VIDEO_WORK_MAX_AGE_MS || '86400000',
-        VIDEO_UPLOAD_MAX_MB: process.env.VIDEO_UPLOAD_MAX_MB || '2048',
+        VIDEO_UPLOAD_MAX_MB: process.env.VIDEO_UPLOAD_MAX_MB || '5120',
+        VIDEO_DIRECT_UPLOAD_TTL_MINUTES: process.env.VIDEO_DIRECT_UPLOAD_TTL_MINUTES || '30',
+        VIDEO_DIRECT_UPLOAD_MAX_EXPIRES_SECONDS: process.env.VIDEO_DIRECT_UPLOAD_MAX_EXPIRES_SECONDS || '21600',
+        VIDEO_DIRECT_UPLOAD_ESTIMATED_BYTES_PER_SECOND: process.env.VIDEO_DIRECT_UPLOAD_ESTIMATED_BYTES_PER_SECOND || '786432',
         VIDEO_RENDER_CONCURRENCY: process.env.VIDEO_RENDER_CONCURRENCY || '1',
         VIDEO_RENDER_RECOVER_ON_BOOT: process.env.VIDEO_RENDER_RECOVER_ON_BOOT || '1',
-        FFMPEG_PATH: process.env.FFMPEG_PATH || '/usr/bin/ffmpeg',
-        FFPROBE_PATH: process.env.FFPROBE_PATH || '/usr/bin/ffprobe',
+        FFMPEG_PATH: process.env.FFMPEG_PATH || 'ffmpeg',
+        FFPROBE_PATH: process.env.FFPROBE_PATH || 'ffprobe',
         
         // 本地上传目录（可选）
         UPLOAD_ABS_DIR: process.env.UPLOAD_ABS_DIR || '',
@@ -62,9 +66,10 @@ module.exports = {
         DASHSCOPE_BASE_URL: process.env.DASHSCOPE_BASE_URL || '',
         OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
         AI_TEXT_API_KEY: process.env.AI_TEXT_API_KEY || '',
+        AI_TEXT_BASE_URL: process.env.AI_TEXT_BASE_URL || '',
         AI_TEXT_MODEL: process.env.AI_TEXT_MODEL || '',
         AI_VIDEO_MODEL: process.env.AI_VIDEO_MODEL || '',
-        VIDEO_AI_REQUIRE_MODEL: process.env.VIDEO_AI_REQUIRE_MODEL || '1',
+        VIDEO_AI_REQUIRE_MODEL: process.env.VIDEO_AI_REQUIRE_MODEL || '0',
         AI_VISION_PROVIDER: process.env.AI_VISION_PROVIDER || 'dashscope',
         AI_VISION_MODEL: process.env.AI_VISION_MODEL || 'qwen2-vl-72b-instruct',
         AI_VISION_FALLBACK_PROVIDER: process.env.AI_VISION_FALLBACK_PROVIDER || '',
@@ -79,7 +84,7 @@ module.exports = {
           'http://127.0.0.1:5173',
           'http://localhost:5188',
           'http://127.0.0.1:5188',
-          'http://10.11.12.63:3000',
+          'http://10.100.65.147:3000',
           'http://10.100.83.67:3000',
           'https://mamage.wenyuli.site',
           'https://lan.mamage.wenyuli.site',
@@ -89,8 +94,8 @@ module.exports = {
       },
       
       // ===== 日志配置 =====
-      output: '/home/liwy/mamage_server/logs/out.log',
-      error: '/home/liwy/mamage_server/logs/error.log',
+      output: path.join(__dirname, 'logs', 'out.log'),
+      error: path.join(__dirname, 'logs', 'error.log'),
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       
       // ===== 自动重启策略 =====
