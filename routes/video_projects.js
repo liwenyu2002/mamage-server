@@ -305,15 +305,28 @@ router.post('/assets/:assetId/analyze', requirePermission('ai.generate'), async 
   if (!rows.length) return res.status(404).json({ error: 'VIDEO_ASSET_NOT_FOUND' });
   let workDir = null;
   try {
-    workDir = await videoStorage.createJobWorkDir(`analyze-${rows[0].id}`);
-    const localPath = await videoStorage.materializeAsset(rows[0], workDir);
-    const metadata = await probeVideo(localPath);
+    let input = await videoStorage.analysisInput(rows[0]);
+    let metadata;
+    try {
+      metadata = await probeVideo(input);
+    } catch (probeError) {
+      // Legacy/non-faststart assets may not be seekable over the storage gateway.
+      // Materialize only those exceptional files and clean them immediately after.
+      workDir = await videoStorage.createJobWorkDir(`analyze-${rows[0].id}`);
+      input = await videoStorage.materializeAsset(rows[0], workDir);
+      metadata = await probeVideo(input);
+    }
     if (!metadata.duration || !metadata.width || !metadata.height) throw new Error('无法识别视频轨道');
     await pool.query(
       'UPDATE video_editor_assets SET duration_seconds = ?, width = ?, height = ?, has_audio = ? WHERE id = ? AND user_id = ?',
       [metadata.duration, metadata.width, metadata.height, metadata.hasAudio ? 1 : 0, rows[0].id, req.user.id]
     );
-    const analysis = await analyzeVideo(localPath, metadata.duration);
+    const analysis = await analyzeVideo(input, metadata.duration, {
+      workDir,
+      onProgress: ({ phase, completed, total }) => {
+        if (phase === 'visual') console.log(`[video-projects] asset ${rows[0].id} temporal segment ${completed + 1}/${total}`);
+      },
+    });
     await pool.query('UPDATE video_editor_assets SET analysis_json = ? WHERE id = ? AND user_id = ?', [JSON.stringify(analysis), rows[0].id, req.user.id]);
     res.json({ analysis });
   } catch (error) {

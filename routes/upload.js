@@ -495,6 +495,7 @@ function enqueueVideoPlaybackTranscode({ sourceFilePath, cleanupPaths, playbackK
       playbackVideo = await createVideoPlaybackForWeb(sourceFilePath);
       if (!playbackVideo) {
         console.warn('[upload.video] playback job produced no file:', insertedId);
+        await enableVideoSemanticAnalysis({ insertedId });
         return;
       }
       await cosStorage.uploadFile(playbackKey, playbackVideo.filePath, {
@@ -524,8 +525,12 @@ function enqueueVideoPlaybackTranscode({ sourceFilePath, cleanupPaths, playbackK
         playbackBytes: playbackVideo.size,
         playbackRel,
       });
+      // Playback work owns the expensive FFmpeg slot first. Only then enqueue
+      // full-duration semantics, which deliberately has the lowest AI priority.
+      await enableVideoSemanticAnalysis({ insertedId });
     } catch (err) {
       console.error('[upload.video] playback job failed:', insertedId, err && err.stack ? err.stack : err);
+      await enableVideoSemanticAnalysis({ insertedId }).catch(() => null);
     } finally {
       if (playbackVideo && playbackVideo.filePath) unlinkFileQuiet(playbackVideo.filePath);
       cleanupSet.forEach(unlinkFileQuiet);
@@ -546,7 +551,6 @@ function enqueueDirectVideoPostProcess({ sourceKey, mimeType, thumbKey, thumbRel
     let preparedVideo = null;
     let posterImage = null;
     let playbackVideo = null;
-    let posterReadyForAnalysis = false;
     try {
       const head = await cosStorage.headObject(sourceKey);
       const sourceBytes = Number(head && head.ContentLength) || 0;
@@ -578,16 +582,8 @@ function enqueueDirectVideoPostProcess({ sourceKey, mimeType, thumbKey, thumbRel
             'UPDATE photos SET thumb_url = ? WHERE id = ? AND (thumb_url IS NULL OR thumb_url = \'\')',
             [thumbRel, insertedId]
           );
-          if (!posterUpdate || !posterUpdate.affectedRows) {
-            await cosStorage.deleteObjects([thumbKey]).catch(() => null);
-          } else {
-            posterReadyForAnalysis = true;
-          }
+          if (!posterUpdate || !posterUpdate.affectedRows) await cosStorage.deleteObjects([thumbKey]).catch(() => null);
         }
-      }
-      // 封面就绪即可进行低优先级语义分析，不必等更耗时的播放转码完成。
-      if (posterReadyForAnalysis) {
-        await enableVideoSemanticAnalysis({ insertedId, thumbRel });
       }
 
       if (VIDEO_PLAYBACK_ENABLED && playbackKey && playbackRel) {
@@ -603,9 +599,13 @@ function enqueueDirectVideoPostProcess({ sourceKey, mimeType, thumbKey, thumbRel
           if (!playbackUpdate || !playbackUpdate.affectedRows) await cosStorage.deleteObjects([playbackKey]).catch(() => null);
         }
       }
+      // Queue only after faststart/preview/playback work has released the heavy
+      // video path. The semantic job will read the now seek-friendly source.
+      await enableVideoSemanticAnalysis({ insertedId });
       console.log('[upload.video] direct post-process ready', { mediaId: insertedId });
     } catch (err) {
       console.error('[upload.video] direct post-process failed:', insertedId, err && err.stack ? err.stack : err);
+      await enableVideoSemanticAnalysis({ insertedId }).catch(() => null);
     } finally {
       if (playbackVideo && playbackVideo.filePath) unlinkFileQuiet(playbackVideo.filePath);
       if (posterImage && posterImage.filePath) unlinkFileQuiet(posterImage.filePath);
@@ -1119,12 +1119,12 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
   }
 }
 
-function enqueueVideoSemanticAnalysis({ insertedId, thumbRel }) {
-  if (!insertedId || !thumbRel) return false;
+function enqueueVideoSemanticAnalysis({ insertedId }) {
+  if (!insertedId) return false;
   try {
     const aiWorker = require('../lib/ai_tags_worker');
-    // 视频语义只看转码生成的封面帧，并放到低优先级队列；照片、人脸等常规任务优先。
-    aiWorker.enqueue({ id: insertedId, relPath: thumbRel, isVideo: true, priority: 'low' });
+    // 视频直接从对象存储上的源文件做连续时段语义理解；照片和人脸任务始终优先。
+    aiWorker.enqueue({ id: insertedId, isVideo: true, priority: 'low' });
     return true;
   } catch (err) {
     console.error('[upload.video] enqueue semantic analysis failed:', err && err.message ? err.message : err);
@@ -1132,8 +1132,8 @@ function enqueueVideoSemanticAnalysis({ insertedId, thumbRel }) {
   }
 }
 
-async function enableVideoSemanticAnalysis({ insertedId, thumbRel }) {
-  if (!insertedId || !thumbRel) return false;
+async function enableVideoSemanticAnalysis({ insertedId }) {
+  if (!insertedId) return false;
   try {
     const [result] = await pool.query(
       `UPDATE photos
@@ -1142,7 +1142,7 @@ async function enableVideoSemanticAnalysis({ insertedId, thumbRel }) {
       [insertedId]
     );
     if (!result || !result.affectedRows) return false;
-    return enqueueVideoSemanticAnalysis({ insertedId, thumbRel });
+    return enqueueVideoSemanticAnalysis({ insertedId });
   } catch (err) {
     console.error('[upload.video] enable semantic analysis failed:', insertedId, err && err.message ? err.message : err);
     return false;
@@ -1422,9 +1422,6 @@ async function processVideoUpload(req, res) {
     });
 
     const photographerName = await getPhotographerName(photographerId);
-    if (playbackThumbRel) {
-      enqueueVideoSemanticAnalysis({ insertedId, thumbRel: playbackThumbRel });
-    }
     playbackJobScheduled = enqueueVideoPlaybackTranscode({
       sourceFilePath: uploadFilePath,
       cleanupPaths: [filePath, processedVideo && processedVideo.cleanupPath],
@@ -1432,6 +1429,7 @@ async function processVideoUpload(req, res) {
       playbackRel,
       insertedId,
     });
+    if (!playbackJobScheduled) await enableVideoSemanticAnalysis({ insertedId });
 
     if (UPLOAD_TIMING_LOGS) {
       console.log('[upload.video] timing', {
@@ -1704,6 +1702,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
       sourceKey: session.originalKey, mimeType: session.mimeType, thumbKey: session.thumbKey, thumbRel: session.thumbRel,
       playbackKey: session.playbackKey, playbackRel: session.playbackRel, insertedId,
     });
+    if (!playbackQueued) await enableVideoSemanticAnalysis({ insertedId });
     return res.json(makeResponsePayload({
       insertedId, projectId: session.metadata.projectId, timelineSectionId: session.metadata.timelineSectionId,
       relPath: session.relPath, thumbRel: null, playbackRel: null, playbackQueued,

@@ -752,6 +752,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
     }
 
     const type = req.query.type || null;
+    const includeVideoAnalysis = ['1', 'true', 'yes'].includes(String(req.query.includeVideoAnalysis || '').trim().toLowerCase());
     const projectId = req.query.projectId
       ? parseInt(req.query.projectId, 10)
       : null;
@@ -776,6 +777,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         p.ai_error        AS aiError,
         p.ai_started_at   AS aiStartedAt,
         p.ai_finished_at  AS aiFinishedAt,
+        ${includeVideoAnalysis ? 'pvs.analysis_json AS videoAnalysis,' : ''}
         p.type,
         p.photographer_id AS photographerId,
         u.name            AS photographerName,
@@ -786,6 +788,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
       FROM photos p
       LEFT JOIN users u ON p.photographer_id = u.id
       LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
+      ${includeVideoAnalysis ? 'LEFT JOIN photo_video_semantics pvs ON pvs.photo_id = p.id' : ''}
     `;
     const conds = [];
     const params = [];
@@ -825,11 +828,13 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
     try {
       [rows] = await pool.query(sql, params);
     } catch (colErr) {
-      // 缺列降级（迁移 20260711_001 尚未执行时）：去掉 ai_score/ai_quality 重查
-      if (colErr && (colErr.code === 'ER_BAD_FIELD_ERROR' || String(colErr.message || '').includes('Unknown column'))) {
+      // 缺列/新语义表未迁移时降级，不让普通素材读取直接变成 500。
+      if (colErr && (colErr.code === 'ER_BAD_FIELD_ERROR' || colErr.code === 'ER_NO_SUCH_TABLE' || /Unknown column|doesn't exist/i.test(String(colErr.message || '')))) {
         const degraded = sql
           .replace('p.ai_score        AS aiScore,', '')
-          .replace('p.ai_quality      AS aiQuality,', '');
+          .replace('p.ai_quality      AS aiQuality,', '')
+          .replace('pvs.analysis_json AS videoAnalysis,', '')
+          .replace('LEFT JOIN photo_video_semantics pvs ON pvs.photo_id = p.id', '');
         [rows] = await pool.query(degraded, params);
       } else {
         throw colErr;
@@ -885,7 +890,8 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         aiQuality: (() => { try { return typeof p.aiQuality === 'string' ? JSON.parse(p.aiQuality) : (p.aiQuality || null); } catch (e) { return null; } })(),
         aiError: p.aiError || null,
         aiStartedAt: p.aiStartedAt || null,
-        aiFinishedAt: p.aiFinishedAt || null
+        aiFinishedAt: p.aiFinishedAt || null,
+        videoAnalysis: (() => { try { return typeof p.videoAnalysis === 'string' ? JSON.parse(p.videoAnalysis) : (p.videoAnalysis || null); } catch (e) { return null; } })(),
       };
     });
 

@@ -5,6 +5,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { buildRenderSpec, renderProject } = require('../lib/video_render');
 const videoStorage = require('../lib/video_editor_storage');
+const { analyzeVideo } = require('../lib/video_analysis');
+const { heuristicRoughCut } = require('../ai_function/ai_for_video/ai_for_video');
 
 async function main() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mamage-video-production-test-'));
@@ -70,6 +72,33 @@ async function main() {
     });
     const transitionDuration = Number(execFileSync(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', transitionOutput], { encoding: 'utf8' }).trim());
     assert(transitionDuration >= 1 && transitionDuration <= 1.4, `unexpected transition duration ${transitionDuration}`);
+
+    const temporalSource = path.join(tempDir, 'temporal.mp4');
+    execFileSync(ffmpeg, [
+      '-hide_banner', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=12', '-t', '7',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', temporalSource,
+    ], { stdio: 'ignore' });
+    const temporal = await analyzeVideo(temporalSource, 7, { semantic: false, includeAudio: false });
+    assert.strictEqual(temporal.version, 2);
+    assert.strictEqual(temporal.coverage.complete, true);
+    assert(temporal.segments.length >= 2, 'temporal analysis should cover multiple consecutive segments');
+    assert(temporal.coverage.sampleFrameCount >= temporal.segments.length, 'every temporal segment should own representative samples');
+    assert.strictEqual(temporal.semanticStatus, 'technical');
+
+    const semanticPlan = heuristicRoughCut({
+      targetDuration: 5,
+      style: 'documentary',
+      aspectRatio: '16:9',
+      sources: [{
+        id: 'semantic-source', name: 'semantic', duration: 20,
+        analysis: {
+          segments: [{ start: 8, end: 12, summary: '嘉宾登台发言', actions: ['发言'], keyMoment: true }],
+          scenes: [{ start: 0, end: 20, duration: 20 }],
+        },
+      }],
+    });
+    assert(semanticPlan.clips.length > 0);
+    assert(semanticPlan.clips[0].start >= 8 && semanticPlan.clips[0].start <= 12, 'rough cut should prefer the temporal semantic segment');
 
     const localMaterialized = await videoStorage.materializeAsset(rows[0], tempDir);
     assert.strictEqual(localMaterialized, fakeVideo);

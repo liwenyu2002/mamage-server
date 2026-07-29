@@ -14,6 +14,27 @@ function cleanText(value, max = 500) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
+function compactTemporalSegments(input, max = 12) {
+  const source = Array.isArray(input) ? input : [];
+  const normalized = source.map((segment) => ({
+    start: clamp(segment && segment.start, 0, 4 * 60 * 60),
+    end: clamp(segment && segment.end, 0, 4 * 60 * 60),
+    summary: cleanText(segment && segment.summary, 180),
+    tags: (Array.isArray(segment && segment.tags) ? segment.tags : []).map((tag) => cleanText(tag, 32)).filter(Boolean).slice(0, 8),
+    actions: (Array.isArray(segment && segment.actions) ? segment.actions : []).map((action) => cleanText(action, 48)).filter(Boolean).slice(0, 4),
+    keyMoment: Boolean(segment && segment.keyMoment),
+  })).filter((segment) => segment.end - segment.start >= 0.05);
+  if (normalized.length <= max) return normalized;
+  const selected = new Map();
+  normalized.filter((segment) => segment.keyMoment).slice(0, Math.ceil(max / 2)).forEach((segment) => selected.set(`${segment.start}-${segment.end}`, segment));
+  for (let index = 0; selected.size < max && index < max; index += 1) {
+    const sourceIndex = Math.round((index / Math.max(1, max - 1)) * (normalized.length - 1));
+    const segment = normalized[sourceIndex];
+    selected.set(`${segment.start}-${segment.end}`, segment);
+  }
+  return Array.from(selected.values()).sort((left, right) => left.start - right.start).slice(0, max);
+}
+
 function normalizeSources(input) {
   return (Array.isArray(input) ? input : [])
     .map((item, index) => ({
@@ -30,6 +51,19 @@ function normalizeSources(input) {
       aiQuality: cleanText(item && item.aiQuality, 80),
       analysis: item && item.analysis && typeof item.analysis === 'object' ? {
         summary: cleanText(item.analysis.summary, 240),
+        semanticStatus: cleanText(item.analysis.semanticStatus, 24),
+        coverage: item.analysis.coverage && typeof item.analysis.coverage === 'object' ? {
+          duration: clamp(item.analysis.coverage.duration, 0, 4 * 60 * 60),
+          segmentCount: clamp(item.analysis.coverage.segmentCount, 0, 48),
+          visualSegments: clamp(item.analysis.coverage.visualSegments, 0, 48),
+        } : null,
+        global: item.analysis.global && typeof item.analysis.global === 'object' ? {
+          description: cleanText(item.analysis.global.description, 360),
+          summary: cleanText(item.analysis.global.summary, 360),
+          tags: (Array.isArray(item.analysis.global.tags) ? item.analysis.global.tags : []).map((tag) => cleanText(tag, 32)).filter(Boolean).slice(0, 12),
+          keyMoments: compactTemporalSegments(item.analysis.global.keyMoments, 8),
+        } : null,
+        segments: compactTemporalSegments(item.analysis.segments, 12),
         scenes: (Array.isArray(item.analysis.scenes) ? item.analysis.scenes : []).slice(0, 80).map((scene) => ({
           start: clamp(scene.start, 0, 4 * 60 * 60), end: clamp(scene.end, 0, 4 * 60 * 60), duration: clamp(scene.duration, 0, 600),
         })),
@@ -87,8 +121,13 @@ function heuristicRoughCut({ sources, projects = [], brief, targetDuration, styl
       if (usable < 0.35) continue;
       const maxStart = Math.max(0, source.duration - usable);
       const ratio = ((round * 0.37) + (index * 0.19)) % 0.92;
+      const semanticSegments = source.analysis && Array.isArray(source.analysis.segments) ? source.analysis.segments : [];
+      const semanticCandidates = semanticSegments.filter((segment) => segment.keyMoment || (segment.actions && segment.actions.length) || segment.summary);
+      const semantic = semanticCandidates.length ? semanticCandidates[(round + index) % semanticCandidates.length] : null;
       const scene = source.analysis && source.analysis.scenes && source.analysis.scenes[(round + index) % source.analysis.scenes.length];
-      const start = scene ? Math.min(maxStart, Math.max(0, scene.start)) : Math.min(maxStart, maxStart * ratio);
+      const start = semantic
+        ? Math.min(maxStart, Math.max(0, semantic.start))
+        : scene ? Math.min(maxStart, Math.max(0, scene.start)) : Math.min(maxStart, maxStart * ratio);
       const end = Math.min(source.duration, start + usable);
       clips.push({
         sourceId: source.id,
@@ -96,7 +135,7 @@ function heuristicRoughCut({ sources, projects = [], brief, targetDuration, styl
         end: Number(end.toFixed(2)),
         speed: 1,
         transition: clips.length ? (style === 'dynamic' ? 'flash' : 'dissolve') : 'none',
-        reason: source.description || `${source.projectName ? `${source.projectName} · ` : ''}${source.name} 的代表性片段`,
+        reason: (semantic && semantic.summary) || source.description || `${source.projectName ? `${source.projectName} · ` : ''}${source.name} 的代表性片段`,
       });
       total += end - start;
       added = true;
@@ -197,7 +236,7 @@ async function generateRoughCut(input = {}) {
     '只返回 JSON 对象，不要 Markdown。不得虚构 sourceId，不得给出超出素材时长的入点/出点。',
     '优先建立开场、发展、高潮、收束的叙事；避免连续重复同一素材，除非只有一个素材。',
     '若提供多个 projects，结合项目名称、日期、标签和描述建立跨项目叙事，并尽量平衡各项目的代表性镜头。',
-    '素材可能包含 projectName、timelineSectionName、photographerName、aiScore、aiQuality 等字段，应将其作为选材依据。',
+    '素材可能包含 projectName、timelineSectionName、photographerName、aiScore、aiQuality，以及 analysis.global / analysis.segments 的全程时间线语义；应优先依照这些真实时间段内容选取片段，不要只按视频开头或单张封面判断。',
     'clips 每项字段：sourceId,start,end,speed,transition,reason。transition 只能是 none/cut/dissolve/fade/flash。',
     '根字段：title,summary,targetDuration,aspectRatio,clips,captions,musicMood,notes。',
     'captions 每项字段：at,text。总片段数不超过 80。',
