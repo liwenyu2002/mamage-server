@@ -1689,7 +1689,9 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
     let insertedId;
     try {
       insertedId = await createPhotoRecordWithRetry({
-        ...session.metadata, relPath: session.relPath, thumbRel: null, playbackRel: null, aiStatus: 'skipped', photographerId, orgId: session.orgId,
+        // The source is already in object storage. Keep the semantic state visible
+        // while the low-priority post-process waits for its playback slot.
+        ...session.metadata, relPath: session.relPath, thumbRel: null, playbackRel: null, aiStatus: 'pending', photographerId, orgId: session.orgId,
       });
     } catch (dbErr) {
       await cosStorage.deleteObjects([session.originalKey]).catch(() => null);
@@ -1706,7 +1708,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
     return res.json(makeResponsePayload({
       insertedId, projectId: session.metadata.projectId, timelineSectionId: session.metadata.timelineSectionId,
       relPath: session.relPath, thumbRel: null, playbackRel: null, playbackQueued,
-      title: session.metadata.title, type: 'video', mediaType: 'video', aiStatus: 'skipped', photographerId, photographerName,
+      title: session.metadata.title, type: 'video', mediaType: 'video', aiStatus: 'pending', photographerId, photographerName,
     }));
   } catch (err) {
     if (session) {
