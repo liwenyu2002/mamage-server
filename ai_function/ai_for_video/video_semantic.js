@@ -102,6 +102,21 @@ function normalizeSegmentResult(raw) {
   };
 }
 
+function normalizeGlobalEvidenceResult(raw) {
+  const structured = extractJson(raw) || {};
+  return {
+    event: cleanText(structured.event || structured.eventStage || structured.activity, 160) || null,
+    setting: cleanText(structured.setting || structured.scene || structured.sceneContext, 160) || null,
+    keyObjects: normalizedList(structured.keyObjects || structured.objects || structured.entities, 12, 100),
+    visibleText: normalizedList(structured.visibleText || structured.ocrText || structured.textOnScreen || structured.ocr, 12, 160),
+    timelineFacts: normalizedList(structured.timelineFacts || structured.sequence || structured.events, 8, 220),
+    evidence: normalizedList(structured.evidence || structured.reasoningEvidence || structured.visualEvidence, 8, 180),
+    confidence: Number.isFinite(Number(structured.confidence))
+      ? Number(clamp(Number(structured.confidence), 0, 1).toFixed(2))
+      : null,
+  };
+}
+
 function formatTime(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
   const hour = Math.floor(seconds / 3600);
@@ -139,6 +154,24 @@ function temporalPrompt(context = {}) {
   ].join('\n');
 }
 
+function globalEvidencePrompt(context = {}) {
+  const frameTimes = (Array.isArray(context.sampleTimes) ? context.sampleTimes : []).map(formatTime).join('、');
+  return [
+    '你是高校融媒体视频的全片事实核验助手。图片由同一视频按时间从上到下排列的高分辨率代表画面组成。',
+    `代表画面时间依次为：${frameTimes || '未提供'}。请利用画面中的屏幕、横幅、物体文字和连续动作，核验整条视频的关键事实。`,
+    '只写画面直接支持的内容。文字必须逐字抄录可辨认部分，不能用语境补全；物体有清晰标识时必须使用其具体名称。',
+    '必须只返回一个 JSON 对象，不要 Markdown，不要解释。',
+    '字段固定为：event, setting, keyObjects, visibleText, timelineFacts, evidence, confidence。',
+    'event：0-1 条具体活动或会议环节；无法确认则为空字符串。',
+    'setting：0-1 条场景事实。',
+    'keyObjects：0-10 个关键物体或实体，避免“红色箱子”这类已可具体识别的泛称。',
+    'visibleText：0-10 个可辨认的文字短语，按原文抄录。',
+    'timelineFacts：0-6 条带时间的事实，格式“00:00-00:05｜发生的动作或场景”。',
+    'evidence：0-6 条可见依据，说明文字或物体在何处出现。',
+    'confidence：0 到 1 之间的小数。',
+  ].join('\n');
+}
+
 function extractOpenAIMessageText(message) {
   if (!message) return '';
   if (typeof message.content === 'string') return message.content.trim();
@@ -153,12 +186,11 @@ function extractOpenAIMessageText(message) {
   return String(message.content || '').trim();
 }
 
-async function analyzeWithProvider(provider, storyboardJpeg, context) {
-  if (provider === 'off') return { available: false, provider: 'off', model: null, ...normalizeSegmentResult('') };
-  const prompt = temporalPrompt(context);
+async function callVisionProvider(provider, imageJpeg, prompt) {
+  if (provider === 'off') return { available: false, provider: 'off', model: null, raw: '' };
   if (provider === 'ollama') {
-    const raw = await callOllamaGenerate(prompt, storyboardJpeg.toString('base64'));
-    return { available: true, provider, model: visionModel(provider), raw, ...normalizeSegmentResult(raw) };
+    const raw = await callOllamaGenerate(prompt, imageJpeg.toString('base64'));
+    return { available: true, provider, model: visionModel(provider), raw };
   }
   if (provider === 'dashscope') {
     const apiKey = process.env.AI_VISION_API_KEY || process.env.DASHSCOPE_API_KEY;
@@ -174,15 +206,25 @@ async function analyzeWithProvider(provider, storyboardJpeg, context) {
           role: 'user',
           content: [
             { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${storyboardJpeg.toString('base64')}` } },
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageJpeg.toString('base64')}` } },
           ],
         },
       ],
     });
     const raw = extractOpenAIMessageText(response && response.choices && response.choices[0] && response.choices[0].message);
-    return { available: true, provider, model, raw, ...normalizeSegmentResult(raw) };
+    return { available: true, provider, model, raw };
   }
   throw new Error(`Unsupported VIDEO_SEMANTIC_VISION_PROVIDER: ${provider}`);
+}
+
+async function analyzeWithProvider(provider, storyboardJpeg, context) {
+  const response = await callVisionProvider(provider, storyboardJpeg, temporalPrompt(context));
+  return { ...response, ...normalizeSegmentResult(response.raw) };
+}
+
+async function analyzeGlobalEvidenceWithProvider(provider, evidenceJpeg, context) {
+  const response = await callVisionProvider(provider, evidenceJpeg, globalEvidencePrompt(context));
+  return { ...response, ...normalizeGlobalEvidenceResult(response.raw) };
 }
 
 function isVisionEnabled() {
@@ -201,11 +243,30 @@ async function analyzeTemporalStoryboard(storyboardJpeg, context = {}) {
   }
 }
 
-function deterministicTimelineSummary(segments, duration) {
+async function analyzeGlobalEvidenceBoard(evidenceJpeg, context = {}) {
+  const primary = visionProvider();
+  try {
+    return await analyzeGlobalEvidenceWithProvider(primary, evidenceJpeg, context);
+  } catch (error) {
+    const fallback = fallbackProvider(primary);
+    if (!fallback) throw error;
+    console.warn(`[video-semantic] global evidence ${primary} failed, fallback to ${fallback}:`, error && error.message ? error.message : error);
+    return analyzeGlobalEvidenceWithProvider(fallback, evidenceJpeg, context);
+  }
+}
+
+function deterministicTimelineSummary(segments, duration, globalEvidence = null) {
+  const evidence = globalEvidence && typeof globalEvidence === 'object' ? globalEvidence : {};
   const descriptive = (segments || []).map((segment) => cleanText(segment.summary, 80)).filter(Boolean);
   const tags = Array.from(new Set((segments || []).flatMap((segment) => Array.isArray(segment.tags) ? segment.tags : []))).slice(0, 12);
-  const keyEntities = Array.from(new Set((segments || []).flatMap((segment) => Array.isArray(segment.keyObjects) ? segment.keyObjects : []))).slice(0, 12);
-  const visibleText = Array.from(new Set((segments || []).flatMap((segment) => Array.isArray(segment.visibleText) ? segment.visibleText : []))).slice(0, 12);
+  const keyEntities = Array.from(new Set([
+    ...(Array.isArray(evidence.keyObjects) ? evidence.keyObjects : []),
+    ...(segments || []).flatMap((segment) => Array.isArray(segment.keyObjects) ? segment.keyObjects : []),
+  ])).slice(0, 12);
+  const visibleText = Array.from(new Set([
+    ...(Array.isArray(evidence.visibleText) ? evidence.visibleText : []),
+    ...(segments || []).flatMap((segment) => Array.isArray(segment.visibleText) ? segment.visibleText : []),
+  ])).slice(0, 12);
   const eventStages = (segments || []).map((segment) => cleanText(segment.eventStage, 100)).filter(Boolean);
   const keyMoments = (segments || []).filter((segment) => segment.keyMoment || (segment.actions && segment.actions.length)).slice(0, 8).map((segment) => ({
     start: segment.start,
@@ -221,7 +282,10 @@ function deterministicTimelineSummary(segments, duration) {
   }).filter(Boolean).slice(0, 8);
   const detailedSummary = cleanText([
     prefix,
+    evidence.event ? `活动：${cleanText(evidence.event, 160)}` : '',
+    evidence.setting ? `场景：${cleanText(evidence.setting, 160)}` : '',
     ...narrative,
+    ...(Array.isArray(evidence.timelineFacts) ? evidence.timelineFacts.map((fact) => cleanText(fact, 220)) : []),
     keyEntities.length ? `关键实体：${keyEntities.join('、')}` : '',
     visibleText.length ? `可见文字：${visibleText.join('、')}` : '',
   ].filter(Boolean).join('；'), 900);
@@ -230,8 +294,8 @@ function deterministicTimelineSummary(segments, duration) {
     description: cleanText([prefix, ...descriptive.slice(0, 3)].filter(Boolean).join('；'), 500),
     summary: cleanText(descriptive.slice(0, 4).join('；') || prefix, 500),
     detailedSummary,
-    event: cleanText(eventStages[0], 160),
-    setting: cleanText((segments || []).map((segment) => segment.scene).find(Boolean), 160),
+    event: cleanText(evidence.event || eventStages[0], 160),
+    setting: cleanText(evidence.setting || (segments || []).map((segment) => segment.scene).find(Boolean), 160),
     tags,
     keyEntities,
     visibleText,
@@ -243,8 +307,8 @@ function deterministicTimelineSummary(segments, duration) {
   };
 }
 
-async function summarizeTemporalTimeline({ segments, duration, hasAudio, silences, allowModel = true }) {
-  const fallback = deterministicTimelineSummary(segments, duration);
+async function summarizeTemporalTimeline({ segments, duration, hasAudio, silences, globalEvidence = null, allowModel = true }) {
+  const fallback = deterministicTimelineSummary(segments, duration, globalEvidence);
   const apiKey = process.env.AI_TEXT_API_KEY || process.env.OPENAI_API_KEY || '';
   if (!allowModel || !apiKey || !segments.some((segment) => segment.summary)) return fallback;
   const model = process.env.AI_VIDEO_MODEL || process.env.AI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -274,11 +338,25 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
           content: [
             '你是高校融媒体视频编辑与事实核验员。根据覆盖整段视频的带证据时间线，生成可用于归档、检索和智能剪辑的详细总语义；不能编造。',
             '只返回 JSON：title(8-32字), description(50-140字), summary(不超过180字), detailedSummary(120-360字), event(0-80字), setting(0-80字), tags(0-16个中文短标签), keyEntities(0-12个具体实体), visibleText(0-12个画面文字短语), searchTerms(0-20个检索词), keyMoments([{start,end,summary,reason}]), narrative(0-8条按时间排序的“起止时间｜事件”短句)。',
-            '详细总语义必须按时间讲清楚发生了什么、关键物体是什么、其在何时出现及动作如何变化。只能把输入 visibleText 中出现的内容作为“可见文字”；只能把输入 keyObjects 或 evidence 支持的内容写成具体物体或会议环节。',
+            '详细总语义必须按时间讲清楚发生了什么、关键物体是什么、其在何时出现及动作如何变化。globalEvidence 是高分辨率全片核验结果，优先用于纠正片段摘要中的泛称、漏读或不一致；相邻时段明显是同一物体时必须使用同一个已核验的具体名称。',
+            '只能把输入 visibleText 或 globalEvidence.visibleText 中出现的内容作为“可见文字”；只能把输入 keyObjects、evidence 或 globalEvidence 支持的内容写成具体物体或会议环节。',
             '不得把泛称强行具体化，不得把“疑似”写成事实。keyMoments 只能引用给定时段；若不确定则给空数组。',
           ].join('\n'),
         },
-        { role: 'user', content: JSON.stringify({ duration, hasAudio: Boolean(hasAudio), silences: (silences || []).slice(0, 20), segments: compactSegments }) },
+        { role: 'user', content: JSON.stringify({
+          duration,
+          hasAudio: Boolean(hasAudio),
+          silences: (silences || []).slice(0, 20),
+          globalEvidence: globalEvidence && typeof globalEvidence === 'object' ? {
+            event: cleanText(globalEvidence.event, 160),
+            setting: cleanText(globalEvidence.setting, 160),
+            keyObjects: normalizedList(globalEvidence.keyObjects, 12, 100),
+            visibleText: normalizedList(globalEvidence.visibleText, 12, 160),
+            timelineFacts: normalizedList(globalEvidence.timelineFacts, 8, 220),
+            evidence: normalizedList(globalEvidence.evidence, 8, 180),
+          } : null,
+          segments: compactSegments,
+        }) },
       ],
     });
     const raw = extractOpenAIMessageText(response && response.choices && response.choices[0] && response.choices[0].message);
@@ -327,6 +405,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
 
 module.exports = {
   analyzeTemporalStoryboard,
+  analyzeGlobalEvidenceBoard,
   deterministicTimelineSummary,
   isVisionEnabled,
   summarizeTemporalTimeline,
