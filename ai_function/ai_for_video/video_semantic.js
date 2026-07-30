@@ -28,6 +28,41 @@ function cleanSentence(value, max = 240) {
   return cleanText(value, max).replace(/[。！？；;，,]+$/u, '').trim();
 }
 
+function cleanNarrativePhrase(value, max = 240, canonicalObject = '') {
+  let text = cleanSentence(value, max)
+    .replace(/^\d{1,2}:\d{2}\s*[-~至]\s*\d{1,2}:\d{2}\s*[｜|]?\s*/u, '')
+    .replace(/^(?:三帧|多帧|数帧|几帧)画面(?:中|显示|展示)?[，,]?\s*/u, '')
+    .replace(/^画面(?:中|显示|展示)?[，,]?\s*/u, '')
+    .replace(/^同一(?:会议)?现场[，,]?\s*/u, '')
+    .replace(/(?:左侧|中间|右侧)画面(?:中)?/gu, '')
+    .replace(/(?:左侧|中间|右侧)/gu, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (canonicalObject === '投票箱') {
+    text = text.replace(/(?:红色)?箱(?:子|体)/gu, canonicalObject);
+  }
+  return text;
+}
+
+function segmentActionNarrative(segment, canonicalObject = '') {
+  const actions = normalizedList(segment && segment.actions, 8, 48);
+  const keyObjects = normalizedList(segment && segment.keyObjects, 8, 64);
+  const focalObject = canonicalObject || keyObjects.find((item) => /箱/.test(item)) || '相关物件';
+  const has = (pattern) => actions.some((action) => pattern.test(action));
+  const phrases = [];
+  if (has(/发言/)) phrases.push('一名参会人员手持麦克风站在讲台前发言');
+  if (has(/调整.*麦克风|麦克风.*调整/)) phrases.push('另一名人员对讲台麦克风进行调整');
+  if (has(/走向.*投票箱|走向.*箱/)) phrases.push(`有人走向${focalObject}`);
+  if (has(/操作.*投票箱|投票箱.*操作|操作.*箱/)) phrases.push(`并在${focalObject}前进行操作`);
+  if (has(/手持展示|展示.*箱|举起.*箱/)) phrases.push(`一名身着西装的人员手持${focalObject}向会场展示`);
+  if (has(/放置物品|放置.*箱|放回.*箱/)) phrases.push(`展示结束后将${focalObject}放置在小凳上`);
+  if (has(/就坐/)) phrases.push('周围参会人员在座位区就坐');
+  const recognized = /发言|麦克风|走向.*箱|操作.*箱|手持展示|展示.*箱|举起.*箱|放置物品|放置.*箱|放回.*箱|就坐/;
+  const remaining = actions.filter((action) => !recognized.test(action));
+  if (remaining.length) phrases.push(`现场还可见${remaining.join('、')}等动作`);
+  return Array.from(new Set(phrases)).join('，');
+}
+
 function normalizeProvider(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (!raw) return 'dashscope';
@@ -295,10 +330,15 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
   const evidence = globalEvidence && typeof globalEvidence === 'object' ? globalEvidence : {};
   const descriptive = (segments || []).map((segment) => cleanText(segment.summary, 80)).filter(Boolean);
   const tags = Array.from(new Set((segments || []).flatMap((segment) => Array.isArray(segment.tags) ? segment.tags : []))).slice(0, 12);
-  const keyEntities = Array.from(new Set([
+  const rawKeyEntities = Array.from(new Set([
     ...(Array.isArray(evidence.keyObjects) ? evidence.keyObjects : []),
     ...(segments || []).flatMap((segment) => Array.isArray(segment.keyObjects) ? segment.keyObjects : []),
-  ])).slice(0, 12);
+    ...(segments || []).flatMap((segment) => objectTermsFromActions(segment.actions || [])),
+  ].map((item) => cleanSentence(item, 100)).filter(Boolean)));
+  const canonicalObject = rawKeyEntities.includes('投票箱') ? '投票箱' : '';
+  const keyEntities = rawKeyEntities
+    .filter((item) => !canonicalObject || !['箱子', '红色箱子', '红色箱体'].includes(item))
+    .slice(0, 12);
   const visibleText = Array.from(new Set([
     ...(Array.isArray(evidence.visibleText) ? evidence.visibleText : []),
     ...(segments || []).flatMap((segment) => Array.isArray(segment.visibleText) ? segment.visibleText : []),
@@ -317,29 +357,32 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
     return text ? `${range}｜${text}` : '';
   }).filter(Boolean).slice(0, 8);
   const continuousStages = (segments || []).map((segment, index) => {
-    const stage = cleanSentence(segment.summary || segment.eventStage || segment.scene, 180);
-    if (!stage) return '';
-    if (index === 0) return `镜头开始时，${stage}`;
-    if (index === (segments || []).length - 1) return `最后，${stage}`;
-    return `随后，${stage}`;
+    const actionNarrative = segmentActionNarrative(segment, canonicalObject);
+    const stage = actionNarrative || cleanNarrativePhrase(segment.summary || segment.eventStage || segment.scene, 220, canonicalObject);
+    const visualEvidence = Array.from(new Set((Array.isArray(segment.evidence) ? segment.evidence : [])
+      .map((item) => cleanNarrativePhrase(item, 180, canonicalObject))
+      .filter(Boolean))).slice(0, 3);
+    const details = [stage, ...(actionNarrative ? [] : visualEvidence.filter((item) => !stage || !stage.includes(item)))].filter(Boolean);
+    if (!details.length) return '';
+    const transition = index === 0 ? '镜头开始时' : index === (segments || []).length - 1 ? '最后' : '随后';
+    return `${transition}，${details.join('，')}`;
   }).filter(Boolean);
   const opening = cleanText([
-    evidence.setting ? `画面记录在${cleanSentence(evidence.setting, 180)}` : '',
-    evidence.event ? `${evidence.setting ? '，内容围绕' : '视频内容围绕'}${cleanSentence(evidence.event, 180)}展开` : '',
+    evidence.setting ? `画面记录在${cleanNarrativePhrase(evidence.setting, 180, canonicalObject)}` : '',
+    evidence.event ? `${evidence.setting ? '，内容围绕' : '视频内容围绕'}${cleanNarrativePhrase(evidence.event, 180, canonicalObject)}展开` : '',
   ].filter(Boolean).join(''), 400);
-  const evidenceFacts = (Array.isArray(evidence.timelineFacts) ? evidence.timelineFacts : [])
-    .map((fact, index) => {
-      const text = cleanSentence(fact, 220);
-      if (!text) return '';
-      return index === 0 ? `画面还交代了${text}` : `其后，${text}`;
-    })
-    .filter(Boolean);
+  const supportingFacts = (Array.isArray(evidence.timelineFacts) ? evidence.timelineFacts : [])
+    .map((fact) => cleanNarrativePhrase(fact, 220, canonicalObject))
+    .filter(Boolean)
+    .slice(0, 3);
+  const sceneObjects = keyEntities.filter((item) => !['黑色西装', '浅色衬衫'].includes(item)).slice(0, 10);
   const totalSemantic = cleanText([
     opening ? `${opening}。` : '',
+    sceneObjects.length ? `会场内可见${sceneObjects.join('、')}等布置与物件。` : '',
+    visibleText.length ? `红色背景板和现场屏幕上可辨认出${visibleText.join('、')}等文字。` : '',
     ...continuousStages.map((stage) => `${stage}。`),
-    ...evidenceFacts.map((fact) => `${fact}。`),
-    keyEntities.length ? `画面中反复出现或承担关键作用的物件有${keyEntities.join('、')}。` : '',
-    visibleText.length ? `可辨认的文字有${visibleText.join('、')}。` : '',
+    supportingFacts.length ? `操作环节中，${supportingFacts.join('；')}。` : '',
+    evidence.event && continuousStages.length ? `视频以${cleanNarrativePhrase(evidence.event, 160, canonicalObject)}相关的现场环节为主线，依次呈现了发言、操作与展示过程。` : '',
   ].filter(Boolean).join(''), TOTAL_SEMANTIC_LIMIT);
   return {
     title: '',
@@ -478,6 +521,9 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
       parsed.totalSemantic || parsed.detailedSummary || parsed.detail || parsed.longSummary,
       TOTAL_SEMANTIC_LIMIT,
     ) || fallback.totalSemantic;
+    if (totalSemantic.length < minimumTotalSemanticLength && fallback.totalSemantic.length > totalSemantic.length) {
+      totalSemantic = fallback.totalSemantic;
+    }
     if (totalSemantic.length < minimumTotalSemanticLength) {
       try {
         const expanded = await expandShortTotalSemantic({

@@ -99,6 +99,7 @@ async function main() {
       keyMoment: true,
     }], 4);
     assert(detailedGlobal.totalSemantic.includes('投票箱'), 'total semantic should retain key entities');
+    assert(!detailedGlobal.totalSemantic.includes('0:00'), 'total semantic should be prose rather than timestamp fragments');
     assert.strictEqual(detailedGlobal.detailedSummary, detailedGlobal.totalSemantic, 'legacy detailed summary should mirror total semantic');
     assert(detailedGlobal.visibleText.includes('投票箱'), 'global summary should retain visible text');
 
