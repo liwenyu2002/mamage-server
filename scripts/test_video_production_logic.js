@@ -7,6 +7,7 @@ const { buildRenderSpec, renderProject } = require('../lib/video_render');
 const videoStorage = require('../lib/video_editor_storage');
 const { analyzeVideo } = require('../lib/video_analysis');
 const { heuristicRoughCut } = require('../ai_function/ai_for_video/ai_for_video');
+const { deterministicTimelineSummary } = require('../ai_function/ai_for_video/video_semantic');
 
 async function main() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mamage-video-production-test-'));
@@ -79,11 +80,26 @@ async function main() {
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', temporalSource,
     ], { stdio: 'ignore' });
     const temporal = await analyzeVideo(temporalSource, 7, { semantic: false, includeAudio: false });
-    assert.strictEqual(temporal.version, 2);
+    assert.strictEqual(temporal.version, 3);
     assert.strictEqual(temporal.coverage.complete, true);
     assert(temporal.segments.length >= 2, 'temporal analysis should cover multiple consecutive segments');
     assert(temporal.coverage.sampleFrameCount >= temporal.segments.length, 'every temporal segment should own representative samples');
     assert.strictEqual(temporal.semanticStatus, 'technical');
+
+    const detailedGlobal = deterministicTimelineSummary([{
+      start: 0,
+      end: 4,
+      summary: '工作人员打开并展示空投票箱。',
+      scene: '团代会选举正式会议会场',
+      eventStage: '展示空投票箱',
+      tags: ['室内', '会议'],
+      keyObjects: ['投票箱'],
+      visibleText: ['投票箱'],
+      actions: ['打开', '展示'],
+      keyMoment: true,
+    }], 4);
+    assert(detailedGlobal.detailedSummary.includes('投票箱'), 'detailed summary should retain key entities');
+    assert(detailedGlobal.visibleText.includes('投票箱'), 'global summary should retain visible text');
 
     const semanticPlan = heuristicRoughCut({
       targetDuration: 5,
