@@ -69,11 +69,33 @@ function normalizedList(value, max = 8, itemLimit = 32) {
     .filter(Boolean))).slice(0, max);
 }
 
+const GENERIC_ACTION_OBJECTS = new Set([
+  '展示', '物品', '东西', '现场', '画面', '动作', '人物', '人员',
+  '箱子', '红色箱子', '物体', '设备', '内容', '文件',
+]);
+
+function objectTermsFromActions(actions) {
+  const prefixes = /^(?:正在|随后|人员)?(?:走向|靠近|操作|展示|打开|关闭|放置|举起|手持|搬运|拿起|取出|递交|调整|投放|检查|清点)/;
+  return Array.from(new Set((actions || [])
+    .map((action) => {
+      const text = cleanText(action, 64);
+      const prefix = text.match(prefixes);
+      return prefix
+        ? text.slice(prefix[0].length).replace(/[，,、。；;].*$/, '').trim()
+        : '';
+    })
+    .filter((value) => value.length >= 2 && value.length <= 16 && !GENERIC_ACTION_OBJECTS.has(value))));
+}
+
 function normalizeSegmentResult(raw) {
   const structured = extractJson(raw) || {};
   const legacy = parseVisionResponse(raw);
   const summary = cleanText(structured.summary || structured.description || structured.caption || legacy.description, 220);
-  const keyObjects = normalizedList(structured.keyObjects || structured.objects || structured.entities, 8, 64);
+  const actions = normalizedList(structured.actions || structured.events || structured.keyActions, 5, 48);
+  const keyObjects = Array.from(new Set([
+    ...normalizedList(structured.keyObjects || structured.objects || structured.entities, 8, 64),
+    ...objectTermsFromActions(actions),
+  ])).slice(0, 8);
   const visibleText = normalizedList(structured.visibleText || structured.ocrText || structured.textOnScreen || structured.ocr, 8, 120);
   const tags = Array.from(new Set([
     ...(legacy.tags || []),
@@ -92,7 +114,7 @@ function normalizeSegmentResult(raw) {
     tags,
     keyObjects,
     visibleText,
-    actions: normalizedList(structured.actions || structured.events || structured.keyActions, 5, 48),
+    actions,
     evidence: normalizedList(structured.evidence || structured.reasoningEvidence || structured.visualEvidence, 4, 140),
     peopleCount,
     keyMoment: Boolean(structured.keyMoment || structured.highlight || structured.eventMoment),
