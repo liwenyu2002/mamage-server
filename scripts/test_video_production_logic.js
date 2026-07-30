@@ -103,6 +103,17 @@ async function main() {
     assert.strictEqual(detailedGlobal.detailedSummary, detailedGlobal.totalSemantic, 'legacy detailed summary should mirror total semantic');
     assert(detailedGlobal.visibleText.includes('投票箱'), 'global summary should retain visible text');
 
+    const verifiedTextGlobal = deterministicTimelineSummary([{
+      start: 0,
+      end: 4,
+      summary: '工作人员展示投票箱。',
+      visibleText: ['低清误读'],
+      keyObjects: ['投票箱'],
+      actions: ['展示投票箱'],
+    }], 4, { visibleText: ['全片核验文字'] });
+    assert(verifiedTextGlobal.visibleText.includes('全片核验文字'), 'total semantic should prefer verified full-video OCR');
+    assert(!verifiedTextGlobal.visibleText.includes('低清误读'), 'total semantic should not mix unverified segment OCR');
+
     const semanticPlan = heuristicRoughCut({
       targetDuration: 5,
       style: 'documentary',

@@ -355,10 +355,10 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
   const keyEntities = rawKeyEntities
     .filter((item) => !canonicalObject || !['箱子', '红色箱子', '红色箱体'].includes(item))
     .slice(0, 12);
-  const visibleText = Array.from(new Set([
-    ...(Array.isArray(evidence.visibleText) ? evidence.visibleText : []),
-    ...(segments || []).flatMap((segment) => Array.isArray(segment.visibleText) ? segment.visibleText : []),
-  ])).slice(0, 12);
+  const verifiedVisibleText = normalizedList(evidence.visibleText, 12, 160);
+  const visibleText = verifiedVisibleText.length
+    ? verifiedVisibleText
+    : Array.from(new Set((segments || []).flatMap((segment) => Array.isArray(segment.visibleText) ? segment.visibleText : []))).slice(0, 12);
   const eventStages = (segments || []).map((segment) => cleanText(segment.eventStage, 100)).filter(Boolean);
   const keyMoments = (segments || []).filter((segment) => segment.keyMoment || (segment.actions && segment.actions.length)).slice(0, 8).map((segment) => ({
     start: segment.start,
