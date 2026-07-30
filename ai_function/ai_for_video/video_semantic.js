@@ -28,6 +28,22 @@ function cleanSentence(value, max = 240) {
   return cleanText(value, max).replace(/[。！？；;，,]+$/u, '').trim();
 }
 
+function canonicalObjectForSegments(segments) {
+  const terms = (segments || []).flatMap((segment) => [
+    ...(Array.isArray(segment && segment.keyObjects) ? segment.keyObjects : []),
+    ...(Array.isArray(segment && segment.actions) ? segment.actions : []),
+  ]).map((item) => cleanSentence(item, 100));
+  return terms.some((item) => /投票箱/u.test(item)) ? '投票箱' : '';
+}
+
+function canonicalizeObjectName(value, canonicalObject = '') {
+  const text = String(value || '');
+  if (canonicalObject === '投票箱') {
+    return text.replace(/(?:红色)?箱(?:子|体)/gu, canonicalObject);
+  }
+  return text;
+}
+
 function cleanNarrativePhrase(value, max = 240, canonicalObject = '') {
   let text = cleanSentence(value, max)
     .replace(/^\d{1,2}:\d{2}\s*[-~至]\s*\d{1,2}:\d{2}\s*[｜|]?\s*/u, '')
@@ -38,10 +54,7 @@ function cleanNarrativePhrase(value, max = 240, canonicalObject = '') {
     .replace(/(?:左侧|中间|右侧)/gu, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
-  if (canonicalObject === '投票箱') {
-    text = text.replace(/(?:红色)?箱(?:子|体)/gu, canonicalObject);
-  }
-  return text;
+  return canonicalizeObjectName(text, canonicalObject);
 }
 
 function segmentActionNarrative(segment, canonicalObject = '') {
@@ -52,8 +65,11 @@ function segmentActionNarrative(segment, canonicalObject = '') {
   const phrases = [];
   if (has(/发言/)) phrases.push('一名参会人员手持麦克风站在讲台前发言');
   if (has(/调整.*麦克风|麦克风.*调整/)) phrases.push('另一名人员对讲台麦克风进行调整');
-  if (has(/走向.*投票箱|走向.*箱/)) phrases.push(`有人走向${focalObject}`);
-  if (has(/操作.*投票箱|投票箱.*操作|操作.*箱/)) phrases.push(`并在${focalObject}前进行操作`);
+  const walksToObject = has(/走向.*投票箱|走向.*箱/);
+  if (walksToObject) phrases.push(`有人走向${focalObject}`);
+  if (has(/操作.*投票箱|投票箱.*操作|操作.*箱/)) {
+    phrases.push(walksToObject ? `并在${focalObject}前进行操作` : `有人在${focalObject}前进行操作`);
+  }
   if (has(/手持展示|展示.*箱|举起.*箱/)) phrases.push(`一名身着西装的人员手持${focalObject}向会场展示`);
   if (has(/放置物品|放置.*箱|放回.*箱/)) phrases.push(`展示结束后将${focalObject}放置在小凳上`);
   if (has(/就坐/)) phrases.push('周围参会人员在座位区就坐');
@@ -335,7 +351,7 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
     ...(segments || []).flatMap((segment) => Array.isArray(segment.keyObjects) ? segment.keyObjects : []),
     ...(segments || []).flatMap((segment) => objectTermsFromActions(segment.actions || [])),
   ].map((item) => cleanSentence(item, 100)).filter(Boolean)));
-  const canonicalObject = rawKeyEntities.includes('投票箱') ? '投票箱' : '';
+  const canonicalObject = canonicalObjectForSegments(segments) || (rawKeyEntities.includes('投票箱') ? '投票箱' : '');
   const keyEntities = rawKeyEntities
     .filter((item) => !canonicalObject || !['箱子', '红色箱子', '红色箱体'].includes(item))
     .slice(0, 12);
@@ -540,6 +556,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
         console.warn('[video-semantic] total semantic expansion fallback:', error && error.message ? error.message : error);
       }
     }
+    totalSemantic = canonicalizeObjectName(totalSemantic, canonicalObjectForSegments(segments));
     return {
       title: cleanText(parsed.title, 80) || fallback.title,
       description: cleanText(parsed.description, 500) || fallback.description,
