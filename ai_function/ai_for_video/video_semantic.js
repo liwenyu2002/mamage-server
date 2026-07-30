@@ -5,6 +5,15 @@ const DEFAULT_DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mo
 const DEFAULT_OLLAMA_MODEL = 'qwen2.5vl:3b';
 const TOTAL_SEMANTIC_LIMIT = 1800;
 
+function totalSemanticMinimumLength(duration) {
+  const seconds = Math.max(0, Number(duration) || 0);
+  if (seconds >= 180) return 780;
+  if (seconds >= 45) return 560;
+  if (seconds >= 10) return 380;
+  if (seconds >= 4) return 240;
+  return 120;
+}
+
 function clamp(value, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return min;
@@ -352,6 +361,41 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
   };
 }
 
+async function expandShortTotalSemantic({ client, model, duration, minimumLength, current, segments, globalEvidence }) {
+  const response = await client.chat.completions.create({
+    model,
+    temperature: 0.1,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          '你是高校融媒体视频编辑与事实核验员。下面的总语义因过短需要补全，但只能依据提供的可核验视觉证据扩写，绝不能添加没有证据支持的人物、行为、物件、文字或情节。',
+          `只返回 JSON：totalSemantic(一整段中文白描，至少${minimumLength}字，最多900字)。`,
+          '必须从镜头开场自然写到结束，完整写出场景、人物角色、关键动作、具体物件、可见文字、人物与物件关系和环节转换。使用连贯叙述，不得使用标题、列表、标签、时间戳、分段序号，也不得提及帧、模型、采样或时间线。',
+          '这是硬性补写任务：先在脑中核对内容是否充分，再输出；如果输入素材很短，也可以细致描述可明确看见的环境、站位、物件和动作变化，但不得编造。',
+        ].join('\n'),
+      },
+      {
+        role: 'user', content: JSON.stringify({
+          duration,
+          currentTotalSemantic: current,
+          globalEvidence: globalEvidence && typeof globalEvidence === 'object' ? {
+            event: cleanText(globalEvidence.event, 160),
+            setting: cleanText(globalEvidence.setting, 160),
+            keyObjects: normalizedList(globalEvidence.keyObjects, 12, 100),
+            visibleText: normalizedList(globalEvidence.visibleText, 12, 160),
+            timelineFacts: normalizedList(globalEvidence.timelineFacts, 8, 220),
+            evidence: normalizedList(globalEvidence.evidence, 8, 180),
+          } : null,
+          segments,
+        }) },
+    ],
+  });
+  const raw = extractOpenAIMessageText(response && response.choices && response.choices[0] && response.choices[0].message);
+  const parsed = extractJson(raw);
+  return cleanText(parsed && (parsed.totalSemantic || parsed.detailedSummary || parsed.detail), TOTAL_SEMANTIC_LIMIT);
+}
+
 async function summarizeTemporalTimeline({ segments, duration, hasAudio, silences, globalEvidence = null, allowModel = true }) {
   const fallback = deterministicTimelineSummary(segments, duration, globalEvidence);
   const apiKey = process.env.AI_TEXT_API_KEY || process.env.OPENAI_API_KEY || '';
@@ -359,6 +403,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
   const model = process.env.AI_VIDEO_MODEL || process.env.AI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
   const baseURL = process.env.AI_TEXT_BASE_URL || process.env.DASHSCOPE_BASE_URL || undefined;
   const client = baseURL ? new OpenAI({ apiKey, baseURL }) : new OpenAI({ apiKey });
+  const minimumTotalSemanticLength = totalSemanticMinimumLength(duration);
   const compactSegments = segments.map((segment) => ({
     start: Number(segment.start.toFixed(2)),
     end: Number(segment.end.toFixed(2)),
@@ -382,7 +427,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
           role: 'system',
           content: [
             '你是高校融媒体视频编辑与事实核验员。根据覆盖整段视频的带证据时间线，生成可用于归档、检索和智能剪辑的详细总语义；不能编造。',
-            '只返回 JSON：title(8-32字), description(50-140字), summary(不超过180字), totalSemantic(350-900字的中文单段长文), event(0-80字), setting(0-80字), tags(0-16个中文短标签), keyEntities(0-12个具体实体), visibleText(0-12个画面文字短语), searchTerms(0-20个检索词), keyMoments([{start,end,summary,reason}]), narrative(0-8条按时间排序的“起止时间｜事件”短句)。',
+            `只返回 JSON：title(8-32字), description(50-140字), summary(不超过180字), totalSemantic(${minimumTotalSemanticLength}-900字的中文单段长文), event(0-80字), setting(0-80字), tags(0-16个中文短标签), keyEntities(0-12个具体实体), visibleText(0-12个画面文字短语), searchTerms(0-20个检索词), keyMoments([{start,end,summary,reason}]), narrative(0-8条按时间排序的“起止时间｜事件”短句)。`,
             'totalSemantic 是独立的“总语义”，必须是一整段连贯、客观、完整的中文白描：按视频自然时间从开场写到结束，用“镜头开始、随后、接着、最后”等自然衔接推进；完整交代可核验的场景、人物角色（不命名未知人物）、关键动作、物件、可读文字、人物与物件关系及环节转换。不要写标题、列表、标签、时间戳、分段序号，也不要提及“帧、采样、模型、时间线、左侧/中间/右侧画面”。素材很短时可略短，但仍要尽可能完整；不确定的细节宁可不写，绝不为凑字数编造。',
             'globalEvidence 是高分辨率全片核验结果，优先用于纠正片段摘要中的泛称、漏读或不一致；相邻时段明显是同一物体时必须使用同一个已核验的具体名称。',
             '只能把输入 visibleText 或 globalEvidence.visibleText 中出现的内容作为“可见文字”；只能把输入 keyObjects、evidence 或 globalEvidence 支持的内容写成具体物体或会议环节。',
@@ -429,10 +474,26 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
       ...fallback.searchTerms,
     ], 20, 80);
     const narrative = normalizedList(parsed.narrative, 8, 200);
-    const totalSemantic = cleanText(
+    let totalSemantic = cleanText(
       parsed.totalSemantic || parsed.detailedSummary || parsed.detail || parsed.longSummary,
       TOTAL_SEMANTIC_LIMIT,
     ) || fallback.totalSemantic;
+    if (totalSemantic.length < minimumTotalSemanticLength) {
+      try {
+        const expanded = await expandShortTotalSemantic({
+          client,
+          model,
+          duration,
+          minimumLength: minimumTotalSemanticLength,
+          current: totalSemantic,
+          segments: compactSegments,
+          globalEvidence,
+        });
+        if (expanded.length > totalSemantic.length) totalSemantic = expanded;
+      } catch (error) {
+        console.warn('[video-semantic] total semantic expansion fallback:', error && error.message ? error.message : error);
+      }
+    }
     return {
       title: cleanText(parsed.title, 80) || fallback.title,
       description: cleanText(parsed.description, 500) || fallback.description,
