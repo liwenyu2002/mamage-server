@@ -80,7 +80,7 @@ async function main() {
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', temporalSource,
     ], { stdio: 'ignore' });
     const temporal = await analyzeVideo(temporalSource, 7, { semantic: false, includeAudio: false });
-    assert.strictEqual(temporal.version, 3);
+    assert.strictEqual(temporal.version, 4);
     assert.strictEqual(temporal.coverage.complete, true);
     assert(temporal.segments.length >= 2, 'temporal analysis should cover multiple consecutive segments');
     assert(temporal.coverage.sampleFrameCount >= temporal.segments.length, 'every temporal segment should own representative samples');
@@ -98,7 +98,8 @@ async function main() {
       actions: ['打开', '展示'],
       keyMoment: true,
     }], 4);
-    assert(detailedGlobal.detailedSummary.includes('投票箱'), 'detailed summary should retain key entities');
+    assert(detailedGlobal.totalSemantic.includes('投票箱'), 'total semantic should retain key entities');
+    assert.strictEqual(detailedGlobal.detailedSummary, detailedGlobal.totalSemantic, 'legacy detailed summary should mirror total semantic');
     assert(detailedGlobal.visibleText.includes('投票箱'), 'global summary should retain visible text');
 
     const semanticPlan = heuristicRoughCut({

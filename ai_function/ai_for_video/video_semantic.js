@@ -3,6 +3,7 @@ const { callOllamaGenerate, parseVisionResponse } = require('../ai_for_tags/ai_f
 
 const DEFAULT_DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEFAULT_OLLAMA_MODEL = 'qwen2.5vl:3b';
+const TOTAL_SEMANTIC_LIMIT = 1800;
 
 function clamp(value, min, max) {
   const number = Number(value);
@@ -12,6 +13,10 @@ function clamp(value, min, max) {
 
 function cleanText(value, max = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function cleanSentence(value, max = 240) {
+  return cleanText(value, max).replace(/[。！？；;，,]+$/u, '').trim();
 }
 
 function normalizeProvider(value) {
@@ -302,20 +307,38 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
     const text = cleanText(segment.summary || segment.eventStage || segment.scene, 160);
     return text ? `${range}｜${text}` : '';
   }).filter(Boolean).slice(0, 8);
-  const detailedSummary = cleanText([
-    prefix,
-    evidence.event ? `活动：${cleanText(evidence.event, 160)}` : '',
-    evidence.setting ? `场景：${cleanText(evidence.setting, 160)}` : '',
-    ...narrative,
-    ...(Array.isArray(evidence.timelineFacts) ? evidence.timelineFacts.map((fact) => cleanText(fact, 220)) : []),
-    keyEntities.length ? `关键实体：${keyEntities.join('、')}` : '',
-    visibleText.length ? `可见文字：${visibleText.join('、')}` : '',
-  ].filter(Boolean).join('；'), 900);
+  const continuousStages = (segments || []).map((segment, index) => {
+    const stage = cleanSentence(segment.summary || segment.eventStage || segment.scene, 180);
+    if (!stage) return '';
+    if (index === 0) return `镜头开始时，${stage}`;
+    if (index === (segments || []).length - 1) return `最后，${stage}`;
+    return `随后，${stage}`;
+  }).filter(Boolean);
+  const opening = cleanText([
+    evidence.setting ? `画面记录在${cleanSentence(evidence.setting, 180)}` : '',
+    evidence.event ? `${evidence.setting ? '，内容围绕' : '视频内容围绕'}${cleanSentence(evidence.event, 180)}展开` : '',
+  ].filter(Boolean).join(''), 400);
+  const evidenceFacts = (Array.isArray(evidence.timelineFacts) ? evidence.timelineFacts : [])
+    .map((fact, index) => {
+      const text = cleanSentence(fact, 220);
+      if (!text) return '';
+      return index === 0 ? `画面还交代了${text}` : `其后，${text}`;
+    })
+    .filter(Boolean);
+  const totalSemantic = cleanText([
+    opening ? `${opening}。` : '',
+    ...continuousStages.map((stage) => `${stage}。`),
+    ...evidenceFacts.map((fact) => `${fact}。`),
+    keyEntities.length ? `画面中反复出现或承担关键作用的物件有${keyEntities.join('、')}。` : '',
+    visibleText.length ? `可辨认的文字有${visibleText.join('、')}。` : '',
+  ].filter(Boolean).join(''), TOTAL_SEMANTIC_LIMIT);
   return {
     title: '',
     description: cleanText([prefix, ...descriptive.slice(0, 3)].filter(Boolean).join('；'), 500),
     summary: cleanText(descriptive.slice(0, 4).join('；') || prefix, 500),
-    detailedSummary,
+    totalSemantic,
+    // Keep the existing field for stored analyses and older consumers.
+    detailedSummary: totalSemantic,
     event: cleanText(evidence.event || eventStages[0], 160),
     setting: cleanText(evidence.setting || (segments || []).map((segment) => segment.scene).find(Boolean), 160),
     tags,
@@ -359,8 +382,9 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
           role: 'system',
           content: [
             '你是高校融媒体视频编辑与事实核验员。根据覆盖整段视频的带证据时间线，生成可用于归档、检索和智能剪辑的详细总语义；不能编造。',
-            '只返回 JSON：title(8-32字), description(50-140字), summary(不超过180字), detailedSummary(120-360字), event(0-80字), setting(0-80字), tags(0-16个中文短标签), keyEntities(0-12个具体实体), visibleText(0-12个画面文字短语), searchTerms(0-20个检索词), keyMoments([{start,end,summary,reason}]), narrative(0-8条按时间排序的“起止时间｜事件”短句)。',
-            '详细总语义必须按时间讲清楚发生了什么、关键物体是什么、其在何时出现及动作如何变化。globalEvidence 是高分辨率全片核验结果，优先用于纠正片段摘要中的泛称、漏读或不一致；相邻时段明显是同一物体时必须使用同一个已核验的具体名称。',
+            '只返回 JSON：title(8-32字), description(50-140字), summary(不超过180字), totalSemantic(350-900字的中文单段长文), event(0-80字), setting(0-80字), tags(0-16个中文短标签), keyEntities(0-12个具体实体), visibleText(0-12个画面文字短语), searchTerms(0-20个检索词), keyMoments([{start,end,summary,reason}]), narrative(0-8条按时间排序的“起止时间｜事件”短句)。',
+            'totalSemantic 是独立的“总语义”，必须是一整段连贯、客观、完整的中文白描：按视频自然时间从开场写到结束，用“镜头开始、随后、接着、最后”等自然衔接推进；完整交代可核验的场景、人物角色（不命名未知人物）、关键动作、物件、可读文字、人物与物件关系及环节转换。不要写标题、列表、标签、时间戳、分段序号，也不要提及“帧、采样、模型、时间线、左侧/中间/右侧画面”。素材很短时可略短，但仍要尽可能完整；不确定的细节宁可不写，绝不为凑字数编造。',
+            'globalEvidence 是高分辨率全片核验结果，优先用于纠正片段摘要中的泛称、漏读或不一致；相邻时段明显是同一物体时必须使用同一个已核验的具体名称。',
             '只能把输入 visibleText 或 globalEvidence.visibleText 中出现的内容作为“可见文字”；只能把输入 keyObjects、evidence 或 globalEvidence 支持的内容写成具体物体或会议环节。',
             '不得把泛称强行具体化，不得把“疑似”写成事实。keyMoments 只能引用给定时段；若不确定则给空数组。',
           ].join('\n'),
@@ -405,12 +429,17 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
       ...fallback.searchTerms,
     ], 20, 80);
     const narrative = normalizedList(parsed.narrative, 8, 200);
-    const detailedSummary = cleanText(parsed.detailedSummary || parsed.detail || parsed.longSummary, 900) || fallback.detailedSummary;
+    const totalSemantic = cleanText(
+      parsed.totalSemantic || parsed.detailedSummary || parsed.detail || parsed.longSummary,
+      TOTAL_SEMANTIC_LIMIT,
+    ) || fallback.totalSemantic;
     return {
       title: cleanText(parsed.title, 80) || fallback.title,
       description: cleanText(parsed.description, 500) || fallback.description,
       summary: cleanText(parsed.summary, 500) || fallback.summary,
-      detailedSummary,
+      totalSemantic,
+      // Compatibility for clients that were released before totalSemantic.
+      detailedSummary: totalSemantic,
       event: cleanText(parsed.event || parsed.eventType, 160) || fallback.event,
       setting: cleanText(parsed.setting || parsed.scene, 160) || fallback.setting,
       tags: tags.length ? tags : fallback.tags,
