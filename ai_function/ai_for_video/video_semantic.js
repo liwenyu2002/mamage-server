@@ -397,10 +397,13 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
         reason: cleanText(item && item.reason, 160),
       };
     }).filter(Boolean);
-    const tags = normalizedList(parsed.tags, 16);
+    const tags = normalizedList([...(Array.isArray(parsed.tags) ? parsed.tags : []), ...fallback.tags], 16);
     const keyEntities = normalizedList(parsed.keyEntities || parsed.entities || parsed.keyObjects, 12, 100);
     const visibleText = normalizedList(parsed.visibleText, 12, 140);
-    const searchTerms = normalizedList(parsed.searchTerms, 20, 80);
+    const searchTerms = normalizedList([
+      ...(Array.isArray(parsed.searchTerms) ? parsed.searchTerms : []),
+      ...fallback.searchTerms,
+    ], 20, 80);
     const narrative = normalizedList(parsed.narrative, 8, 200);
     const detailedSummary = cleanText(parsed.detailedSummary || parsed.detail || parsed.longSummary, 900) || fallback.detailedSummary;
     return {
@@ -411,11 +414,11 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
       event: cleanText(parsed.event || parsed.eventType, 160) || fallback.event,
       setting: cleanText(parsed.setting || parsed.scene, 160) || fallback.setting,
       tags: tags.length ? tags : fallback.tags,
-      keyEntities: keyEntities.length ? keyEntities : fallback.keyEntities,
+      keyEntities: normalizedList([...keyEntities, ...fallback.keyEntities], 12, 100),
       visibleText: visibleText.length ? visibleText : fallback.visibleText,
       searchTerms: searchTerms.length ? searchTerms : fallback.searchTerms,
       keyMoments: keyMoments.length ? keyMoments : fallback.keyMoments,
-      narrative: narrative.length ? narrative : fallback.narrative,
+      narrative: normalizedList([...narrative, ...fallback.narrative], 8, 200),
       provider: 'text-model',
       model,
     };
