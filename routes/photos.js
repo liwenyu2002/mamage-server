@@ -2097,6 +2097,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
         p.ai_error AS aiError,
         p.ai_started_at AS aiStartedAt,
         p.ai_finished_at AS aiFinishedAt,
+        pvs.analysis_json AS videoAnalysis,
         p.type,
         p.photographer_id AS photographerId,
         u.name AS photographerName,
@@ -2105,6 +2106,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       FROM photos p
       LEFT JOIN users u ON p.photographer_id = u.id
       LEFT JOIN project_timeline_sections pts ON p.timeline_section_id = pts.id
+      LEFT JOIN photo_video_semantics pvs ON pvs.photo_id = p.id
       WHERE p.id = ?`;
 
     // apply organization scoping for single photo
@@ -2154,6 +2156,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       aiError: p.aiError || null,
       aiStartedAt: p.aiStartedAt || null,
       aiFinishedAt: p.aiFinishedAt || null,
+      videoAnalysis: (() => { try { return typeof p.videoAnalysis === 'string' ? JSON.parse(p.videoAnalysis) : (p.videoAnalysis || null); } catch (e) { return null; } })(),
       type: p.type,
       photographerId: p.photographerId || null,
       photographerName: p.photographerName || null,
