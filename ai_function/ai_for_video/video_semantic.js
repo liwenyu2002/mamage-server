@@ -273,6 +273,19 @@ function extractOpenAIMessageText(message) {
   return String(message.content || '').trim();
 }
 
+// 长视频总语义只是结构化时间线的增强层，绝不能因第三方文本模型的慢推理永久占住 AI 队列。
+const VIDEO_TEXT_TIMEOUT_MS = Math.max(15000, Math.min(120000, Number(process.env.VIDEO_SEMANTIC_TEXT_TIMEOUT_MS || 65000)));
+const VIDEO_TEXT_MAX_TOKENS = Math.max(500, Math.min(2400, Number(process.env.VIDEO_SEMANTIC_TEXT_MAX_TOKENS || 1500)));
+
+function createVideoTextClient(apiKey, baseURL) {
+  return new OpenAI({
+    apiKey,
+    baseURL,
+    timeout: VIDEO_TEXT_TIMEOUT_MS,
+    maxRetries: 0,
+  });
+}
+
 async function callVisionProvider(provider, imageJpeg, prompt) {
   if (provider === 'off') return { available: false, provider: 'off', model: null, raw: '' };
   if (provider === 'ollama') {
@@ -424,6 +437,7 @@ async function expandShortTotalSemantic({ client, model, duration, minimumLength
   const response = await client.chat.completions.create({
     model,
     temperature: 0.1,
+    max_tokens: VIDEO_TEXT_MAX_TOKENS,
     messages: [
       {
         role: 'system',
@@ -461,7 +475,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
   if (!allowModel || !apiKey || !segments.some((segment) => segment.summary)) return fallback;
   const model = process.env.AI_VIDEO_MODEL || process.env.AI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
   const baseURL = process.env.AI_TEXT_BASE_URL || process.env.DASHSCOPE_BASE_URL || undefined;
-  const client = baseURL ? new OpenAI({ apiKey, baseURL }) : new OpenAI({ apiKey });
+  const client = createVideoTextClient(apiKey, baseURL);
   const minimumTotalSemanticLength = totalSemanticMinimumLength(duration);
   const compactSegments = segments.map((segment) => ({
     start: Number(segment.start.toFixed(2)),
@@ -481,6 +495,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
     const response = await client.chat.completions.create({
       model,
       temperature: 0.15,
+      max_tokens: VIDEO_TEXT_MAX_TOKENS,
       messages: [
         {
           role: 'system',
