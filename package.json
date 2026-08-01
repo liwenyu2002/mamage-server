@@ -15,6 +15,7 @@
     "face:backfill": "node scripts/backfill_faces.js",
     "image:backfill": "node scripts/backfill_image_embeddings.js",
     "video:playback:backfill": "node scripts/backfill_video_playback.js",
+    "video:transcript:backfill": "node scripts/backfill_video_transcripts.js --all",
     "video:validate": "node scripts/validate_video_production.js",
     "storage:cors": "node scripts/configure_storage_cors.js",
     "test": "echo \"Error: no test specified\" && exit 1",

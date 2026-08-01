@@ -80,7 +80,7 @@ async function main() {
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', temporalSource,
     ], { stdio: 'ignore' });
     const temporal = await analyzeVideo(temporalSource, 7, { semantic: false, includeAudio: false });
-    assert.strictEqual(temporal.version, 4);
+    assert.strictEqual(temporal.version, 5);
     assert.strictEqual(temporal.coverage.complete, true);
     assert(temporal.segments.length >= 2, 'temporal analysis should cover multiple consecutive segments');
     assert(temporal.coverage.sampleFrameCount >= temporal.segments.length, 'every temporal segment should own representative samples');
@@ -113,6 +113,19 @@ async function main() {
     }], 4, { visibleText: ['全片核验文字'] });
     assert(verifiedTextGlobal.visibleText.includes('全片核验文字'), 'total semantic should prefer verified full-video OCR');
     assert(!verifiedTextGlobal.visibleText.includes('低清误读'), 'total semantic should not mix unverified segment OCR');
+
+    const audioAwareGlobal = deterministicTimelineSummary([{
+      start: 0,
+      end: 4,
+      summary: '主持人在会场介绍活动流程。',
+      tags: ['室内', '会议'],
+      actions: ['发言'],
+    }], 4, null, {
+      status: 'done',
+      segments: [{ start: 0.4, end: 2.8, text: '现在开始介绍本次活动的流程。' }],
+    });
+    assert.strictEqual(audioAwareGlobal.spokenHighlights.length, 1, 'speech transcript should produce timestamped highlights');
+    assert(audioAwareGlobal.totalSemantic.includes('活动的流程'), 'total semantic should retain verified spoken content');
 
     const semanticPlan = heuristicRoughCut({
       targetDuration: 5,

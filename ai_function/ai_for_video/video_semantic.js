@@ -355,7 +355,44 @@ async function analyzeGlobalEvidenceBoard(evidenceJpeg, context = {}) {
   }
 }
 
-function deterministicTimelineSummary(segments, duration, globalEvidence = null) {
+function compactTranscriptSegments(transcript, limit = 80) {
+  const source = Array.isArray(transcript && transcript.segments) ? transcript.segments : [];
+  const normalized = source.map((item) => ({
+    start: Number(item && item.start) || 0,
+    end: Number(item && item.end) || Number(item && item.start) || 0,
+    text: cleanText(item && item.text, 220),
+  })).filter((item) => item.text);
+  if (normalized.length <= limit) return normalized;
+  const indexes = new Set();
+  for (let index = 0; index < limit; index += 1) {
+    indexes.add(Math.round((index / Math.max(1, limit - 1)) * (normalized.length - 1)));
+  }
+  return Array.from(indexes).sort((left, right) => left - right).map((index) => normalized[index]);
+}
+
+function transcriptHighlights(transcript, limit = 8) {
+  return compactTranscriptSegments(transcript, limit).map((item) => ({
+    start: Number(item.start.toFixed(3)),
+    end: Number(item.end.toFixed(3)),
+    text: item.text,
+  }));
+}
+
+function transcriptEvidenceForPrompt(transcript) {
+  if (!transcript || typeof transcript !== 'object') return null;
+  return {
+    status: String(transcript.status || 'unavailable'),
+    language: cleanText(transcript.language, 24),
+    coverage: transcript.coverage && typeof transcript.coverage === 'object' ? {
+      start: Number(transcript.coverage.start) || 0,
+      end: Number(transcript.coverage.end) || 0,
+      complete: Boolean(transcript.coverage.complete),
+    } : null,
+    segments: compactTranscriptSegments(transcript, 80),
+  };
+}
+
+function deterministicTimelineSummary(segments, duration, globalEvidence = null, transcript = null) {
   const evidence = globalEvidence && typeof globalEvidence === 'object' ? globalEvidence : {};
   const descriptive = (segments || []).map((segment) => cleanText(segment.summary, 80)).filter(Boolean);
   const tags = Array.from(new Set((segments || []).flatMap((segment) => Array.isArray(segment.tags) ? segment.tags : []))).slice(0, 12);
@@ -405,18 +442,21 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
     .filter(Boolean)
     .slice(0, 3);
   const sceneObjects = keyEntities.filter((item) => !['黑色西装', '浅色衬衫'].includes(item)).slice(0, 10);
+  const spokenHighlights = transcriptHighlights(transcript);
+  const spokenExcerpt = spokenHighlights.slice(0, 2).map((item) => cleanNarrativePhrase(item.text, 120, canonicalObject)).filter(Boolean);
   const totalSemantic = cleanText([
     opening ? `${opening}。` : '',
     sceneObjects.length ? `会场内可见${sceneObjects.join('、')}等布置与物件。` : '',
     visibleText.length ? `红色背景板和现场屏幕上可辨认出${visibleText.join('、')}等文字。` : '',
     ...continuousStages.map((stage) => `${stage}。`),
     supportingFacts.length ? `操作环节中，${supportingFacts.join('；')}。` : '',
+    spokenExcerpt.length ? `现场音频转写可听到“${spokenExcerpt.join('”“')}”等内容。` : '',
     evidence.event && continuousStages.length ? `视频以${cleanNarrativePhrase(evidence.event, 160, canonicalObject)}相关的现场环节为主线，依次呈现了发言、操作与展示过程。` : '',
   ].filter(Boolean).join(''), TOTAL_SEMANTIC_LIMIT);
   return {
     title: '',
-    description: cleanText([prefix, ...descriptive.slice(0, 3)].filter(Boolean).join('；'), 500),
-    summary: cleanText(descriptive.slice(0, 4).join('；') || prefix, 500),
+    description: cleanText([prefix, ...descriptive.slice(0, 3), spokenHighlights.length ? `含 ${spokenHighlights.length} 段可定位的语音转写` : ''].filter(Boolean).join('；'), 500),
+    summary: cleanText([descriptive.slice(0, 4).join('；') || prefix, spokenExcerpt.length ? `音频提及${spokenExcerpt[0]}` : ''].filter(Boolean).join('；'), 500),
     totalSemantic,
     // Keep the existing field for stored analyses and older consumers.
     detailedSummary: totalSemantic,
@@ -428,12 +468,13 @@ function deterministicTimelineSummary(segments, duration, globalEvidence = null)
     searchTerms: Array.from(new Set([...tags, ...keyEntities, ...eventStages, ...((segments || []).flatMap((segment) => segment.actions || []))])).slice(0, 20),
     keyMoments,
     narrative,
+    spokenHighlights,
     provider: 'heuristic',
     model: null,
   };
 }
 
-async function expandShortTotalSemantic({ client, model, duration, minimumLength, current, segments, globalEvidence }) {
+async function expandShortTotalSemantic({ client, model, duration, minimumLength, current, segments, globalEvidence, transcript }) {
   const response = await client.chat.completions.create({
     model,
     temperature: 0.1,
@@ -442,9 +483,9 @@ async function expandShortTotalSemantic({ client, model, duration, minimumLength
       {
         role: 'system',
         content: [
-          '你是高校融媒体视频编辑与事实核验员。下面的总语义因过短需要补全，但只能依据提供的可核验视觉证据扩写，绝不能添加没有证据支持的人物、行为、物件、文字或情节。',
+          '你是高校融媒体视频编辑与事实核验员。下面的总语义因过短需要补全，但只能依据提供的可核验视觉证据和音频转写扩写，绝不能添加没有证据支持的人物、行为、物件、文字或情节。',
           `只返回 JSON：totalSemantic(一整段中文白描，至少${minimumLength}字，最多900字)。`,
-          '必须从镜头开场自然写到结束，完整写出场景、人物角色、关键动作、具体物件、可见文字、人物与物件关系和环节转换。使用连贯叙述，不得使用标题、列表、标签、时间戳、分段序号，也不得提及帧、模型、采样或时间线。',
+          '必须从镜头开场自然写到结束，完整写出场景、人物角色、关键动作、具体物件、可见文字、人物与物件关系和环节转换。音频转写只能作为“听到的内容”，绝不能当作画面文字，也不能给未明确的说话者命名。使用连贯叙述，不得使用标题、列表、标签、时间戳、分段序号，也不得提及帧、模型、采样或时间线。',
           '这是硬性补写任务：先在脑中核对内容是否充分，再输出；如果输入素材很短，也可以细致描述可明确看见的环境、站位、物件和动作变化，但不得编造。',
         ].join('\n'),
       },
@@ -460,6 +501,7 @@ async function expandShortTotalSemantic({ client, model, duration, minimumLength
             timelineFacts: normalizedList(globalEvidence.timelineFacts, 8, 220),
             evidence: normalizedList(globalEvidence.evidence, 8, 180),
           } : null,
+          transcript: transcriptEvidenceForPrompt(transcript),
           segments,
         }) },
     ],
@@ -469,8 +511,8 @@ async function expandShortTotalSemantic({ client, model, duration, minimumLength
   return cleanText(parsed && (parsed.totalSemantic || parsed.detailedSummary || parsed.detail), TOTAL_SEMANTIC_LIMIT);
 }
 
-async function summarizeTemporalTimeline({ segments, duration, hasAudio, silences, globalEvidence = null, allowModel = true }) {
-  const fallback = deterministicTimelineSummary(segments, duration, globalEvidence);
+async function summarizeTemporalTimeline({ segments, duration, hasAudio, silences, globalEvidence = null, transcript = null, allowModel = true }) {
+  const fallback = deterministicTimelineSummary(segments, duration, globalEvidence, transcript);
   const apiKey = process.env.AI_TEXT_API_KEY || process.env.OPENAI_API_KEY || '';
   if (!allowModel || !apiKey || !segments.some((segment) => segment.summary)) return fallback;
   const model = process.env.AI_VIDEO_MODEL || process.env.AI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -502,7 +544,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
           content: [
             '你是高校融媒体视频编辑与事实核验员。根据覆盖整段视频的带证据时间线，生成可用于归档、检索和智能剪辑的详细总语义；不能编造。',
             `只返回 JSON：title(8-32字), description(50-140字), summary(不超过180字), totalSemantic(${minimumTotalSemanticLength}-900字的中文单段长文), event(0-80字), setting(0-80字), tags(0-16个中文短标签), keyEntities(0-12个具体实体), visibleText(0-12个画面文字短语), searchTerms(0-20个检索词), keyMoments([{start,end,summary,reason}]), narrative(0-8条按时间排序的“起止时间｜事件”短句)。`,
-            'totalSemantic 是独立的“总语义”，必须是一整段连贯、客观、完整的中文白描：按视频自然时间从开场写到结束，用“镜头开始、随后、接着、最后”等自然衔接推进；完整交代可核验的场景、人物角色（不命名未知人物）、关键动作、物件、可读文字、人物与物件关系及环节转换。不要写标题、列表、标签、时间戳、分段序号，也不要提及“帧、采样、模型、时间线、左侧/中间/右侧画面”。素材很短时可略短，但仍要尽可能完整；不确定的细节宁可不写，绝不为凑字数编造。',
+            'totalSemantic 是独立的“总语义”，必须是一整段连贯、客观、完整的中文白描：按视频自然时间从开场写到结束，用“镜头开始、随后、接着、最后”等自然衔接推进；完整交代可核验的场景、人物角色（不命名未知人物）、关键动作、物件、可读文字、人物与物件关系及环节转换。音频转写仅能写成“现场可听到/音频中提到”，不能视为可见文字，不能据此猜测说话者，也不能将转写不确定内容写成事实。不要写标题、列表、标签、时间戳、分段序号，也不要提及“帧、采样、模型、时间线、左侧/中间/右侧画面”。素材很短时可略短，但仍要尽可能完整；不确定的细节宁可不写，绝不为凑字数编造。',
             'globalEvidence 是高分辨率全片核验结果，优先用于纠正片段摘要中的泛称、漏读或不一致；相邻时段明显是同一物体时必须使用同一个已核验的具体名称。',
             '只能把输入 visibleText 或 globalEvidence.visibleText 中出现的内容作为“可见文字”；只能把输入 keyObjects、evidence 或 globalEvidence 支持的内容写成具体物体或会议环节。',
             '不得把泛称强行具体化，不得把“疑似”写成事实。keyMoments 只能引用给定时段；若不确定则给空数组。',
@@ -520,6 +562,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
             timelineFacts: normalizedList(globalEvidence.timelineFacts, 8, 220),
             evidence: normalizedList(globalEvidence.evidence, 8, 180),
           } : null,
+          transcript: transcriptEvidenceForPrompt(transcript),
           segments: compactSegments,
         }) },
       ],
@@ -565,6 +608,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
           current: totalSemantic,
           segments: compactSegments,
           globalEvidence,
+          transcript,
         });
         if (expanded.length > totalSemantic.length) totalSemantic = expanded;
       } catch (error) {
@@ -587,6 +631,7 @@ async function summarizeTemporalTimeline({ segments, duration, hasAudio, silence
       searchTerms: searchTerms.length ? searchTerms : fallback.searchTerms,
       keyMoments: keyMoments.length ? keyMoments : fallback.keyMoments,
       narrative: normalizedList([...narrative, ...fallback.narrative], 8, 200),
+      spokenHighlights: fallback.spokenHighlights,
       provider: 'text-model',
       model,
     };
