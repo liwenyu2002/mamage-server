@@ -15,11 +15,15 @@ const { pool, buildUploadUrl } = require('../db');
 const cosStorage = require('../lib/cos_storage');
 const { requirePermission } = require('../lib/permissions');
 const { createPublicDownloadBuffer, readStreamToBuffer, DEFAULT_MAX_BYTES: DEFAULT_PUBLIC_DOWNLOAD_MAX_BYTES } = require('../lib/public_download_variant');
+const { getMaxVideoUploadBytes, getMaxVideoApiFallbackBytes } = require('../config/video_upload_limits');
 
 const execFileAsync = promisify(execFile);
 
 const MAX_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_FILE_MB || 30)) * 1024 * 1024;
-const MAX_VIDEO_UPLOAD_BYTES = Math.max(1, Number(process.env.UPLOAD_MAX_VIDEO_MB || 512)) * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES = getMaxVideoUploadBytes();
+// 普通 multipart 接口会先把文件落到临时盘，作为直传不可用时的兼容兜底。
+// 超过该值必须使用对象存储直传，避免 100GB 文件挤爆 Mac Mini 临时盘。
+const MAX_VIDEO_API_FALLBACK_BYTES = getMaxVideoApiFallbackBytes();
 const THUMB_MAX_DIMENSION = Math.max(320, Number(process.env.UPLOAD_THUMB_MAX_DIMENSION || process.env.UPLOAD_THUMB_MAX_WIDTH || 800));
 const THUMB_QUALITY = Math.min(95, Math.max(50, Number(process.env.UPLOAD_THUMB_JPEG_QUALITY || 80)));
 const UPLOAD_CACHE_CONTROL = process.env.UPLOAD_CACHE_CONTROL || 'public, max-age=31536000, immutable';
@@ -43,6 +47,22 @@ const VIDEO_PLAYBACK_MAXRATE = process.env.VIDEO_PLAYBACK_MAXRATE || '2800k';
 const VIDEO_PLAYBACK_BUFSIZE = process.env.VIDEO_PLAYBACK_BUFSIZE || '5600k';
 const VIDEO_PLAYBACK_TIMEOUT_MS = Math.max(30000, envNumber(process.env.VIDEO_PLAYBACK_TIMEOUT_MS, 900000));
 const VIDEO_TMP_MIN_FREE_BYTES = Math.max(0, envNumber(process.env.VIDEO_TMP_MIN_FREE_MB, 2048)) * 1024 * 1024;
+const DIRECT_VIDEO_MULTIPART_THRESHOLD_BYTES = Math.max(
+  5 * 1024 * 1024,
+  envNumber(process.env.DIRECT_VIDEO_MULTIPART_THRESHOLD_MB, 2048) * 1024 * 1024
+);
+const DIRECT_VIDEO_ESTIMATED_BYTES_PER_SECOND = Math.max(
+  128 * 1024,
+  envNumber(process.env.DIRECT_VIDEO_ESTIMATED_BYTES_PER_SECOND, 768 * 1024)
+);
+const DIRECT_VIDEO_FINISHING_BUFFER_SECONDS = Math.max(
+  5 * 60,
+  envNumber(process.env.DIRECT_VIDEO_FINISHING_BUFFER_SECONDS, 30 * 60)
+);
+const DIRECT_VIDEO_SESSION_TTL_MAX_MS = Math.max(
+  60 * 60 * 1000,
+  envNumber(process.env.DIRECT_VIDEO_SESSION_TTL_MAX_MINUTES, 48 * 60) * 60 * 1000
+);
 
 const IMAGE_MIME_BY_EXT = new Map([
   ['.jpg', 'image/jpeg'],
@@ -77,11 +97,12 @@ const VIDEO_MIME_BY_EXT = new Map([
 ]);
 const ALLOWED_VIDEO_MIMES = new Set(VIDEO_MIME_BY_EXT.values());
 const VIDEO_UPLOAD_TMP_DIR = process.env.UPLOAD_VIDEO_TMP_DIR || path.join(os.tmpdir(), 'mamage-video-uploads');
-const DIRECT_VIDEO_PART_SIZE = Math.max(5 * 1024 * 1024, envNumber(process.env.DIRECT_VIDEO_PART_SIZE_MB, 16) * 1024 * 1024);
+const DIRECT_VIDEO_PART_SIZE = Math.max(5 * 1024 * 1024, envNumber(process.env.DIRECT_VIDEO_PART_SIZE_MB, 32) * 1024 * 1024);
 const DIRECT_VIDEO_MAX_PARTS = 10000;
 const DIRECT_VIDEO_SESSION_TTL_MS = Math.max(10 * 60 * 1000, envNumber(process.env.DIRECT_VIDEO_SESSION_TTL_MINUTES, 180) * 60 * 1000);
 const DIRECT_VIDEO_PART_URL_BATCH = Math.min(32, Math.max(1, envNumber(process.env.DIRECT_VIDEO_PART_URL_BATCH, 12)));
 const directVideoUploads = new Map();
+let directVideoCleanupTimer = null;
 
 function parseEnvBoolean(value) {
   const raw = String(value || '').trim().toLowerCase();
@@ -147,6 +168,15 @@ function cleanupDirectVideoUploads() {
   }
 }
 
+function getDirectVideoSessionTtlMs(fileSize) {
+  const estimatedSeconds = Math.ceil(Number(fileSize || 0) / DIRECT_VIDEO_ESTIMATED_BYTES_PER_SECOND)
+    + DIRECT_VIDEO_FINISHING_BUFFER_SECONDS;
+  return Math.min(
+    DIRECT_VIDEO_SESSION_TTL_MAX_MS,
+    Math.max(DIRECT_VIDEO_SESSION_TTL_MS, estimatedSeconds * 1000)
+  );
+}
+
 function getDirectVideoSession(req, sessionId) {
   cleanupDirectVideoUploads();
   const session = directVideoUploads.get(String(sessionId || ''));
@@ -157,8 +187,13 @@ function getDirectVideoSession(req, sessionId) {
 }
 
 function scheduleDirectVideoCleanup() {
-  const timer = setTimeout(cleanupDirectVideoUploads, DIRECT_VIDEO_SESSION_TTL_MS + 1000);
-  if (timer && typeof timer.unref === 'function') timer.unref();
+  if (directVideoCleanupTimer) return;
+  directVideoCleanupTimer = setTimeout(() => {
+    directVideoCleanupTimer = null;
+    cleanupDirectVideoUploads();
+    if (directVideoUploads.size) scheduleDirectVideoCleanup();
+  }, Math.min(5 * 60 * 1000, DIRECT_VIDEO_SESSION_TTL_MS));
+  if (directVideoCleanupTimer && typeof directVideoCleanupTimer.unref === 'function') directVideoCleanupTimer.unref();
 }
 
 try {
@@ -229,7 +264,7 @@ const videoStorage = multer.diskStorage({
 const videoUpload = multer({
   storage: videoStorage,
   limits: {
-    fileSize: MAX_VIDEO_UPLOAD_BYTES,
+    fileSize: MAX_VIDEO_API_FALLBACK_BYTES,
     files: 1,
     fields: 16,
     parts: 24,
@@ -1191,11 +1226,26 @@ function handleUploadMiddleware(req, res, next) {
 }
 
 function handleVideoUploadMiddleware(req, res, next) {
+  // multipart 的 Content-Length 包含少量表单边界开销，留出 32MiB 后再拦截，
+  // 这样超大文件不会先被 diskStorage 写入临时目录。
+  const contentLength = Number(req.headers && req.headers['content-length']);
+  if (Number.isFinite(contentLength)
+    && contentLength > MAX_VIDEO_API_FALLBACK_BYTES + 32 * 1024 * 1024) {
+    return res.status(413).json({
+      error: 'VIDEO_FILE_TOO_LARGE',
+      maxFileBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+      directUploadRequiredAboveBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+    });
+  }
   videoUpload.single('file')(req, res, (err) => {
     if (!err) return next();
     if (err instanceof multer.MulterError) {
       if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ error: 'VIDEO_FILE_TOO_LARGE', maxFileBytes: MAX_VIDEO_UPLOAD_BYTES });
+        return res.status(413).json({
+          error: 'VIDEO_FILE_TOO_LARGE',
+          maxFileBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+          directUploadRequiredAboveBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+        });
       }
       return res.status(400).json({ error: err.code || 'VIDEO_UPLOAD_REJECTED' });
     }
@@ -1637,20 +1687,63 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
     if (fileSize > MAX_VIDEO_UPLOAD_BYTES) return res.status(413).json({ error: 'VIDEO_FILE_TOO_LARGE', maxFileBytes: MAX_VIDEO_UPLOAD_BYTES });
 
     const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'video');
-    // 该对象存储网关会错误拒绝跨域 PUT 的 OPTIONS 预检；采用标准 S3 presigned POST，
-    // 浏览器可直接提交 FormData 到存储，不经过 Mac Mini，也不会触发 PUT 预检。
-    const post = await cosStorage.signedPost(originalKey, {
-      expires: SIGNED_UPLOAD_EXPIRES_SECONDS, contentType: mimeType, cacheControl: UPLOAD_CACHE_CONTROL, maxBytes: fileSize,
-    });
     const sessionId = uuidv4();
-    directVideoUploads.set(sessionId, {
+    const sessionTtlMs = getDirectVideoSessionTtlMs(fileSize);
+    const commonSession = {
       id: sessionId, userId: req.user.id, orgId, metadata, fileName, fileSize, mimeType,
       originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel,
-      storageUploadId: null, partCount: 1, createdAt: Date.now(), expiresAt: Date.now() + DIRECT_VIDEO_SESSION_TTL_MS,
-      status: 'uploading',
+      createdAt: Date.now(), expiresAt: Date.now() + sessionTtlMs, status: 'uploading',
+    };
+
+    // 大文件用 S3 multipart：网络抖动只需重传当前分片，且整个视频始终不落 Mac Mini 临时盘。
+    if (fileSize >= DIRECT_VIDEO_MULTIPART_THRESHOLD_BYTES) {
+      const multipart = await cosStorage.createMultipartUpload(originalKey, {
+        contentType: mimeType,
+        cacheControl: UPLOAD_CACHE_CONTROL,
+      });
+      const partCount = Math.ceil(fileSize / DIRECT_VIDEO_PART_SIZE);
+      if (partCount > DIRECT_VIDEO_MAX_PARTS) {
+        await cosStorage.abortMultipartUpload(originalKey, multipart.uploadId).catch(() => null);
+        return res.status(413).json({ error: 'VIDEO_TOO_MANY_PARTS', maxParts: DIRECT_VIDEO_MAX_PARTS });
+      }
+      directVideoUploads.set(sessionId, {
+        ...commonSession,
+        storageUploadId: multipart.uploadId,
+        partCount,
+      });
+      scheduleDirectVideoCleanup();
+      return res.json({
+        uploadMode: 'direct-video-multipart',
+        sessionId,
+        partSize: DIRECT_VIDEO_PART_SIZE,
+        partCount,
+        expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS,
+        maxFileBytes: MAX_VIDEO_UPLOAD_BYTES,
+        sessionExpiresIn: Math.ceil(sessionTtlMs / 1000),
+      });
+    }
+
+    // 小文件保留预签名 POST，兼容部分对象存储网关对跨域 PUT 预检的限制。
+    const post = await cosStorage.signedPost(originalKey, {
+      expires: SIGNED_UPLOAD_EXPIRES_SECONDS,
+      contentType: mimeType,
+      cacheControl: UPLOAD_CACHE_CONTROL,
+      maxBytes: fileSize,
+    });
+    directVideoUploads.set(sessionId, {
+      ...commonSession,
+      storageUploadId: null,
+      partCount: 1,
     });
     scheduleDirectVideoCleanup();
-    return res.json({ uploadMode: 'direct-video-post', sessionId, expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS, upload: { uploadUrl: post.postUrl, formFields: post.fields } });
+    return res.json({
+      uploadMode: 'direct-video-post',
+      sessionId,
+      expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS,
+      sessionExpiresIn: Math.ceil(sessionTtlMs / 1000),
+      maxFileBytes: MAX_VIDEO_UPLOAD_BYTES,
+      upload: { uploadUrl: post.postUrl, formFields: post.fields },
+    });
   } catch (err) {
     console.error('POST /api/upload/video/direct/init error:', err && err.stack ? err.stack : err);
     return res.status(err.status || 500).json({ error: err.message || 'DIRECT_VIDEO_INIT_FAILED' });
@@ -1661,6 +1754,7 @@ router.post('/video/direct/parts', requirePermission('upload.photo'), async (req
   try {
     const session = getDirectVideoSession(req, req.body && req.body.sessionId);
     if (!session || session.status !== 'uploading') return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
+    if (!session.storageUploadId) return res.status(400).json({ error: 'DIRECT_VIDEO_MULTIPART_NOT_ENABLED' });
     const requested = Array.from(new Set(Array.isArray(req.body && req.body.partNumbers) ? req.body.partNumbers.map(Number) : []))
       .filter((partNumber) => Number.isInteger(partNumber) && partNumber >= 1 && partNumber <= session.partCount)
       .slice(0, DIRECT_VIDEO_PART_URL_BATCH);
@@ -1682,6 +1776,23 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
     session = getDirectVideoSession(req, req.body && req.body.sessionId);
     if (!session || session.status !== 'uploading') return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
     session.status = 'completing';
+    if (session.storageUploadId) {
+      const parts = Array.from(req.body && req.body.parts || [])
+        .map((part) => ({
+          partNumber: Number(part && part.partNumber),
+          etag: String(part && part.etag || '').trim(),
+        }))
+        .filter((part) => Number.isInteger(part.partNumber)
+          && part.partNumber >= 1
+          && part.partNumber <= session.partCount
+          && part.etag)
+        .sort((a, b) => a.partNumber - b.partNumber);
+      if (parts.length !== session.partCount || parts.some((part, index) => part.partNumber !== index + 1)) {
+        session.status = 'uploading';
+        return res.status(400).json({ error: 'DIRECT_VIDEO_PARTS_INCOMPLETE' });
+      }
+      await cosStorage.completeMultipartUpload(session.originalKey, session.storageUploadId, parts);
+    }
     const head = await cosStorage.headObject(session.originalKey);
     if (!head || Number(head.ContentLength) !== Number(session.fileSize)) throw new Error('DIRECT_VIDEO_SIZE_MISMATCH');
 

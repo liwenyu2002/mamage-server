@@ -9,15 +9,17 @@ const { probeVideo, renderProject, normalizeProjectClips } = require('../lib/vid
 const { analyzeVideo } = require('../lib/video_analysis');
 const videoStorage = require('../lib/video_editor_storage');
 const cosStorage = require('../lib/cos_storage');
+const { getMaxVideoUploadBytes, getMaxVideoApiFallbackBytes } = require('../config/video_upload_limits');
 
 const router = express.Router();
 const assetUploadDir = videoStorage.getUploadTempDir();
-const MAX_VIDEO_UPLOAD_BYTES = Math.max(10, Number(process.env.VIDEO_UPLOAD_MAX_MB) || 5120) * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES = getMaxVideoUploadBytes();
+const MAX_VIDEO_API_FALLBACK_BYTES = getMaxVideoApiFallbackBytes();
 const DIRECT_ASSET_UPLOAD_TTL_MS = Math.max(10 * 60 * 1000, Number(process.env.VIDEO_DIRECT_UPLOAD_TTL_MINUTES || 30) * 60 * 1000);
 const DIRECT_ASSET_UPLOAD_EXPIRES_SECONDS = Math.max(60, Number(process.env.COS_SIGNED_UPLOAD_EXPIRES_SECONDS || 900));
 const DIRECT_ASSET_UPLOAD_MAX_EXPIRES_SECONDS = Math.max(
   DIRECT_ASSET_UPLOAD_EXPIRES_SECONDS,
-  Number(process.env.VIDEO_DIRECT_UPLOAD_MAX_EXPIRES_SECONDS || 6 * 60 * 60)
+  Number(process.env.VIDEO_DIRECT_UPLOAD_MAX_EXPIRES_SECONDS || 48 * 60 * 60)
 );
 const DIRECT_ASSET_UPLOAD_ESTIMATED_BYTES_PER_SECOND = Math.max(
   128 * 1024,
@@ -35,7 +37,8 @@ const upload = multer({
       cb(null, `${Date.now()}-${crypto.randomUUID()}${ext}`);
     },
   }),
-  limits: { fileSize: MAX_VIDEO_UPLOAD_BYTES },
+  // 该接口会先写入 Mac Mini 临时目录，只作为小文件兼容兜底。
+  limits: { fileSize: MAX_VIDEO_API_FALLBACK_BYTES },
   fileFilter: (_req, file, cb) => {
     const accepted = String(file.mimetype || '').startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv|avi|ogv|ogg)$/i.test(file.originalname || '');
     cb(accepted ? null : new Error('仅支持视频文件'), accepted);
@@ -180,10 +183,25 @@ router.get('/assets', requirePermission('ai.generate'), async (req, res) => {
 });
 
 router.post('/assets', requirePermission('ai.generate'), (req, res) => {
+  const contentLength = Number(req.headers && req.headers['content-length']);
+  if (Number.isFinite(contentLength)
+    && contentLength > MAX_VIDEO_API_FALLBACK_BYTES + 32 * 1024 * 1024) {
+    return res.status(413).json({
+      error: 'VIDEO_UPLOAD_FAILED',
+      message: '超过 5GB 的视频必须直传对象存储',
+      maxFileBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+      directUploadRequiredAboveBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+    });
+  }
   upload.single('file')(req, res, async (uploadError) => {
     if (uploadError) {
       const status = uploadError && uploadError.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
-      return res.status(status).json({ error: 'VIDEO_UPLOAD_FAILED', message: uploadError.message });
+      return res.status(status).json({
+        error: 'VIDEO_UPLOAD_FAILED',
+        message: uploadError.message,
+        maxFileBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+        directUploadRequiredAboveBytes: MAX_VIDEO_API_FALLBACK_BYTES,
+      });
     }
     if (!req.file) return res.status(400).json({ error: 'VIDEO_REQUIRED', message: '请选择视频文件' });
     try {
