@@ -101,6 +101,15 @@ const DIRECT_VIDEO_PART_SIZE = Math.max(5 * 1024 * 1024, envNumber(process.env.D
 const DIRECT_VIDEO_MAX_PARTS = 10000;
 const DIRECT_VIDEO_SESSION_TTL_MS = Math.max(10 * 60 * 1000, envNumber(process.env.DIRECT_VIDEO_SESSION_TTL_MINUTES, 180) * 60 * 1000);
 const DIRECT_VIDEO_PART_URL_BATCH = Math.min(32, Math.max(1, envNumber(process.env.DIRECT_VIDEO_PART_URL_BATCH, 12)));
+// 代理直传：HTTPS 页面向 HTTP 对象存储端点直传会被浏览器混合内容拦截，校外也路由不到内网存储。
+// 浏览器改为把分片 PUT 到同源 API，服务端收一片转一片进对象存储 multipart，全程不落本机临时盘。
+// 分片必须小于 Cloudflare 免费版单请求 ~100MB 上限，且在慢隧道(实测约 0.4MB/s)下单请求耗时
+// 要远低于 100s 源站超时，所以默认比直传分片小。
+const DIRECT_VIDEO_PROXY_PART_SIZE = Math.max(
+  5 * 1024 * 1024,
+  envNumber(process.env.DIRECT_VIDEO_PROXY_PART_SIZE_MB, 8) * 1024 * 1024
+);
+const DIRECT_VIDEO_PROXY_MAX_INFLIGHT = Math.max(1, Math.min(16, envNumber(process.env.DIRECT_VIDEO_PROXY_MAX_INFLIGHT, 4)));
 const directVideoUploads = new Map();
 let directVideoCleanupTimer = null;
 
@@ -156,6 +165,26 @@ function getDirectUploadUnavailableReason() {
   }
 
   return null;
+}
+
+function getStorageEndpointProtocol() {
+  try {
+    const parsed = new URL(cosStorage.getEndpointUrl() || '');
+    return parsed.protocol || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// 视频直传通道协商：HTTPS 页面 + HTTP 存储端点时浏览器直传必被混合内容拦截，
+// 必须走同源代理通道（内网存储地址浏览器也未必可达，代理通道同样兜得住）。
+function resolveDirectVideoTransport(req) {
+  const requested = String(req.body && req.body.transport || '').trim().toLowerCase();
+  if (requested === 'proxy') return 'proxy';
+
+  const pageProtocol = String(req.body && (req.body.clientProtocol || req.body.pageProtocol) || '').trim().toLowerCase();
+  if (pageProtocol === 'https:' && getStorageEndpointProtocol() === 'http:') return 'proxy';
+  return 'direct';
 }
 
 function cleanupDirectVideoUploads() {
@@ -1668,11 +1697,15 @@ router.post('/photo/direct/abort', requirePermission('upload.photo'), async (req
 });
 
 // 视频直传：浏览器只持有短时分片 PUT URL，访问密钥始终留在 Mac Mini。
+// transport=direct：浏览器拿签名 URL 直传对象存储（要求页面与存储端点协议兼容且网络可达）。
+// transport=proxy：浏览器把分片 PUT 到同源 /video/direct/part-proxy，服务端代转进对象存储 multipart。
 router.post('/video/direct/init', requirePermission('upload.photo'), async (req, res) => {
   try {
     if (!cosStorage.isConfigured()) return res.status(503).json({ error: 'COS_NOT_CONFIGURED' });
-    const unavailable = getDirectUploadUnavailableReason();
-    if (unavailable) return res.status(409).json({ error: 'DIRECT_UPLOAD_UNAVAILABLE', reason: unavailable, fallback: 'api-upload' });
+    // 代理通道不要求浏览器可达存储端点，私有/HTTP 内网地址也能直传；仅显式关闭时禁用。
+    if (parseEnvBoolean(process.env.COS_DIRECT_UPLOAD_ENABLED) === false) {
+      return res.status(409).json({ error: 'DIRECT_UPLOAD_UNAVAILABLE', reason: 'DIRECT_UPLOAD_DISABLED', fallback: 'api-upload' });
+    }
 
     const metadata = readPhotoMetadata(req.body || {});
     metadata.type = 'video';
@@ -1686,6 +1719,9 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
     if (!Number.isFinite(fileSize) || fileSize <= 0) return res.status(400).json({ error: 'INVALID_FILE_SIZE' });
     if (fileSize > MAX_VIDEO_UPLOAD_BYTES) return res.status(413).json({ error: 'VIDEO_FILE_TOO_LARGE', maxFileBytes: MAX_VIDEO_UPLOAD_BYTES });
 
+    const transport = resolveDirectVideoTransport(req);
+    const partSize = transport === 'proxy' ? DIRECT_VIDEO_PROXY_PART_SIZE : DIRECT_VIDEO_PART_SIZE;
+
     const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'video');
     const sessionId = uuidv4();
     const sessionTtlMs = getDirectVideoSessionTtlMs(fileSize);
@@ -1695,13 +1731,15 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
       createdAt: Date.now(), expiresAt: Date.now() + sessionTtlMs, status: 'uploading',
     };
 
-    // 大文件用 S3 multipart：网络抖动只需重传当前分片，且整个视频始终不落 Mac Mini 临时盘。
-    if (fileSize >= DIRECT_VIDEO_MULTIPART_THRESHOLD_BYTES) {
+    // 大文件或代理通道统一用 S3 multipart：网络抖动只需重传当前分片，
+    // 且整个视频始终不落 Mac Mini 临时盘。代理通道下预签名 POST 同样会被
+    // 混合内容拦截，小文件也没有绕开 multipart 的意义。
+    if (transport === 'proxy' || fileSize >= DIRECT_VIDEO_MULTIPART_THRESHOLD_BYTES) {
       const multipart = await cosStorage.createMultipartUpload(originalKey, {
         contentType: mimeType,
         cacheControl: UPLOAD_CACHE_CONTROL,
       });
-      const partCount = Math.ceil(fileSize / DIRECT_VIDEO_PART_SIZE);
+      const partCount = Math.ceil(fileSize / partSize);
       if (partCount > DIRECT_VIDEO_MAX_PARTS) {
         await cosStorage.abortMultipartUpload(originalKey, multipart.uploadId).catch(() => null);
         return res.status(413).json({ error: 'VIDEO_TOO_MANY_PARTS', maxParts: DIRECT_VIDEO_MAX_PARTS });
@@ -1710,16 +1748,21 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
         ...commonSession,
         storageUploadId: multipart.uploadId,
         partCount,
+        partSize,
+        transport,
+        proxyInflight: 0,
       });
       scheduleDirectVideoCleanup();
       return res.json({
-        uploadMode: 'direct-video-multipart',
+        uploadMode: transport === 'proxy' ? 'direct-video-multipart-proxy' : 'direct-video-multipart',
+        transport,
         sessionId,
-        partSize: DIRECT_VIDEO_PART_SIZE,
+        partSize,
         partCount,
         expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS,
         maxFileBytes: MAX_VIDEO_UPLOAD_BYTES,
         sessionExpiresIn: Math.ceil(sessionTtlMs / 1000),
+        partUploadUrlPath: `/api/upload/video/direct/part-proxy/${sessionId}/{partNumber}`,
       });
     }
 
@@ -1734,10 +1777,13 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
       ...commonSession,
       storageUploadId: null,
       partCount: 1,
+      partSize: null,
+      transport: 'direct',
     });
     scheduleDirectVideoCleanup();
     return res.json({
       uploadMode: 'direct-video-post',
+      transport: 'direct',
       sessionId,
       expiresIn: SIGNED_UPLOAD_EXPIRES_SECONDS,
       sessionExpiresIn: Math.ceil(sessionTtlMs / 1000),
@@ -1769,6 +1815,49 @@ router.post('/video/direct/parts', requirePermission('upload.photo'), async (req
     return res.status(500).json({ error: 'DIRECT_VIDEO_PART_URL_FAILED' });
   }
 });
+
+// 代理直传分片：浏览器把分片 PUT 到同源端点，服务端原样转进对象存储 multipart。
+// 每片字节数必须与 init 协商的 partSize 完全一致（末片为余量），不匹配直接拒绝，
+// 防止错位分片写坏整个对象；单会话并发有上限，约束内存占用。
+router.put(
+  '/video/direct/part-proxy/:sessionId/:partNumber',
+  requirePermission('upload.photo'),
+  express.raw({ type: () => true, limit: DIRECT_VIDEO_PROXY_PART_SIZE + 1024 * 1024 }),
+  async (req, res) => {
+    const session = getDirectVideoSession(req, req.params.sessionId);
+    if (!session || session.status !== 'uploading') return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
+    if (session.transport !== 'proxy' || !session.storageUploadId || !session.partSize) {
+      return res.status(400).json({ error: 'DIRECT_VIDEO_PROXY_NOT_ENABLED' });
+    }
+    const partNumber = Number(req.params.partNumber);
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > session.partCount) {
+      return res.status(400).json({ error: 'INVALID_PART_NUMBER' });
+    }
+    const expectedBytes = Math.min(session.partSize, session.fileSize - (partNumber - 1) * session.partSize);
+    const body = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!body || body.length !== expectedBytes) {
+      return res.status(400).json({ error: 'DIRECT_VIDEO_PART_SIZE_MISMATCH', expectedBytes });
+    }
+    if ((session.proxyInflight || 0) >= DIRECT_VIDEO_PROXY_MAX_INFLIGHT) {
+      res.set('Retry-After', '1');
+      return res.status(429).json({ error: 'DIRECT_VIDEO_PROXY_BUSY' });
+    }
+    session.proxyInflight = (session.proxyInflight || 0) + 1;
+    try {
+      const uploaded = await cosStorage.uploadPart(session.originalKey, session.storageUploadId, partNumber, body, {
+        contentLength: body.length,
+      });
+      // 显式覆盖，避免 express 给 JSON 响应自动生成的弱 ETag 被前端误当成分片 ETag。
+      res.set('ETag', uploaded.etag);
+      return res.json({ sessionId: session.id, partNumber, etag: uploaded.etag });
+    } catch (err) {
+      console.error('PUT /api/upload/video/direct/part-proxy error:', err && err.message ? err.message : err);
+      return res.status(502).json({ error: 'DIRECT_VIDEO_PART_UPLOAD_FAILED' });
+    } finally {
+      session.proxyInflight -= 1;
+    }
+  }
+);
 
 router.post('/video/direct/complete', requirePermission('upload.photo'), async (req, res) => {
   let session = null;
