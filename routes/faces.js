@@ -1183,7 +1183,7 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
       if (!person) throw Object.assign(new Error('person not found'), { status: 404 });
 
       const [rows] = await conn.query(
-        'SELECT id, cover_face_id FROM photo_faces WHERE person_id = ? AND organization_id = ?',
+        'SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ?',
         [personId, orgId]
       );
       const ownedIds = new Set((rows || []).map((r) => Number(r.id)));

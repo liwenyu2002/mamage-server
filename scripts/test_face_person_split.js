@@ -69,8 +69,8 @@ function rowsFor(sql, params) {
     const pid = Number(params && params[0]);
     return [[pid === 77 ? personRow : null].filter(Boolean), null];
   }
-  if (/SELECT id, cover_face_id FROM photo_faces WHERE person_id = \? AND organization_id = \?/i.test(sql)) {
-    return [personFaces.map((f) => ({ id: f.id, cover_face_id: null })), null];
+  if (/SELECT id FROM photo_faces WHERE person_id = \? AND organization_id = \?(?!.*ORDER BY)/i.test(sql)) {
+    return [personFaces.map((f) => ({ id: f.id })), null];
   }
   if (/COALESCE\(MAX\(person_no\), 0\) AS maxNo/i.test(sql)) return [[{ maxNo: 10 }], null];
   if (/^INSERT INTO face_persons/i.test(String(sql).trim())) return [{ insertId: 999 }, null];
