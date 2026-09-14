@@ -945,6 +945,339 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
   }
 });
 
+// ---------------------------------------------------------------------------
+// 系统认错人了？——人物拆分。两个人被聚簇误判成同一个 face_persons 时，
+// 用户标出"不是这个人"的种子脸，后端用 embedding 把该人物名下所有脸
+// 重新二分：贴近种子的搬去新人物，其余留下。preview 只算不写，split 落库。
+// ---------------------------------------------------------------------------
+const { splitFacesBySeeds } = require('../lib/face_person_split');
+
+const SPLIT_GRID_AVATAR_SIZE = 112;      // 选择器/预览网格用小头像，省流量
+const SPLIT_MAX_PREVIEW_AVATARS = 240;   // 预览最多现场裁多少张头像，超出的回退照片缩略图
+const SPLIT_AVATAR_CONCURRENCY = 6;
+
+function parseFaceIdArray(input) {
+  const arr = Array.isArray(input) ? input : [input];
+  return Array.from(new Set(
+    arr.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0).map((x) => Math.floor(x))
+  ));
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const out = new Array(items.length);
+  let idx = 0;
+  const workers = new Array(Math.max(1, Math.min(limit, items.length))).fill(0).map(async () => {
+    while (idx < items.length) {
+      const i = idx++;
+      try {
+        out[i] = await fn(items[i], i);
+      } catch (e) {
+        out[i] = null;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+// 网格头像优先用缩略图裁（省下载），缩略图缺失才回退原图
+async function splitGridAvatar(row) {
+  if (!row) return null;
+  const preferThumb = { ...row, photo_url: row.photo_thumb_url || row.photo_url };
+  return getFaceAvatarDataUrl(preferThumb, SPLIT_GRID_AVATAR_SIZE);
+}
+
+async function loadPersonFacesWithPhoto(personId, orgId) {
+  const params = [personId];
+  let sql = `
+    SELECT
+      pf.*,
+      p.title AS photo_title,
+      p.description AS photo_description,
+      p.project_id AS photo_project_id,
+      pr.name AS project_name,
+      p.url AS photo_url,
+      p.thumb_url AS photo_thumb_url
+    FROM photo_faces pf
+    JOIN photos p ON p.id = pf.photo_id
+    LEFT JOIN projects pr ON pr.id = p.project_id
+    WHERE pf.person_id = ?
+  `;
+  sql = appendOrgScope(sql, 'pf', orgId, params);
+  sql += ' ORDER BY pf.created_at DESC, pf.id DESC LIMIT 5000';
+  const [rows] = await pool.query(sql, params);
+  return rows || [];
+}
+
+function toSplitFaceItem(row, score) {
+  const item = {
+    faceId: String(row.id),
+    photoId: row.photo_id,
+    photoTitle: row.photo_title || row.photo_description || null,
+    projectId: row.photo_project_id || row.project_id || null,
+    projectName: row.project_name || null,
+    thumbUrl: row.photo_thumb_url ? buildUploadUrl(row.photo_thumb_url) : (row.photo_url ? buildUploadUrl(row.photo_url) : null),
+    status: row.status || 'detected',
+    createdAt: row.created_at || null,
+    avatarDataUrl: null,
+  };
+  if (score) {
+    item.scoreSeed = Number(Number(score.scoreSeed).toFixed(4));
+    item.scoreKeep = Number(Number(score.scoreKeep).toFixed(4));
+    item.isSeed = Boolean(score.isSeed);
+    item.hasEmbedding = Boolean(score.hasEmbedding);
+  }
+  return item;
+}
+
+async function attachAvatars(items, rowsById, budget) {
+  let remaining = Math.max(0, Number(budget) || 0);
+  const need = items.filter((it) => rowsById.has(Number(it.faceId)) && remaining-- > 0);
+  const avatars = await mapWithConcurrency(need, SPLIT_AVATAR_CONCURRENCY, async (it) => {
+    const av = await splitGridAvatar(rowsById.get(Number(it.faceId)));
+    it.avatarDataUrl = av;
+    return av;
+  });
+  return avatars.filter(Boolean).length;
+}
+
+async function getPersonRow(connOrPool, personId, orgId) {
+  const params = [personId];
+  let sql = 'SELECT id, person_no, name, note, cover_face_id FROM face_persons WHERE id = ?';
+  sql = appendOrgScope(sql, 'face_persons', orgId, params);
+  sql += ' LIMIT 1';
+  const [rows] = await connOrPool.query(sql, params);
+  return rows && rows.length ? rows[0] : null;
+}
+
+// 拆分选择器：该人物名下所有脸（分页 + 服务端裁好的头像），用于人工勾种子
+router.get('/persons/:personId/faces', requirePermission('photos.view'), async (req, res) => {
+  try {
+    const orgId = getOrgIdFromReq(req);
+    const personId = Number(req.params.personId);
+    if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
+
+    let page = Number(req.query.page || 1);
+    let pageSize = Number(req.query.pageSize || 48);
+    if (!Number.isFinite(page) || page <= 0) page = 1;
+    if (!Number.isFinite(pageSize) || pageSize <= 0) pageSize = 48;
+    pageSize = Math.max(12, Math.min(120, Math.floor(pageSize)));
+    const offset = (Math.floor(page) - 1) * pageSize;
+
+    const cntParams = [personId];
+    let cntSql = 'SELECT COUNT(*) AS total FROM photo_faces pf WHERE pf.person_id = ?';
+    cntSql = appendOrgScope(cntSql, 'pf', orgId, cntParams);
+    const [cntRows] = await pool.query(cntSql, cntParams);
+    const total = cntRows && cntRows[0] ? Number(cntRows[0].total) || 0 : 0;
+
+    const rows = await loadPersonFacesWithPhoto(personId, orgId);
+    const pageRows = rows.slice(offset, offset + pageSize);
+    const items = pageRows.map((row) => toSplitFaceItem(row, null));
+    await attachAvatars(items, new Map(pageRows.map((r) => [Number(r.id), r])), pageSize);
+
+    return res.json({
+      personId: String(personId),
+      page: Math.floor(page),
+      pageSize,
+      total,
+      hasMore: offset + items.length < total,
+      faces: items,
+      list: items,
+    });
+  } catch (err) {
+    console.error('GET /api/persons/:personId/faces error:', err && err.stack ? err.stack : err);
+    if (schemaErrorResponse(res, err, 'GET /api/persons/:personId/faces')) return;
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 拆分预览（不落库）：种子脸 vs 其余脸各建 profile，逐脸判"跟谁走"
+router.post('/persons/:personId/split-preview', requirePermission('faces.merge'), async (req, res) => {
+  try {
+    const orgId = getOrgIdFromReq(req);
+    const personId = Number(req.params.personId);
+    if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
+
+    const person = await getPersonRow(pool, personId, orgId);
+    if (!person) return res.status(404).json({ error: 'person not found' });
+
+    const seedFaceIds = parseFaceIdArray(req.body && req.body.seedFaceIds);
+    if (!seedFaceIds.length) return res.status(400).json({ error: 'seedFaceIds is required' });
+
+    const rows = await loadPersonFacesWithPhoto(personId, orgId);
+    if (rows.length < 2) return res.status(400).json({ error: '该人物脸太少，无法拆分' });
+
+    const ownedIds = new Set(rows.map((r) => Number(r.id)));
+    const foreign = seedFaceIds.filter((id) => !ownedIds.has(id));
+    if (foreign.length) {
+      return res.status(400).json({ error: `these faces do not belong to person ${personId}: ${foreign.join(',')}` });
+    }
+    if (seedFaceIds.length >= rows.length) {
+      return res.status(400).json({ error: '不能把该人物所有脸都标为认错，至少留一张' });
+    }
+
+    const result = splitFacesBySeeds(rows, seedFaceIds);
+    const moveItems = result.move.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id))));
+    const keepItems = result.keep.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id))));
+    const undecidedItems = result.undecided.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id))));
+
+    // 头像预算：优先种子+搬走组（用户重点核对），其次判不了的，最后保留组
+    await attachAvatars(
+      [...moveItems, ...undecidedItems, ...keepItems],
+      result.rowsById,
+      SPLIT_MAX_PREVIEW_AVATARS
+    );
+
+    return res.json({
+      ok: true,
+      personId: String(personId),
+      margin: result.margin,
+      stats: {
+        totalFaces: rows.length,
+        seedCount: result.seeds.length,
+        moveCount: moveItems.length,
+        keepCount: keepItems.length,
+        undecidedCount: undecidedItems.length,
+      },
+      moveFaces: moveItems,
+      keepFaces: keepItems,
+      undecidedFaces: undecidedItems,
+    });
+  } catch (err) {
+    console.error('POST /api/persons/:personId/split-preview error:', err && err.stack ? err.stack : err);
+    if (schemaErrorResponse(res, err, 'POST /api/persons/:personId/split-preview')) return;
+    return res.status(500).json({ error: err && err.message ? err.message : 'Internal server error' });
+  }
+});
+
+// 执行拆分：moveFaceIds 搬去新建人物，原人物保留身份/姓名
+router.post('/persons/:personId/split', requirePermission('faces.merge'), async (req, res) => {
+  try {
+    const orgId = getOrgIdFromReq(req);
+    if (!Number.isFinite(orgId) || orgId <= 0) return res.status(400).json({ error: 'organization_id is required' });
+    const personId = Number(req.params.personId);
+    if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
+
+    const body = req.body || {};
+    const moveFaceIds = parseFaceIdArray(body.moveFaceIds);
+    if (!moveFaceIds.length) return res.status(400).json({ error: 'moveFaceIds is required' });
+    const newPersonName = body.newPersonName !== undefined && body.newPersonName !== null
+      ? String(body.newPersonName).trim().slice(0, 80)
+      : '';
+    if (newPersonName) {
+      const dupParams = [newPersonName, personId];
+      let dupSql = 'SELECT id FROM face_persons WHERE name = ? AND id <> ?';
+      dupSql = appendOrgScope(dupSql, 'face_persons', orgId, dupParams);
+      dupSql += ' LIMIT 1';
+      const [dupRows] = await pool.query(dupSql, dupParams);
+      if (dupRows && dupRows.length) return res.status(409).json({ error: 'person name already exists' });
+    }
+
+    const conn = await pool.getConnection();
+    let newPersonId = null;
+    let movedFaces = 0;
+    try {
+      await conn.beginTransaction();
+
+      const person = await getPersonRow(conn, personId, orgId);
+      if (!person) throw Object.assign(new Error('person not found'), { status: 404 });
+
+      const [rows] = await conn.query(
+        'SELECT id, cover_face_id FROM photo_faces WHERE person_id = ? AND organization_id = ?',
+        [personId, orgId]
+      );
+      const ownedIds = new Set((rows || []).map((r) => Number(r.id)));
+      const foreign = moveFaceIds.filter((id) => !ownedIds.has(id));
+      if (foreign.length) {
+        throw Object.assign(new Error(`these faces do not belong to person ${personId}: ${foreign.join(',')}`), { status: 400 });
+      }
+      if (moveFaceIds.length >= ownedIds.size) {
+        throw Object.assign(new Error('至少保留一张脸给原人物；如果想整体改名请用重命名'), { status: 400 });
+      }
+
+      const [seqRows] = await conn.query(
+        'SELECT COALESCE(MAX(person_no), 0) AS maxNo FROM face_persons WHERE organization_id = ? FOR UPDATE',
+        [orgId]
+      );
+      const nextNo = ((seqRows && seqRows[0] && Number(seqRows[0].maxNo)) || 0) + 1;
+
+      const [ins] = await conn.query(
+        'INSERT INTO face_persons (organization_id, person_no, name, note, created_by) VALUES (?, ?, ?, ?, ?)',
+        [orgId, nextNo, newPersonName || null, `split from #${personId}`, req.user && req.user.id ? Number(req.user.id) : null]
+      );
+      newPersonId = ins.insertId;
+
+      // 逐脸合并 extra（记录拆分来源，方便审计/回滚定位）
+      const [moveRows] = await conn.query('SELECT id, extra FROM photo_faces WHERE id IN (?)', [moveFaceIds]);
+      const movedIdSet = new Set(moveFaceIds);
+      for (const mr of (moveRows || [])) {
+        if (!movedIdSet.has(Number(mr.id))) continue;
+        let extra = null;
+        try { extra = mr.extra ? JSON.parse(String(mr.extra)) : null; } catch (e) { extra = null; }
+        const mergedExtra = JSON.stringify({
+          ...(extra && typeof extra === 'object' ? extra : {}),
+          splitFromPersonId: personId,
+          splitToPersonId: newPersonId,
+          splitAt: new Date().toISOString(),
+        });
+        const upd = await conn.query(
+          "UPDATE photo_faces SET person_id = ?, status = 'confirmed', extra = ? WHERE id = ? AND person_id = ? AND organization_id = ?",
+          [newPersonId, mergedExtra, mr.id, personId, orgId]
+        );
+        movedFaces += upd && upd[0] && Number(upd[0].affectedRows) ? Number(upd[0].affectedRows) : 0;
+      }
+
+      // 封面：新人物取搬走组里检测分最高的一张；原人物封面若被搬走则用剩余最好的一张补上
+      const [newCoverRows] = await conn.query(
+        'SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ? ORDER BY detection_score DESC, id ASC LIMIT 1',
+        [newPersonId, orgId]
+      );
+      if (newCoverRows && newCoverRows.length) {
+        await conn.query('UPDATE face_persons SET cover_face_id = ? WHERE id = ?', [newCoverRows[0].id, newPersonId]);
+      }
+
+      const oldCoverId = person.cover_face_id ? Number(person.cover_face_id) : null;
+      if (oldCoverId && movedIdSet.has(oldCoverId)) {
+        const [oldCoverRows] = await conn.query(
+          'SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ? ORDER BY detection_score DESC, id ASC LIMIT 1',
+          [personId, orgId]
+        );
+        await conn.query(
+          'UPDATE face_persons SET cover_face_id = ? WHERE id = ?',
+          [oldCoverRows && oldCoverRows.length ? oldCoverRows[0].id : null, personId]
+        );
+      }
+
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    const [originalProfile, newPersonProfile] = await Promise.all([
+      buildFaceProfile({ faceId: null, personId, orgId }),
+      buildFaceProfile({ faceId: null, personId: newPersonId, orgId }),
+    ]);
+
+    return res.json({
+      ok: true,
+      organizationId: orgId,
+      originalPersonId: String(personId),
+      newPersonId: String(newPersonId),
+      movedFaces,
+      original: originalProfile,
+      newPerson: newPersonProfile,
+    });
+  } catch (err) {
+    console.error('POST /api/persons/:personId/split error:', err && err.stack ? err.stack : err);
+    if (schemaErrorResponse(res, err, 'POST /api/persons/:personId/split')) return;
+    if (err && err.status) return res.status(err.status).json({ error: err.message });
+    return res.status(500).json({ error: err && err.message ? err.message : 'Internal server error' });
+  }
+});
+
 router.patch('/persons/:personId', requirePermission('faces.label'), async (req, res) => {
   try {
     const orgId = getOrgIdFromReq(req);

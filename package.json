@@ -23,7 +23,8 @@
     "test:public-download": "node scripts/test_public_download_variant.js",
     "test:video": "node scripts/test_video_production_logic.js",
     "ai:tags:backfill": "node scripts/backfill_ai_tags.js",
-    "test:direct-video-proxy": "node scripts/test_direct_video_proxy.js"
+    "test:direct-video-proxy": "node scripts/test_direct_video_proxy.js",
+    "test:face-person-split": "node scripts/test_face_person_split.js"
   },
   "keywords": [],
   "author": "",
