@@ -149,6 +149,12 @@ app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
 app.use('/api/network', require('./routes/network'));
+
+// 不暴露实现框架；未匹配的 /api 路径回 JSON 404 而非 Express 默认文本页
+app.disable('x-powered-by');
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'NOT_FOUND', path: req.originalUrl });
+});
 app.use('/api/share', shareRouter);
 app.use('/api/similarity', similarityRouter);
 app.use('/api', facesRouter);

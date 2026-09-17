@@ -90,7 +90,6 @@ function setObjectHeaders(res, key, object) {
   if (!res.getHeader('Access-Control-Allow-Origin')) res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges,Content-Length,Content-Range,Content-Type,ETag,Last-Modified');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
 }
 
 function statusFromStorageError(err) {

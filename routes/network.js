@@ -126,21 +126,16 @@ function visitorLooksIntranet(visitorIp, ownIps) {
 
 router.get('/lan', async (req, res) => {
   const lan = pickLanAddress();
-  // macOS 的 hostname 常已带 .local 后缀，先剥掉再统一拼，避免 .local.local
-  const hostname = String(os.hostname() || '').toLowerCase().replace(/\.local$/i, '').replace(/\.$/, '');
   const visitorIp = visitorPublicIp(req);
   const ownIps = await getOwnPublicIps();
   const visitorOnIntranet = visitorLooksIntranet(visitorIp, ownIps);
+  // 只回前端自动切换真正需要的字段；网卡名/主机名/公网出口 IP 属于内网拓扑，
+  // 不向未认证访客暴露
   res.json({
     ok: Boolean(lan),
     lanIp: lan ? lan.address : null,
-    lanInterface: lan ? lan.name : null,
     lanPort: LAN_HTTPS_PORT,
-    mdnsHost: hostname ? `${hostname}.local` : null,
     visitorOnIntranet,
-    visitorIp: visitorIp || null,
-    sitePublicIp: ownIps.v4,
-    sitePublicIpv6: ownIps.v6,
     reportedAt: new Date().toISOString(),
   });
 });
