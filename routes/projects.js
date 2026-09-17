@@ -635,6 +635,16 @@ router.get('/list', async (req, res) => {
       ? `p.event_date ${orderDir}, p.created_at DESC`
       : `p.created_at ${orderDir}`;
 
+
+    if (!Number.isFinite(page) || page <= 0) page = 1;
+    if (!Number.isFinite(pageSize) || pageSize <= 0 || pageSize > 50) {
+      pageSize = 6;
+    }
+
+    const whereClauses = [];
+    const params = [];
+
+    if (keyword) {
     // 时间筛选（闭区间，YYYY-MM-DD）：作用在"有效时间"上——活动时间优先，没填的回退创建日期
     const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
     const dateFromRaw = String(req.query.dateFrom || '').trim();
@@ -650,15 +660,6 @@ router.get('/list', async (req, res) => {
       params.push(dateTo);
     }
 
-    if (!Number.isFinite(page) || page <= 0) page = 1;
-    if (!Number.isFinite(pageSize) || pageSize <= 0 || pageSize > 50) {
-      pageSize = 6;
-    }
-
-    const whereClauses = [];
-    const params = [];
-
-    if (keyword) {
       const like = `%${keyword}%`;
       // 在项目名、描述、meta、photo_ids 上做模糊匹配
       whereClauses.push('(p.name LIKE ? OR p.description LIKE ? OR p.meta LIKE ? OR p.photo_ids LIKE ? OR p.tags LIKE ?)');
