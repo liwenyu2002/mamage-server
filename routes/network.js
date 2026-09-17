@@ -18,7 +18,7 @@ const PUBLIC_IP_TIMEOUT_MS = 5000;
 const EXTRA_VISITOR_CIDRS = String(process.env.INTRANET_VISITOR_CIDRS || '')
   .split(',').map((x) => x.trim()).filter(Boolean);
 
-let publicIpCache = { ip: null, at: 0 };
+let publicIpCache = { v4: null, v6: null, at: 0 };
 
 // 过滤掉虚拟网卡（docker/colima 桥、VPN utun、苹果随享 awdl 等），优先物理口 en0/en1
 function pickLanAddress() {
@@ -39,19 +39,26 @@ function pickLanAddress() {
   return candidates[0];
 }
 
-async function getOwnPublicIp() {
+async function fetchText(url) {
+  const resp = await fetch(url, { timeout: PUBLIC_IP_TIMEOUT_MS });
+  return String(await resp.text()).trim();
+}
+
+// 双栈查本机公网出口：ipv4./ipv6. 专用主机名只解析对应族，天然强制走 v4/v6 路由。
+// 校园网常有双栈（今日实测 v4=125.35.71.202、v6=240e:604:76b::/48），两族分开比对。
+async function getOwnPublicIps() {
   const now = Date.now();
-  if (publicIpCache.ip && now - publicIpCache.at < PUBLIC_IP_CACHE_MS) return publicIpCache.ip;
-  try {
-    const resp = await fetch('https://api.ipify.org?format=json', { timeout: PUBLIC_IP_TIMEOUT_MS });
-    const data = await resp.json().catch(() => null);
-    const ip = data && data.ip ? String(data.ip).trim() : null;
-    if (ip) publicIpCache = { ip, at: now };
-    else publicIpCache = { ip: publicIpCache.ip, at: now }; // 查询失败也续期，避免打爆外部服务
-    return publicIpCache.ip;
-  } catch (e) {
-    return publicIpCache.ip; // 失败回退旧值；没有旧值则判不出 → 访问者留在公网
-  }
+  if (now - publicIpCache.at < PUBLIC_IP_CACHE_MS) return publicIpCache;
+  const [v4, v6] = await Promise.all([
+    fetchText('https://ipv4.icanhazip.com').catch(() => null),
+    fetchText('https://ipv6.icanhazip.com').catch(() => null),
+  ]);
+  publicIpCache = {
+    v4: v4 && /^(\d{1,3}\.){3}\d{1,3}$/.test(v4) ? v4 : null,
+    v6: v6 && v6.includes(':') ? v6.toLowerCase() : null,
+    at: now,
+  };
+  return publicIpCache;
 }
 
 // 访问者的公网 IP：隧道流量看 CF 头；直连/内网 nginx 场景回退 XFF / socket 地址
@@ -83,18 +90,36 @@ function ipMatchesRule(ip, rule) {
   return (a & mask) === (b & mask);
 }
 
-// 访问者是否与 Mini 同校园网：出口 IP 相同 / 同 /24（NAT 池）/ 命中额外配置规则。
-// 只在把握大时返回 true；判不准一律 false（前端留在公网入口，绝不误跳）。
-function visitorLooksIntranet(visitorIp, ownPublicIp) {
-  if (!visitorIp || !ownPublicIp) return false;
+function ipv6Normalize(ip) {
+  const s = String(ip || '').toLowerCase();
+  if (!s.includes(':')) return null;
+  return s;
+}
+
+// v6 按前 3 段（/48）比对：校园网通常分到 /48 前缀
+function ipv6SharesCampusPrefix(a, b) {
+  const x = ipv6Normalize(a);
+  const y = ipv6Normalize(b);
+  if (!x || !y) return false;
+  const pick = (s) => s.split(':').slice(0, 3).join(':');
+  return pick(x) === pick(y);
+}
+
+// 访问者是否与 Mini 同校园网：同族出口 IP 精确相等 / v4 同 /24（NAT 池）/ v6 同 /48，
+// 或命中额外配置规则。只在把握大时返回 true；判不准一律 false（前端留在公网入口）。
+function visitorLooksIntranet(visitorIp, ownIps) {
+  if (!visitorIp) return false;
   for (const rule of EXTRA_VISITOR_CIDRS) {
     if (ipMatchesRule(visitorIp, rule)) return true;
   }
-  if (visitorIp === ownPublicIp) return true;
-  // 同 /24：校园网常有连续公网出口池，按前缀松一点
+  if (!ownIps) return false;
+  if (visitorIp.includes(':')) {
+    return ipv6SharesCampusPrefix(visitorIp, ownIps.v6);
+  }
+  if (visitorIp === ownIps.v4) return true;
   const a = ipv4ToLong(visitorIp);
-  const b = ipv4ToLong(ownPublicIp);
-  if (a === null || b === null) return false; // IPv6 等暂不猜
+  const b = ipv4ToLong(ownIps.v4);
+  if (a === null || b === null) return false;
   const mask = 0xffffff00;
   return (a & mask) === (b & mask);
 }
@@ -104,8 +129,8 @@ router.get('/lan', async (req, res) => {
   // macOS 的 hostname 常已带 .local 后缀，先剥掉再统一拼，避免 .local.local
   const hostname = String(os.hostname() || '').toLowerCase().replace(/\.local$/i, '').replace(/\.$/, '');
   const visitorIp = visitorPublicIp(req);
-  const ownPublicIp = await getOwnPublicIp();
-  const visitorOnIntranet = visitorLooksIntranet(visitorIp, ownPublicIp);
+  const ownIps = await getOwnPublicIps();
+  const visitorOnIntranet = visitorLooksIntranet(visitorIp, ownIps);
   res.json({
     ok: Boolean(lan),
     lanIp: lan ? lan.address : null,
@@ -113,10 +138,9 @@ router.get('/lan', async (req, res) => {
     lanPort: LAN_HTTPS_PORT,
     mdnsHost: hostname ? `${hostname}.local` : null,
     visitorOnIntranet,
-    visitorIp: visitorIp && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(visitorIp)
-      ? visitorIp
-      : (visitorIp ? visitorIp : null), // 透传给前端便于排查（私网/公网均非敏感拓扑机密，仅出口地址）
-    sitePublicIp: ownPublicIp,
+    visitorIp: visitorIp || null,
+    sitePublicIp: ownIps.v4,
+    sitePublicIpv6: ownIps.v6,
     reportedAt: new Date().toISOString(),
   });
 });
