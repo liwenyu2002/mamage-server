@@ -628,6 +628,12 @@ router.get('/list', async (req, res) => {
     let page = parseInt(req.query.page, 10);
     let pageSize = parseInt(req.query.pageSize, 10);
     const keyword = (req.query.keyword || '').trim();
+    // 排序：createdAt=创建时间（默认），eventDate=活动举办时间；order 仅白名单两值
+    const sortKey = String(req.query.sort || 'createdAt').trim() === 'eventDate' ? 'eventDate' : 'createdAt';
+    const orderDir = String(req.query.order || 'desc').trim().toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+    const orderBySql = sortKey === 'eventDate'
+      ? `p.event_date ${orderDir}, p.created_at DESC`
+      : `p.created_at ${orderDir}`;
 
     if (!Number.isFinite(page) || page <= 0) page = 1;
     if (!Number.isFinite(pageSize) || pageSize <= 0 || pageSize > 50) {
@@ -671,7 +677,9 @@ router.get('/list', async (req, res) => {
         page,
         pageSize,
         total: 0,
-        hasMore: false
+        hasMore: false,
+        sort: sortKey,
+        order: orderDir.toLowerCase()
       });
     }
 
@@ -711,7 +719,7 @@ router.get('/list', async (req, res) => {
         ) AS coverUrl
       FROM projects p
       ${whereSql}
-      ORDER BY p.created_at DESC
+      ORDER BY ${orderBySql}
       LIMIT ? OFFSET ?
     `;
 
