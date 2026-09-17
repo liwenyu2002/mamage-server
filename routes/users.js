@@ -14,6 +14,7 @@ const {
   sendVerificationCode,
   verifyAndConsumeVerificationCode,
 } = require('../lib/email_verification');
+const { clientIpFromReq } = require('../lib/client_ip');
 
 // validation
 const emailRegex = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
@@ -30,18 +31,6 @@ const LOGIN_RATE_MAX_FAILURES = 10;
 const LOGIN_RATE_MAX_BUCKETS = 5000;
 const loginRateBuckets = new Map(); // ip -> { count, resetAt }
 
-function loginClientIp(req) {
-  const cf = req.headers['cf-connecting-ip'];
-  if (cf) return String(cf).split(',')[0].trim();
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) {
-    const parts = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
-    if (parts.length) return parts[parts.length - 1];
-  }
-  return (req.socket && req.socket.remoteAddress)
-    ? String(req.socket.remoteAddress).replace(/^::ffff:/, '')
-    : 'unknown';
-}
 
 function loginRateCheck(ip) {
   const now = Date.now();
@@ -387,8 +376,7 @@ router.post('/register', async (req, res) => {
       if (e && (e.code === 'ER_NO_DEFAULT_FOR_FIELD' || (e.message && e.message.indexOf("organization_id") !== -1))) {
         return res.status(500).json({
           error: 'DB_SCHEMA_ORG_FIELD',
-          message: "Database users.organization_id column requires a value or default. Run: ALTER TABLE users MODIFY COLUMN organization_id INT UNSIGNED NULL;",
-          sql: "ALTER TABLE users MODIFY COLUMN organization_id INT UNSIGNED NULL;"
+          message: '数据库结构异常（organization_id），请联系管理员' 
         });
       }
       return res.status(500).json({ error: 'server error' });
@@ -404,15 +392,14 @@ router.post('/login', async (req, res) => {
   try {
     if (!await hasPasswordColumn()) {
       return res.status(400).json({
-        error: 'Database missing column `password_hash`. Cannot perform password login.',
-        sql: "ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL;"
+        error: 'Database missing column `password_hash`. Cannot perform password login.' 
       });
     }
 
     const { email, password, student_no } = req.body;
     if ((!email && !student_no) || !password) return res.status(400).json({ error: 'email/student_no and password are required' });
 
-    const ip = loginClientIp(req);
+    const ip = clientIpFromReq(req);
     const rate = loginRateCheck(ip);
     if (!rate.allowed) {
       res.set('Retry-After', String(rate.retryAfterSec));
@@ -500,8 +487,7 @@ router.put('/me/password', authMiddleware, async (req, res) => {
     // ensure DB has password_hash column
     if (!await hasPasswordColumn()) {
       return res.status(400).json({
-        error: 'Database missing column `password_hash`. Cannot change password.',
-        sql: "ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL;"
+        error: 'Database missing column `password_hash`. Cannot change password.' 
       });
     }
 
