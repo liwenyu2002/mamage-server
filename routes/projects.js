@@ -635,6 +635,21 @@ router.get('/list', async (req, res) => {
       ? `p.event_date ${orderDir}, p.created_at DESC`
       : `p.created_at ${orderDir}`;
 
+    // 时间筛选（闭区间，YYYY-MM-DD）：作用在"有效时间"上——活动时间优先，没填的回退创建日期
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    const dateFromRaw = String(req.query.dateFrom || '').trim();
+    const dateToRaw = String(req.query.dateTo || '').trim();
+    const dateFrom = DATE_RE.test(dateFromRaw) ? dateFromRaw : null;
+    const dateTo = DATE_RE.test(dateToRaw) ? dateToRaw : null;
+    if (dateFrom) {
+      whereClauses.push('COALESCE(p.event_date, DATE(p.created_at)) >= ?');
+      params.push(dateFrom);
+    }
+    if (dateTo) {
+      whereClauses.push('COALESCE(p.event_date, DATE(p.created_at)) < DATE_ADD(?, INTERVAL 1 DAY)');
+      params.push(dateTo);
+    }
+
     if (!Number.isFinite(page) || page <= 0) page = 1;
     if (!Number.isFinite(pageSize) || pageSize <= 0 || pageSize > 50) {
       pageSize = 6;
