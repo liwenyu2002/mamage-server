@@ -148,6 +148,7 @@ app.use('/api/wechat-compositions', wechatCompositionsRouter);
 app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
+app.use('/api/network', require('./routes/network'));
 app.use('/api/share', shareRouter);
 app.use('/api/similarity', similarityRouter);
 app.use('/api', facesRouter);
