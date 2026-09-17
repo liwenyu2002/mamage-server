@@ -28,7 +28,8 @@ function pickLanAddress() {
 
 router.get('/lan', (req, res) => {
   const lan = pickLanAddress();
-  const hostname = String(os.hostname() || '').toLowerCase().replace(/\.$/, '');
+  // macOS 的 hostname 常已带 .local 后缀，先剥掉再统一拼，避免 .local.local
+  const hostname = String(os.hostname() || '').toLowerCase().replace(/\.local$/i, '').replace(/\.$/, '');
   res.json({
     ok: Boolean(lan),
     lanIp: lan ? lan.address : null,
