@@ -19,6 +19,62 @@ const {
 const emailRegex = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const pwdRegex = /^(?![0-9]+$)(?![a-zA-Z]+$)[0-9A-Za-z]{8,16}$/; // 8-16 位字母+数字组合
 
+// ---------------------------------------------------------------------------
+// 登录限速（防在线爆破）：按来源 IP 记失败次数，15 分钟窗口内满 10 次锁 429，
+// 登录成功即清零。来源 IP 取法：隧道流量信 Cloudflare 的 CF-Connecting-IP；
+// 内网 nginx 直连信 XFF 末段（我们自己的 nginx 把真实 remote_addr 追加在最后，
+// 首段可被客户端伪造，不能用于安全控件）。
+// ---------------------------------------------------------------------------
+const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_MAX_FAILURES = 10;
+const LOGIN_RATE_MAX_BUCKETS = 5000;
+const loginRateBuckets = new Map(); // ip -> { count, resetAt }
+
+function loginClientIp(req) {
+  const cf = req.headers['cf-connecting-ip'];
+  if (cf) return String(cf).split(',')[0].trim();
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    const parts = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return (req.socket && req.socket.remoteAddress)
+    ? String(req.socket.remoteAddress).replace(/^::ffff:/, '')
+    : 'unknown';
+}
+
+function loginRateCheck(ip) {
+  const now = Date.now();
+  // 顺手清理过期桶，超量整表重置（粗暴防内存泄漏，同 find_me 的做法）
+  if (loginRateBuckets.size > LOGIN_RATE_MAX_BUCKETS) loginRateBuckets.clear();
+  for (const [key, bucket] of loginRateBuckets) {
+    if (bucket.resetAt <= now) loginRateBuckets.delete(key);
+  }
+  const bucket = loginRateBuckets.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    loginRateBuckets.set(ip, { count: 0, resetAt: now + LOGIN_RATE_WINDOW_MS });
+    return { allowed: true, count: 0, retryAfterSec: 0 };
+  }
+  if (bucket.count >= LOGIN_RATE_MAX_FAILURES) {
+    return { allowed: false, count: bucket.count, retryAfterSec: Math.ceil((bucket.resetAt - now) / 1000) };
+  }
+  return { allowed: true, count: bucket.count, retryAfterSec: 0 };
+}
+
+function loginRateRecordFailure(ip) {
+  const now = Date.now();
+  const bucket = loginRateBuckets.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    loginRateBuckets.set(ip, { count: 1, resetAt: now + LOGIN_RATE_WINDOW_MS });
+    return;
+  }
+  bucket.count += 1;
+}
+
+function loginRateReset(ip) {
+  loginRateBuckets.delete(ip);
+}
+
 // 检查 users 表中是否存在 password_hash 列（缓存结果）
 let _hasPasswordColumn = null;
 async function hasPasswordColumn() {
@@ -356,13 +412,31 @@ router.post('/login', async (req, res) => {
     const { email, password, student_no } = req.body;
     if ((!email && !student_no) || !password) return res.status(400).json({ error: 'email/student_no and password are required' });
 
+    const ip = loginClientIp(req);
+    const rate = loginRateCheck(ip);
+    if (!rate.allowed) {
+      res.set('Retry-After', String(rate.retryAfterSec));
+      return res.status(429).json({
+        error: 'TOO_MANY_ATTEMPTS',
+        message: '登录失败次数过多，请稍后再试',
+        retryAfterSeconds: rate.retryAfterSec,
+      });
+    }
+
     const where = email ? 'email = ?' : 'student_no = ?';
     const val = email || student_no;
     const [rows] = await pool.query('SELECT id, password_hash, role FROM users WHERE ' + where + ' LIMIT 1', [val]);
-    if (!rows || rows.length === 0) return res.status(401).json({ error: 'invalid credentials' });
+    if (!rows || rows.length === 0) {
+      loginRateRecordFailure(ip);
+      return res.status(401).json({ error: 'invalid credentials' });
+    }
     const user = rows[0];
     const ok = await bcrypt.compare(password, user.password_hash || '');
-    if (!ok) return res.status(401).json({ error: 'invalid credentials' });
+    if (!ok) {
+      loginRateRecordFailure(ip);
+      return res.status(401).json({ error: 'invalid credentials' });
+    }
+    loginRateReset(ip);
     const token = signToken({ id: user.id, role: user.role });
     // load permissions for this role
     let perms = [];
