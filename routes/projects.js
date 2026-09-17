@@ -740,11 +740,14 @@ router.get('/list', async (req, res) => {
       LIMIT ? OFFSET ?
     `;
 
-    const selectParams = [...params];
+    // 占位符绑定顺序必须与 SQL 文本一致：封面子查询的 org 在 SELECT 列表里（最前），
+    // 其次才是 WHERE（keyword/日期/组织），最后 LIMIT/OFFSET。历史上 WHERE 只有 org
+    // 一个值时与子查询同值，错位被掩盖；加日期筛选后必须严格对齐。
+    const selectParams = [];
     if (orgId !== null) {
       selectParams.push(orgId, orgId);
     }
-    selectParams.push(pageSize, offset);
+    selectParams.push(...params, pageSize, offset);
     const [rows] = await pool.query(selectSql, selectParams);
 
     const list = rows.map((r) => ({
