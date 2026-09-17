@@ -149,12 +149,6 @@ app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
 app.use('/api/network', require('./routes/network'));
-
-// 不暴露实现框架；未匹配的 /api 路径回 JSON 404 而非 Express 默认文本页
-app.disable('x-powered-by');
-app.use('/api', (req, res) => {
-  res.status(404).json({ error: 'NOT_FOUND', path: req.originalUrl });
-});
 app.use('/api/share', shareRouter);
 app.use('/api/similarity', similarityRouter);
 app.use('/api', facesRouter);
@@ -162,6 +156,14 @@ app.use('/api', facesRouter);
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
+
+// 不暴露实现框架；未匹配的 /api 路径回 JSON 404 而非 Express 默认文本页。
+// 必须挂在所有 /api 路由（含 facesRouter 和 /api/health）之后，否则会截胡。
+app.disable('x-powered-by');
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'NOT_FOUND', path: req.originalUrl });
+});
+
 app.get('/', (req, res) => {
   res.type('html').send(
     "<!doctype html><html><head><meta charset='utf-8'><title>MaMage API</title></head><body><h1>MaMage API Server</h1><p>This backend serves API only.</p><p>Health: <a href='/api/health'>/api/health</a></p></body></html>"
