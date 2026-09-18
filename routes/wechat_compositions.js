@@ -199,8 +199,28 @@ router.get('/', requirePermission('ai.generate'), async (req, res) => {
 
 // POST /api/wechat-compositions/ai-fill  推文模板 AI 填充
 // body { slots: [{key,label,hint}], brief, titleHint } → { title, digest, values }
+// 按用户限流：5 分钟 10 次（每次是一整段模型生成，防狂点烧 token）
+const AI_FILL_BUCKETS = new Map(); // userId -> { count, resetAt }
+const AI_FILL_WINDOW_MS = 5 * 60 * 1000;
+const AI_FILL_MAX = 10;
+function aiFillRateAllow(userId) {
+  const now = Date.now();
+  if (AI_FILL_BUCKETS.size > 2000) AI_FILL_BUCKETS.clear();
+  const b = AI_FILL_BUCKETS.get(userId);
+  if (!b || b.resetAt <= now) {
+    AI_FILL_BUCKETS.set(userId, { count: 1, resetAt: now + AI_FILL_WINDOW_MS });
+    return true;
+  }
+  if (b.count >= AI_FILL_MAX) return false;
+  b.count += 1;
+  return true;
+}
+
 router.post('/ai-fill', requirePermission('ai.generate'), async (req, res) => {
   try {
+    if (!aiFillRateAllow(req.user.id)) {
+      return res.status(429).json({ error: 'TOO_MANY_REQUESTS', message: 'AI 填充太频繁，请 5 分钟后再试' });
+    }
     const { aiFillArticleTemplate } = require('../lib/wechat_ai_fill');
     const result = await aiFillArticleTemplate(
       (req.body && req.body.slots) || [],
