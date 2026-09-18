@@ -197,6 +197,24 @@ router.get('/', requirePermission('ai.generate'), async (req, res) => {
   }
 });
 
+// POST /api/wechat-compositions/ai-fill  推文模板 AI 填充
+// body { slots: [{key,label,hint}], brief, titleHint } → { title, digest, values }
+router.post('/ai-fill', requirePermission('ai.generate'), async (req, res) => {
+  try {
+    const { aiFillArticleTemplate } = require('../lib/wechat_ai_fill');
+    const result = await aiFillArticleTemplate(
+      (req.body && req.body.slots) || [],
+      (req.body && req.body.brief) || '',
+      { titleHint: (req.body && req.body.titleHint) || '' }
+    );
+    res.json(result);
+  } catch (e) {
+    const status = Number(e && e.status) || 500;
+    if (status >= 500) console.error('[POST /api/wechat-compositions/ai-fill] error', e && e.stack ? e.stack : e);
+    res.status(status).json({ error: e && e.message ? e.message : 'AI_FILL_FAILED' });
+  }
+});
+
 // POST /api/wechat-compositions  body { name, title, digest, doc, blockConfig, themeKey }
 router.post('/', requirePermission('ai.generate'), async (req, res) => {
   try {
