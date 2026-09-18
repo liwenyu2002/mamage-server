@@ -130,11 +130,13 @@ router.get('/lan', async (req, res) => {
   const ownIps = await getOwnPublicIps();
   const visitorOnIntranet = visitorLooksIntranet(visitorIp, ownIps);
   // 只回前端自动切换真正需要的字段；网卡名/主机名/公网出口 IP 属于内网拓扑，
-  // 不向未认证访客暴露
+  // 不向未认证访客暴露。内网地址仅在判定访客身处校园网时下发——公网侧
+  // （扫描器/陌生访客）拿不到任何内网信息（对应漏扫"内部IP泄露"项）。
+  const onIntranet = Boolean(visitorOnIntranet && lan);
   res.json({
-    ok: Boolean(lan),
-    lanIp: lan ? lan.address : null,
-    lanPort: LAN_HTTPS_PORT,
+    ok: onIntranet,
+    lanIp: onIntranet ? lan.address : null,
+    lanPort: onIntranet ? LAN_HTTPS_PORT : null,
     visitorOnIntranet,
     reportedAt: new Date().toISOString(),
   });
