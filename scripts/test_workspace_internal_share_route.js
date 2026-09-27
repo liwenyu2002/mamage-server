@@ -152,6 +152,9 @@ async function main() {
     const inbox = await received.json();
     assert.equal(inbox[0].id, ids.share);
     assert.equal(inbox[0].copyStatus, 'ready');
+    assert.equal(inbox[0].sourceOrganizationName, 'Internal share test');
+    assert.equal(inbox[0].sourceUnitName, 'source');
+    assert.equal(inbox[0].sharedByName, 'owner');
     const peerInbox = await fetch(`${base}/received`, {
       headers: { Authorization: `Bearer ${token(ids.peer)}` },
     });
@@ -188,6 +191,9 @@ async function main() {
     assert.equal(recipientDetail.status, 200);
     const copiedDetail = await recipientDetail.json();
     assert.equal(copiedDetail.projectId, ids.copiedProject);
+    assert.equal(copiedDetail.sourceOrganizationName, 'Internal share test');
+    assert.equal(copiedDetail.sourceUnitName, 'source');
+    assert.equal(copiedDetail.sharedByName, 'owner');
     assert.equal(copiedDetail.photos.length, 1);
     assert.equal(copiedDetail.photos[0].projectId, ids.copiedProject);
     assert.notEqual(copiedDetail.photos[0].id, ids.photo);

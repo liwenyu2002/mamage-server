@@ -46,8 +46,10 @@ async function main() {
     await pool.query('INSERT INTO organization_unit_memberships (unit_id, user_id, role) VALUES (?, ?, ?)',
       [ids.targetUnit, ids.recipient, 'member']);
     const [project] = await pool.query(
-      'INSERT INTO projects (uuid, name, event_date, organization_id, unit_id) VALUES (UUID(), ?, ?, ?, ?)',
-      ['Original album', '2026-09-27', ids.org, ids.sourceUnit]);
+      'INSERT INTO projects (uuid, name, event_date, meta, organization_id, unit_id) VALUES (UUID(), ?, ?, ?, ?, ?)',
+      ['Original album', '2026-09-27', JSON.stringify({ customMarker: 'kept',
+        shareLineage: [{ shareId: 999, organizationName: 'Prior org', unitName: 'Prior unit' }] }),
+      ids.org, ids.sourceUnit]);
     ids.sourceProject = project.insertId;
     const [photo] = await pool.query(
       `INSERT INTO photos
@@ -108,11 +110,24 @@ async function main() {
     assert.equal(photos[0].started, '2026-09-22 10:30:18');
     assert.equal(photos[0].finished, '2026-09-22 10:30:41');
     assert.equal(photos[0].captured, '2026-09-21');
+    const photoOrigin = typeof photos[0].source_attribution === 'string'
+      ? JSON.parse(photos[0].source_attribution) : photos[0].source_attribution;
+    assert.equal(photoOrigin.sourceOrganizationName, 'Copy test');
+    assert.equal(photoOrigin.sourceUnitName, 'source');
+    assert.equal(photoOrigin.shareId, ids.share);
     const [[copiedProject]] = await pool.query(
-      `SELECT name, DATE_FORMAT(event_date, '%Y-%m-%d') AS eventDate FROM projects WHERE id = ?`,
+      `SELECT name, meta, DATE_FORMAT(event_date, '%Y-%m-%d') AS eventDate FROM projects WHERE id = ?`,
       [ids.copiedProject]);
     assert.equal(copiedProject.name, 'Original album（副本）');
     assert.equal(copiedProject.eventDate, '2026-09-27');
+    const meta = typeof copiedProject.meta === 'string' ? JSON.parse(copiedProject.meta) : copiedProject.meta;
+    assert.equal(meta.customMarker, 'kept');
+    assert.equal(meta.shareLineage.length, 2);
+    assert.equal(meta.shareLineage[0].organizationName, 'Prior org');
+    assert.equal(meta.shareLineage[1].organizationName, 'Copy test');
+    assert.equal(meta.shareLineage[1].unitName, 'source');
+    assert.equal(meta.shareLineage[1].albumName, 'Original album');
+    assert.equal(meta.shareLineage[1].shareId, ids.share);
     assert.notEqual(photos[0].url, `/uploads/units/${ids.sourceUnit}/original.jpg`);
     assert.equal(copiedKeys.length, 3);
     assert.equal(copyAttempts, 4);

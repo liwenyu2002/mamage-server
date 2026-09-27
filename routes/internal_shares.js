@@ -163,14 +163,17 @@ router.get('/received', requirePermission('photos.view'), async (req, res) => {
     const [rows] = await pool.query(
       `SELECT s.id, s.share_type AS shareType, s.mode, s.project_id AS projectId,
               s.expires_at AS expiresAt, s.created_at AS createdAt,
-              ou.name AS sourceUnitName, p.name AS albumName,
+              source.name AS sourceUnitName, org.name AS sourceOrganizationName,
+              sharer.name AS sharedByName, p.name AS albumName,
               (SELECT COUNT(*) FROM internal_share_items si WHERE si.share_id = s.id) AS snapshotCount,
               (SELECT j.status FROM organization_copy_jobs j
                WHERE j.share_id = s.id AND j.system_initiated = 1 ORDER BY j.id DESC LIMIT 1) AS copyStatus,
               (SELECT j.result_json FROM organization_copy_jobs j
                WHERE j.share_id = s.id AND j.system_initiated = 1 ORDER BY j.id DESC LIMIT 1) AS copyResult
        FROM internal_shares s
-       JOIN organization_units ou ON ou.id = s.source_unit_id
+       JOIN organization_units source ON source.id = s.source_unit_id
+       JOIN organizations org ON org.id = s.organization_id
+       LEFT JOIN users sharer ON sharer.id = s.created_by
        LEFT JOIN projects p ON p.id = s.project_id
        WHERE s.organization_id = ? AND s.target_unit_id = ?
          AND (s.target_user_id IS NULL OR s.target_user_id = ?)
@@ -292,10 +295,13 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
     const id = positiveId(req.params.id);
     if (!id) throw new WorkspaceAccessError('INVALID_SHARE', 400);
     const [rows] = await pool.query(
-      `SELECT s.*, p.name AS albumName, source.name AS sourceUnitName
+      `SELECT s.*, p.name AS albumName, source.name AS sourceUnitName,
+              org.name AS sourceOrganizationName, sharer.name AS sharedByName
        FROM internal_shares s
        LEFT JOIN projects p ON p.id = s.project_id
        JOIN organization_units source ON source.id = s.source_unit_id
+       JOIN organizations org ON org.id = s.organization_id
+       LEFT JOIN users sharer ON sharer.id = s.created_by
        WHERE s.id = ? AND s.organization_id = ? LIMIT 1`, [id, workspace.orgId]
     );
     const share = rows[0];
@@ -356,7 +362,8 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
     res.json({ id: share.id, shareType: share.share_type, mode: share.mode,
       projectId: share.mode === 'copy' ? copiedProjectId : share.project_id,
       albumName: share.albumName, copyStatus,
-      sourceUnitName: share.sourceUnitName, expiresAt: share.expires_at,
+      sourceUnitName: share.sourceUnitName, sourceOrganizationName: share.sourceOrganizationName,
+      sharedByName: share.sharedByName, createdAt: share.created_at, expiresAt: share.expires_at,
       total, offset, hasMore: offset + photos.length < total,
       photos: photos.map((photo) => ({ ...photo,
         url: buildMediaUrl(photo.url, { userId: workspace.userId, photoId: photo.id }),
