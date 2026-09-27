@@ -21,6 +21,7 @@ const rules = validateRules({
   sectionTitleSelector: 'h2',
 });
 assert.ok(rules);
+assert.ok(validateRules({ itemSelector: 'img.gallery-image', sourceMode: 'img_attribute' }));
 assert.equal(validateRules({ itemSelector: 'img:has(script)' }), null);
 
 const result = applyTemplate(`
