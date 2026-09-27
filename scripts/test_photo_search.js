@@ -46,7 +46,9 @@ function run() {
   assert.strictEqual(shouldUseAiPhotoSearch('快速：田心原在讲台演讲', true), false);
   assert.strictEqual(escapeLikeToken('a%b_c#d'), 'a#%b#_c##d');
   assert.deepStrictEqual(tokenizeLiteralQuery('田心原，演讲  推荐'), ['田心原', '演讲', '推荐']);
-  assert.strictEqual(textMatch('演讲').params.length, 10);
+  const match = textMatch('演讲');
+  assert.ok(match.sql.includes("'$.transcript.text'"));
+  assert.strictEqual(match.params.length, (match.sql.match(/\?/g) || []).length);
 
   console.log('photo search selfcheck: passed');
 }

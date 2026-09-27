@@ -110,6 +110,12 @@ jobs:
             timeout --foreground 8m npm install --omit=dev --prefer-online --no-audit --no-fund --loglevel=verbose
           fi
 
+      - name: Run backend tests
+        run: |
+          set -euo pipefail
+          cd /home/liwy/mamage_server
+          npm test
+
       - name: Ensure CJK fonts for server-side screenshot
         run: |
           set -euo pipefail
