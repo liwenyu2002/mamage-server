@@ -46,21 +46,27 @@ async function main() {
     await pool.query('INSERT INTO organization_unit_memberships (unit_id, user_id, role) VALUES (?, ?, ?)',
       [ids.targetUnit, ids.recipient, 'member']);
     const [project] = await pool.query(
-      'INSERT INTO projects (uuid, name, organization_id, unit_id) VALUES (UUID(), ?, ?, ?)',
-      ['Original album', ids.org, ids.sourceUnit]);
+      'INSERT INTO projects (uuid, name, event_date, organization_id, unit_id) VALUES (UUID(), ?, ?, ?, ?)',
+      ['Original album', '2026-09-27', ids.org, ids.sourceUnit]);
     ids.sourceProject = project.insertId;
     const [photo] = await pool.query(
       `INSERT INTO photos
-         (uuid, project_id, organization_id, unit_id, url, thumb_url, public_download_url, title)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
+         (uuid, project_id, organization_id, unit_id, url, thumb_url, public_download_url,
+          title, ai_started_at, ai_finished_at, capture_time)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [ids.sourceProject, ids.org, ids.sourceUnit,
         `/uploads/units/${ids.sourceUnit}/original.jpg`,
         `/uploads/units/${ids.sourceUnit}/thumb.jpg`,
-        `/uploads/units/${ids.sourceUnit}/public.jpg`, 'Test photo']);
+        `/uploads/units/${ids.sourceUnit}/public.jpg`, 'Test photo',
+        '2026-09-22 10:30:18', '2026-09-22 10:30:41', '2026-09-21']);
     ids.sourcePhoto = photo.insertId;
     const [[sourcePhoto]] = await pool.query(
       'SELECT ph.*, p.name AS source_album_name FROM photos ph JOIN projects p ON p.id = ph.project_id WHERE ph.id = ?',
       [ids.sourcePhoto]
+    );
+    const [[sourceProject]] = await pool.query(
+      'SELECT name, description, event_date, meta, tags, type FROM projects WHERE id = ?',
+      [ids.sourceProject]
     );
     const [share] = await pool.query(
       `INSERT INTO internal_shares
@@ -68,7 +74,7 @@ async function main() {
           created_by, expires_at, snapshot_json)
        VALUES (?, ?, ?, 'album', 'copy', ?, ?, DATE_ADD(NOW(), INTERVAL 1 DAY), ?)`,
       [ids.org, ids.sourceUnit, ids.targetUnit, ids.sourceProject, ids.owner,
-        JSON.stringify({ project: { name: 'Original album', type: 'normal' }, sections: [] })]);
+        JSON.stringify({ project: sourceProject, sections: [] })]);
     ids.share = share.insertId;
     await pool.query('INSERT INTO internal_share_items (share_id, photo_id, snapshot_json) VALUES (?, ?, ?)',
       [ids.share, ids.sourcePhoto, JSON.stringify(sourcePhoto)]);
@@ -92,11 +98,21 @@ async function main() {
     const result = typeof row.result_json === 'string' ? JSON.parse(row.result_json) : row.result_json;
     ids.copiedProject = result.projectId;
     assert.equal(result.photoIds.length, 1);
-    const [photos] = await pool.query('SELECT * FROM photos WHERE id = ?', [result.photoIds[0]]);
+    const [photos] = await pool.query(
+      `SELECT *, DATE_FORMAT(ai_started_at, '%Y-%m-%d %H:%i:%s') AS started,
+              DATE_FORMAT(ai_finished_at, '%Y-%m-%d %H:%i:%s') AS finished,
+              DATE_FORMAT(capture_time, '%Y-%m-%d') AS captured
+       FROM photos WHERE id = ?`, [result.photoIds[0]]);
     assert.equal(Number(photos[0].unit_id), ids.targetUnit);
     assert.equal(photos[0].title, 'Test photo');
-    const [[copiedProject]] = await pool.query('SELECT name FROM projects WHERE id = ?', [ids.copiedProject]);
+    assert.equal(photos[0].started, '2026-09-22 10:30:18');
+    assert.equal(photos[0].finished, '2026-09-22 10:30:41');
+    assert.equal(photos[0].captured, '2026-09-21');
+    const [[copiedProject]] = await pool.query(
+      `SELECT name, DATE_FORMAT(event_date, '%Y-%m-%d') AS eventDate FROM projects WHERE id = ?`,
+      [ids.copiedProject]);
     assert.equal(copiedProject.name, 'Original album（副本）');
+    assert.equal(copiedProject.eventDate, '2026-09-27');
     assert.notEqual(photos[0].url, `/uploads/units/${ids.sourceUnit}/original.jpg`);
     assert.equal(copiedKeys.length, 3);
     assert.equal(copyAttempts, 4);
