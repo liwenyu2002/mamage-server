@@ -1960,5 +1960,8 @@ router.processUpload = processUpload;
 router.processVideoUpload = processVideoUpload;
 router.createPhotoRecordWithRetry = createPhotoRecordWithRetry;
 router.appendPhotoIdToProjectBestEffort = appendPhotoIdToProjectBestEffort;
+router.buildObjectKeys = buildObjectKeys;
+router.enqueuePostUploadJobs = enqueuePostUploadJobs;
+router.enqueuePublicDownloadDerivative = enqueuePublicDownloadDerivative;
 
 module.exports = router;

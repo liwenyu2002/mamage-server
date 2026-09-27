@@ -71,6 +71,7 @@ const wechatStyleRouter = require('./routes/wechat_style');
 const wechatPreviewRouter = require('./routes/wechat_preview');
 const wechatCompositionsRouter = require('./routes/wechat_compositions');
 const userFavoritesRouter = require('./routes/user_favorites');
+const externalImportsRouter = require('./routes/external_imports');
 
 const app = express();
 
@@ -140,6 +141,7 @@ app.use((req, res, next) => {
 app.use('/api/projects', projectsRouter);
 app.use('/api/photos', photosRouter);
 app.use('/api/upload', uploadRouter);
+app.use('/api/external-imports', externalImportsRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/ai/news', aiNewsRouter);
 app.use('/api/ai/video', aiVideoRouter);
@@ -189,6 +191,7 @@ async function startup() {
   });
 
   require('./lib/organization_copy_worker').start();
+  require('./lib/external_import_worker').start();
 
   // AI 打标队列是纯内存的：重启后把 pending/running 孤儿重新入队。
   // 延迟执行避开启动高峰；AI_REQUEUE_ON_BOOT=0 可关闭。
