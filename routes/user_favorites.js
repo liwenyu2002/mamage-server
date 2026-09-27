@@ -7,6 +7,14 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
+const { resolveWorkspace, sendWorkspaceError } = require('../lib/workspace_access');
+
+function favoriteScope(workspace) {
+  if (!workspace.enabled) return { sql: '', params: [] };
+  return workspace.unitId
+    ? { sql: ' AND unit_id = ?', params: [workspace.unitId] }
+    : { sql: ' AND unit_id IS NULL', params: [] };
+}
 
 // snippet=画布框选收藏的元素片段（payload.blocks 是 DocBlock 数组,可原样再插入画布）
 const ALLOWED_KINDS = new Set(['styleBlock', 'photo', 'snippet']);
@@ -73,8 +81,9 @@ router.get('/', requirePermission('ai.generate'), async (req, res) => {
     }
 
     const userId = req.user.id;
-    const params = [userId];
-    let sql = 'SELECT * FROM user_favorites WHERE user_id = ?';
+    const scope = favoriteScope(await resolveWorkspace(req));
+    const params = [userId, ...scope.params];
+    let sql = `SELECT * FROM user_favorites WHERE user_id = ?${scope.sql}`;
     if (kind) {
       sql += ' AND kind = ?';
       params.push(kind);
@@ -84,6 +93,7 @@ router.get('/', requirePermission('ai.generate'), async (req, res) => {
     const [rows] = await pool.query(sql, params);
     res.json({ favorites: (rows || []).map(rowToFavorite) });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('GET /api/favorites error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
@@ -136,18 +146,20 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
     }
 
     const userId = req.user.id;
+    const workspace = await resolveWorkspace(req);
+    const scope = favoriteScope(workspace);
 
     const [existingRows] = await pool.query(
-      'SELECT * FROM user_favorites WHERE user_id = ? AND kind = ? AND ref_key = ? LIMIT 1',
-      [userId, kind, refKey]
+      `SELECT * FROM user_favorites WHERE user_id = ?${scope.sql} AND kind = ? AND ref_key = ? LIMIT 1`,
+      [userId, ...scope.params, kind, refKey]
     );
     if (existingRows && existingRows.length > 0) {
       return res.status(200).json({ favorite: rowToFavorite(existingRows[0]) });
     }
 
     const [[{ cnt }]] = await pool.query(
-      'SELECT COUNT(*) AS cnt FROM user_favorites WHERE user_id = ? AND kind = ?',
-      [userId, kind]
+      `SELECT COUNT(*) AS cnt FROM user_favorites WHERE user_id = ?${scope.sql} AND kind = ?`,
+      [userId, ...scope.params, kind]
     );
     if (cnt >= MAX_FAVORITES_PER_KIND) {
       return res.status(413).json({ code: 4134, message: `favorites of kind ${kind} exceed max ${MAX_FAVORITES_PER_KIND}` });
@@ -156,16 +168,16 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
     let insertId;
     try {
       const [result] = await pool.query(
-        'INSERT INTO user_favorites (user_id, kind, ref_key, payload, created_at) VALUES (?, ?, ?, ?, NOW())',
-        [userId, kind, refKey, payloadJson]
+        'INSERT INTO user_favorites (user_id, unit_id, kind, ref_key, payload, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
+        [userId, workspace.enabled ? workspace.unitId : null, kind, refKey, payloadJson]
       );
       insertId = result.insertId;
     } catch (e) {
       // 并发下两个请求都通过了上面的"不存在"检查，唯一键在 DB 层拦下重复写入，退化为幂等读取
       if (e && e.code === 'ER_DUP_ENTRY') {
         const [dupRows] = await pool.query(
-          'SELECT * FROM user_favorites WHERE user_id = ? AND kind = ? AND ref_key = ? LIMIT 1',
-          [userId, kind, refKey]
+          `SELECT * FROM user_favorites WHERE user_id = ?${scope.sql} AND kind = ? AND ref_key = ? LIMIT 1`,
+          [userId, ...scope.params, kind, refKey]
         );
         if (dupRows && dupRows.length > 0) {
           return res.status(200).json({ favorite: rowToFavorite(dupRows[0]) });
@@ -177,6 +189,7 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
     const [savedRows] = await pool.query('SELECT * FROM user_favorites WHERE id = ? LIMIT 1', [insertId]);
     res.status(201).json({ favorite: rowToFavorite(savedRows[0]) });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('POST /api/favorites error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
@@ -189,12 +202,17 @@ router.delete('/:id', requirePermission('ai.generate'), async (req, res) => {
     if (!id) return res.status(400).json({ code: 4001, message: 'invalid id' });
 
     const userId = req.user.id;
-    const [rows] = await pool.query('SELECT id FROM user_favorites WHERE id = ? AND user_id = ? LIMIT 1', [id, userId]);
+    const scope = favoriteScope(await resolveWorkspace(req));
+    const [rows] = await pool.query(
+      `SELECT id FROM user_favorites WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+      [id, userId, ...scope.params]
+    );
     if (!rows || rows.length === 0) return res.status(404).json({ code: 4041, message: 'favorite not found' });
 
     await pool.query('DELETE FROM user_favorites WHERE id = ?', [id]);
     res.json({ deleted: true, id });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('DELETE /api/favorites/:id error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }

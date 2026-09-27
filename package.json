@@ -24,7 +24,8 @@
     "test:video": "node scripts/test_video_production_logic.js",
     "ai:tags:backfill": "node scripts/backfill_ai_tags.js",
     "test:direct-video-proxy": "node scripts/test_direct_video_proxy.js",
-    "test:face-person-split": "node scripts/test_face_person_split.js"
+    "test:face-person-split": "node scripts/test_face_person_split.js",
+    "test:workspace": "node scripts/test_workspace_access.js && node scripts/test_workspace_share.js && node scripts/test_workspace_copy.js && node scripts/test_workspace_internal_share_route.js && node scripts/test_workspace_video_assets.js"
   },
   "keywords": [],
   "author": "",

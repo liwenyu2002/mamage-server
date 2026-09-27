@@ -11,8 +11,10 @@ const { pipeline } = require('stream/promises');
 const multer = require('multer');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
-const { pool, buildUploadUrl } = require('../db');
+const { pool, buildInternalMediaUrl } = require('../db');
 const cosStorage = require('../lib/cos_storage');
+const { buildMediaUrl } = require('../lib/media_access');
+const { resolveWorkspace, requireProjectAccess, WorkspaceAccessError } = require('../lib/workspace_access');
 const { requirePermission } = require('../lib/permissions');
 const { createPublicDownloadBuffer, readStreamToBuffer, DEFAULT_MAX_BYTES: DEFAULT_PUBLIC_DOWNLOAD_MAX_BYTES } = require('../lib/public_download_variant');
 const { getMaxVideoUploadBytes, getMaxVideoApiFallbackBytes } = require('../config/video_upload_limits');
@@ -741,9 +743,13 @@ function readPhotoMetadata(body) {
   };
 }
 
-function buildObjectKeys(projectId, originalName, mimeType, mediaType = 'image') {
+function buildObjectKeys(projectId, originalName, mimeType, mediaType = 'image', unitId = null) {
   let keyPrefix;
-  if (Number(projectId) === 1) {
+  if (unitId) {
+    const now = new Date();
+    const date = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}`;
+    keyPrefix = `uploads/units/${unitId}/${mediaType === 'video' ? 'videos/' : ''}${date}`;
+  } else if (Number(projectId) === 1) {
     keyPrefix = mediaType === 'video' ? 'uploads/scenery/videos' : 'uploads/scenery';
   } else {
     const now = new Date();
@@ -791,7 +797,14 @@ function parseProjectPhotoIds(existing) {
   return [];
 }
 
-async function ensureProjectInScope(db, projectId, orgId) {
+async function ensureProjectInScope(db, projectId, orgId, req = null) {
+  if (req) {
+    const workspace = await resolveWorkspace(req);
+    if (workspace.enabled) {
+      if (!projectId) throw new WorkspaceAccessError('PROJECT_REQUIRED', 400);
+      return requireProjectAccess(req, projectId, 'upload', db);
+    }
+  }
   if (!projectId) return;
   let sql = 'SELECT id FROM projects WHERE id = ?';
   const params = [projectId];
@@ -816,7 +829,7 @@ async function ensureProjectInScope(db, projectId, orgId) {
         notFound.status = 404;
         throw notFound;
       }
-      return;
+      return rows[0];
     }
     throw err;
   }
@@ -864,15 +877,19 @@ async function createPhotoRecord(payload) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    await ensureProjectInScope(conn, payload.projectId, payload.orgId);
+    await ensureProjectInScope(conn, payload.projectId, payload.orgId, payload.req);
     await ensureTimelineSectionInProject(conn, payload.projectId, payload.orgId, payload.timelineSectionId);
+    const [ownerRows] = payload.projectId
+      ? await conn.query('SELECT unit_id FROM projects WHERE id = ? LIMIT 1', [payload.projectId])
+      : [[]];
+    const unitId = ownerRows[0]?.unit_id || null;
 
     let result;
     try {
       [result] = await conn.query(
         `INSERT INTO photos
-          (uuid, project_id, timeline_section_id, url, thumb_url, playback_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+          (uuid, project_id, timeline_section_id, url, thumb_url, playback_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id, unit_id)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
         [
           payload.projectId || null,
           payload.timelineSectionId || null,
@@ -886,6 +903,7 @@ async function createPhotoRecord(payload) {
           payload.type,
           payload.photographerId || null,
           payload.orgId,
+          unitId,
         ]
       );
     } catch (err) {
@@ -893,8 +911,8 @@ async function createPhotoRecord(payload) {
         if (String(err.message || '').includes('playback_url')) {
           [result] = await conn.query(
             `INSERT INTO photos
-              (uuid, project_id, timeline_section_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id)
-             VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+              (uuid, project_id, timeline_section_id, url, thumb_url, title, description, tags, ai_status, ai_error, type, photographer_id, organization_id, unit_id)
+             VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
             [
               payload.projectId || null,
               payload.timelineSectionId || null,
@@ -907,6 +925,7 @@ async function createPhotoRecord(payload) {
               payload.type,
               payload.photographerId || null,
               payload.orgId,
+              unitId,
             ]
           );
         } else {
@@ -1159,7 +1178,7 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
     const run = async () => {
       let buf = thumbBuffer;
       if (!buf) {
-        const thumbUrl = buildUploadUrl(thumbRel);
+        const thumbUrl = buildInternalMediaUrl(thumbRel);
         buf = await fetchBuffer(thumbUrl, Number(process.env.IMAGE_SIMILARITY_FETCH_MAX_BYTES || 5 * 1024 * 1024), Number(process.env.IMAGE_SIMILARITY_FETCH_TIMEOUT_MS || 15000));
       }
       const emb = await imageSim.encodeImageFromBuffer(buf);
@@ -1222,12 +1241,12 @@ function makeResponsePayload({ insertedId, projectId, timelineSectionId, relPath
     id: insertedId,
     projectId: projectId || null,
     timelineSectionId: timelineSectionId || null,
-    url: buildUploadUrl(relPath),
-    thumbUrl: thumbRel ? buildUploadUrl(thumbRel) : null,
-    playbackUrl: playbackRel ? buildUploadUrl(playbackRel) : null,
-    playback_url: playbackRel ? buildUploadUrl(playbackRel) : null,
-    fullUrl: buildUploadUrl(relPath),
-    fullThumbUrl: thumbRel ? buildUploadUrl(thumbRel) : null,
+    url: buildMediaUrl(relPath, { userId: photographerId, photoId: insertedId }),
+    thumbUrl: thumbRel ? buildMediaUrl(thumbRel, { userId: photographerId, photoId: insertedId }) : null,
+    playbackUrl: playbackRel ? buildMediaUrl(playbackRel, { userId: photographerId, photoId: insertedId }) : null,
+    playback_url: playbackRel ? buildMediaUrl(playbackRel, { userId: photographerId, photoId: insertedId }) : null,
+    fullUrl: buildMediaUrl(relPath, { userId: photographerId, photoId: insertedId }),
+    fullThumbUrl: thumbRel ? buildMediaUrl(thumbRel, { userId: photographerId, photoId: insertedId }) : null,
     title,
     type,
     mediaType: mediaType || (isVideo ? 'video' : 'image'),
@@ -1312,12 +1331,12 @@ async function processUpload(req, res) {
     const metadata = readPhotoMetadata(req.body || {});
     const photographerId = req.user && req.user.id ? req.user.id : null;
     const orgId = getOrgId(req);
-    await ensureProjectInScope(pool, metadata.projectId, orgId);
+    const scopedProject = await ensureProjectInScope(pool, metadata.projectId, orgId, req);
     await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
     timings.scopeMs = nowMs() - startMs;
 
     const mimeType = inferImageMime(req.file.mimetype, req.file.originalname);
-    const { originalKey, thumbKey, publicDownloadKey, relPath, thumbRel, publicDownloadRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType);
+    const { originalKey, thumbKey, publicDownloadKey, relPath, thumbRel, publicDownloadRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'image', scopedProject?.unit_id);
 
     let thumbBuffer = null;
     try {
@@ -1361,6 +1380,7 @@ async function processUpload(req, res) {
         thumbRel,
         photographerId,
         orgId,
+        req,
       });
       timings.dbMs = nowMs() - dbStartMs;
     } catch (err) {
@@ -1433,7 +1453,7 @@ async function processVideoUpload(req, res) {
     metadata.type = 'video';
     const photographerId = req.user && req.user.id ? req.user.id : null;
     const orgId = getOrgId(req);
-    await ensureProjectInScope(pool, metadata.projectId, orgId);
+    const scopedProject = await ensureProjectInScope(pool, metadata.projectId, orgId, req);
     await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
 
     const mimeType = inferVideoMime(req.file.mimetype, req.file.originalname);
@@ -1446,7 +1466,7 @@ async function processVideoUpload(req, res) {
       return res.status(507).json({ error: 'INSUFFICIENT_STORAGE', message: 'Server disk space low, try later' });
     }
 
-    const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video');
+    const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, req.file.originalname, mimeType, 'video', scopedProject?.unit_id);
     processedVideo = await prepareVideoForStreaming(filePath, mimeType);
     const uploadFilePath = processedVideo.filePath || filePath;
     const uploadSize = processedVideo.size || req.file.size;
@@ -1485,6 +1505,7 @@ async function processVideoUpload(req, res) {
         aiStatus: playbackThumbRel ? 'pending' : 'skipped',
         photographerId,
         orgId,
+        req,
       });
     } catch (err) {
       await cosStorage.deleteObjects(uploadedKeys).catch(() => null);
@@ -1572,7 +1593,7 @@ router.post('/photo/direct/init', requirePermission('upload.photo'), async (req,
 
     const metadata = readPhotoMetadata(req.body || {});
     const orgId = getOrgId(req);
-    await ensureProjectInScope(pool, metadata.projectId, orgId);
+    const scopedProject = await ensureProjectInScope(pool, metadata.projectId, orgId, req);
     await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
 
     const fileName = trimText(req.body && req.body.fileName, 255) || 'photo.jpg';
@@ -1589,7 +1610,7 @@ router.post('/photo/direct/init', requirePermission('upload.photo'), async (req,
       return res.status(415).json({ error: 'UNSUPPORTED_FILE_TYPE' });
     }
 
-    const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, fileName, mimeType);
+    const { originalKey, thumbKey, relPath, thumbRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'image', scopedProject?.unit_id);
     const [original, thumb] = await Promise.all([
       cosStorage.signedPost(originalKey, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS, contentType: mimeType, cacheControl: UPLOAD_CACHE_CONTROL, maxBytes: fileSize }),
       cosStorage.signedPost(thumbKey, { expires: SIGNED_UPLOAD_EXPIRES_SECONDS, contentType: 'image/jpeg', cacheControl: UPLOAD_CACHE_CONTROL, maxBytes: Math.max(1024 * 1024, Math.min(fileSize, 16 * 1024 * 1024)) }),
@@ -1643,6 +1664,7 @@ router.post('/photo/direct/complete', requirePermission('upload.photo'), async (
         thumbRel: `/${thumbKey}`,
         photographerId,
         orgId,
+        req,
       });
     } catch (err) {
       await cosStorage.deleteObjects([originalKey, thumbKey]).catch(() => null);
@@ -1710,7 +1732,7 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
     const metadata = readPhotoMetadata(req.body || {});
     metadata.type = 'video';
     const orgId = getOrgId(req);
-    await ensureProjectInScope(pool, metadata.projectId, orgId);
+    const scopedProject = await ensureProjectInScope(pool, metadata.projectId, orgId, req);
     await ensureTimelineSectionInProject(pool, metadata.projectId, orgId, metadata.timelineSectionId);
     const fileName = trimText(req.body && req.body.fileName, 255) || 'video.mp4';
     const fileSize = Number(req.body && req.body.fileSize);
@@ -1722,7 +1744,7 @@ router.post('/video/direct/init', requirePermission('upload.photo'), async (req,
     const transport = resolveDirectVideoTransport(req);
     const partSize = transport === 'proxy' ? DIRECT_VIDEO_PROXY_PART_SIZE : DIRECT_VIDEO_PART_SIZE;
 
-    const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'video');
+    const { originalKey, thumbKey, playbackKey, relPath, thumbRel, playbackRel } = buildObjectKeys(metadata.projectId, fileName, mimeType, 'video', scopedProject?.unit_id);
     const sessionId = uuidv4();
     const sessionTtlMs = getDirectVideoSessionTtlMs(fileSize);
     const commonSession = {
@@ -1891,7 +1913,7 @@ router.post('/video/direct/complete', requirePermission('upload.photo'), async (
       insertedId = await createPhotoRecordWithRetry({
         // The source is already in object storage. Keep the semantic state visible
         // while the low-priority post-process waits for its playback slot.
-        ...session.metadata, relPath: session.relPath, thumbRel: null, playbackRel: null, aiStatus: 'pending', photographerId, orgId: session.orgId,
+        ...session.metadata, relPath: session.relPath, thumbRel: null, playbackRel: null, aiStatus: 'pending', photographerId, orgId: session.orgId, req,
       });
     } catch (dbErr) {
       await cosStorage.deleteObjects([session.originalKey]).catch(() => null);

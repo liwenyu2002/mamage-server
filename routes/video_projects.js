@@ -5,6 +5,7 @@ const path = require('path');
 const multer = require('multer');
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
+const { resolveWorkspace, requirePhotosAccess, sendWorkspaceError } = require('../lib/workspace_access');
 const { probeVideo, renderProject, normalizeProjectClips } = require('../lib/video_render');
 const { analyzeVideo } = require('../lib/video_analysis');
 const videoStorage = require('../lib/video_editor_storage');
@@ -12,6 +13,9 @@ const cosStorage = require('../lib/cos_storage');
 const { getMaxVideoUploadBytes, getMaxVideoApiFallbackBytes } = require('../config/video_upload_limits');
 
 const router = express.Router();
+const projectUnitScope = (workspace) => !workspace.enabled ? { sql: '', params: [] }
+  : workspace.unitId ? { sql: ' AND unit_id = ?', params: [workspace.unitId] }
+    : { sql: ' AND unit_id IS NULL', params: [] };
 const assetUploadDir = videoStorage.getUploadTempDir();
 const MAX_VIDEO_UPLOAD_BYTES = getMaxVideoUploadBytes();
 const MAX_VIDEO_API_FALLBACK_BYTES = getMaxVideoApiFallbackBytes();
@@ -148,12 +152,12 @@ function getDirectAssetSession(req, sessionId) {
   return session;
 }
 
-async function createAssetRecord({ user, metadata, key }) {
+async function createAssetRecord({ user, unitId, metadata, key }) {
   const [result] = await pool.query(
     `INSERT INTO video_editor_assets
-     (user_id, org_id, name, storage_path, public_url, mime_type, file_size, duration_seconds, width, height, has_audio)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [user.id, user.organization_id || null, metadata.name, key, null, metadata.mimeType, metadata.size,
+     (user_id, org_id, unit_id, name, storage_path, public_url, mime_type, file_size, duration_seconds, width, height, has_audio)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [user.id, user.organization_id || null, unitId, metadata.name, key, null, metadata.mimeType, metadata.size,
       metadata.duration, metadata.width, metadata.height, metadata.hasAudio ? 1 : 0]
   );
   const [rows] = await pool.query('SELECT * FROM video_editor_assets WHERE id = ? AND user_id = ? LIMIT 1', [result.insertId, user.id]);
@@ -178,11 +182,19 @@ const renderDto = (row) => ({
 });
 
 router.get('/assets', requirePermission('ai.generate'), async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM video_editor_assets WHERE user_id = ? ORDER BY created_at DESC LIMIT 300', [req.user.id]);
-  res.json({ assets: rows.map(assetDto) });
+  try {
+    const scope = projectUnitScope(await resolveWorkspace(req));
+    const [rows] = await pool.query(`SELECT * FROM video_editor_assets WHERE user_id = ?${scope.sql} ORDER BY created_at DESC LIMIT 300`,
+      [req.user.id, ...scope.params]);
+    res.json({ assets: rows.map(assetDto) });
+  } catch (err) { if (!sendWorkspaceError(res, err)) throw err; }
 });
 
-router.post('/assets', requirePermission('ai.generate'), (req, res) => {
+router.post('/assets', requirePermission('ai.generate'), async (req, res) => {
+  let workspace;
+  try { workspace = await resolveWorkspace(req); }
+  catch (err) { if (sendWorkspaceError(res, err)) return; throw err; }
+  if (workspace.enabled && !workspace.unitId) return res.status(403).json({ error: 'ACTIVE_UNIT_REQUIRED' });
   const contentLength = Number(req.headers && req.headers['content-length']);
   if (Number.isFinite(contentLength)
     && contentLength > MAX_VIDEO_API_FALLBACK_BYTES + 32 * 1024 * 1024) {
@@ -216,6 +228,7 @@ router.post('/assets', requirePermission('ai.generate'), (req, res) => {
       try {
         const asset = await createAssetRecord({
           user: req.user,
+          unitId: workspace.enabled ? workspace.unitId : null,
           key: stored.key,
           metadata: {
             name: String(req.file.originalname || '视频').slice(0, 255),
@@ -245,6 +258,8 @@ router.post('/assets', requirePermission('ai.generate'), (req, res) => {
 // 失败时前端会降级到上面的 /assets 接口，兼容对象存储 CORS 不可用的网络环境。
 router.post('/assets/direct/init', requirePermission('ai.generate'), async (req, res) => {
   try {
+    const workspace = await resolveWorkspace(req);
+    if (workspace.enabled && !workspace.unitId) return res.status(403).json({ error: 'ACTIVE_UNIT_REQUIRED' });
     videoStorage.assertObjectStorage();
     const metadata = normalizeDirectAssetMetadata(req.body || {});
     const expiresIn = directAssetUploadExpiresSeconds(metadata.size);
@@ -264,6 +279,7 @@ router.post('/assets/direct/init', requirePermission('ai.generate'), async (req,
     directAssetUploads.set(id, {
       id,
       userId: req.user.id,
+      unitId: workspace.enabled ? workspace.unitId : null,
       key,
       metadata,
       expiresAt: Date.now() + Math.max(
@@ -280,6 +296,7 @@ router.post('/assets/direct/init', requirePermission('ai.generate'), async (req,
       upload: { uploadUrl: post.postUrl, formFields: post.fields },
     });
   } catch (error) {
+    if (sendWorkspaceError(res, error)) return;
     return res.status(error.status || (error.code === 'VIDEO_STORAGE_NOT_CONFIGURED' ? 503 : 500)).json({
       error: error.code || error.message || 'DIRECT_VIDEO_INIT_FAILED',
       maxFileBytes: error.maxFileBytes,
@@ -292,13 +309,17 @@ router.post('/assets/direct/complete', requirePermission('ai.generate'), async (
   try {
     session = getDirectAssetSession(req, req.body && req.body.sessionId);
     if (!session) return res.status(404).json({ error: 'DIRECT_VIDEO_SESSION_NOT_FOUND' });
+    const workspace = await resolveWorkspace(req);
+    if (workspace.enabled && workspace.unitId !== session.unitId) {
+      return res.status(403).json({ error: 'VIDEO_ASSET_UNIT_CHANGED' });
+    }
     const head = await cosStorage.headObject(session.key);
     if (!head || Number(head.ContentLength) !== Number(session.metadata.size)) {
       const error = new Error('DIRECT_VIDEO_SIZE_MISMATCH');
       error.status = 400;
       throw error;
     }
-    const asset = await createAssetRecord({ user: req.user, metadata: session.metadata, key: session.key });
+    const asset = await createAssetRecord({ user: req.user, unitId: session.unitId, metadata: session.metadata, key: session.key });
     directAssetUploads.delete(session.id);
     return res.status(201).json({ asset: assetDto(asset) });
   } catch (error) {
@@ -306,6 +327,7 @@ router.post('/assets/direct/complete', requirePermission('ai.generate'), async (
       directAssetUploads.delete(session.id);
       await cosStorage.deleteObjects([session.key]).catch(() => null);
     }
+    if (sendWorkspaceError(res, error)) return;
     return res.status(error.status || 500).json({ error: error.code || error.message || 'DIRECT_VIDEO_COMPLETE_FAILED' });
   }
 });
@@ -319,7 +341,9 @@ router.post('/assets/direct/abort', requirePermission('ai.generate'), async (req
 });
 
 router.post('/assets/:assetId/analyze', requirePermission('ai.generate'), async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM video_editor_assets WHERE id = ? AND user_id = ? LIMIT 1', [req.params.assetId, req.user.id]);
+  const scope = projectUnitScope(await resolveWorkspace(req));
+  const [rows] = await pool.query(`SELECT * FROM video_editor_assets WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+    [req.params.assetId, req.user.id, ...scope.params]);
   if (!rows.length) return res.status(404).json({ error: 'VIDEO_ASSET_NOT_FOUND' });
   let workDir = null;
   try {
@@ -355,18 +379,25 @@ router.post('/assets/:assetId/analyze', requirePermission('ai.generate'), async 
 });
 
 router.get('/', requirePermission('ai.generate'), async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM video_projects WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100', [req.user.id]);
-  res.json({ projects: rows.map((row) => projectDto(row, false)) });
+  try {
+    const scope = projectUnitScope(await resolveWorkspace(req));
+    const [rows] = await pool.query(`SELECT * FROM video_projects WHERE user_id = ?${scope.sql} ORDER BY updated_at DESC LIMIT 100`,
+      [req.user.id, ...scope.params]);
+    res.json({ projects: rows.map((row) => projectDto(row, false)) });
+  } catch (err) { if (!sendWorkspaceError(res, err)) throw err; }
 });
 
 router.post('/', requirePermission('ai.generate'), async (req, res) => {
+  const workspace = await resolveWorkspace(req);
+  if (workspace.enabled && !workspace.unitId) return res.status(403).json({ error: 'ACTIVE_UNIT_REQUIRED' });
   const project = req.body && req.body.project;
   if (!project || typeof project !== 'object') return res.status(400).json({ error: 'VIDEO_PROJECT_REQUIRED' });
   const name = String(req.body.name || project.name || '未命名视频工程').trim().slice(0, 160) || '未命名视频工程';
   const ratio = String(req.body.aspectRatio || project.aspectRatio || (project.canvas && project.canvas.aspectRatio) || '16:9').slice(0, 16);
   const [result] = await pool.query(
-    'INSERT INTO video_projects (user_id, org_id, name, aspect_ratio, project_json, duration_seconds) VALUES (?, ?, ?, ?, ?, ?)',
-    [req.user.id, req.user.organization_id || null, name, ratio, JSON.stringify(project), projectDuration(project)]
+    'INSERT INTO video_projects (user_id, org_id, unit_id, name, aspect_ratio, project_json, duration_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [req.user.id, req.user.organization_id || null, workspace.enabled ? workspace.unitId : null,
+      name, ratio, JSON.stringify(project), projectDuration(project)]
   );
   const [rows] = await pool.query('SELECT * FROM video_projects WHERE id = ? LIMIT 1', [result.insertId]);
   res.status(201).json({ project: projectDto(rows[0], true) });
@@ -374,19 +405,23 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
 
 router.get('/:id', requirePermission('ai.generate'), async (req, res, next) => {
   if (!/^\d+$/.test(req.params.id)) return next();
-  const [rows] = await pool.query('SELECT * FROM video_projects WHERE id = ? AND user_id = ? LIMIT 1', [req.params.id, req.user.id]);
+  const scope = projectUnitScope(await resolveWorkspace(req));
+  const [rows] = await pool.query(`SELECT * FROM video_projects WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+    [req.params.id, req.user.id, ...scope.params]);
   if (!rows.length) return res.status(404).json({ error: 'VIDEO_PROJECT_NOT_FOUND' });
   res.json({ project: projectDto(rows[0], true) });
 });
 
 router.put('/:id', requirePermission('ai.generate'), async (req, res) => {
+  const scope = projectUnitScope(await resolveWorkspace(req));
   const project = req.body && req.body.project;
   if (!project || typeof project !== 'object') return res.status(400).json({ error: 'VIDEO_PROJECT_REQUIRED' });
   const name = String(req.body.name || project.name || '未命名视频工程').trim().slice(0, 160) || '未命名视频工程';
   const ratio = String(req.body.aspectRatio || project.aspectRatio || (project.canvas && project.canvas.aspectRatio) || '16:9').slice(0, 16);
   const [result] = await pool.query(
-    'UPDATE video_projects SET name = ?, aspect_ratio = ?, project_json = ?, duration_seconds = ?, version = version + 1 WHERE id = ? AND user_id = ?',
-    [name, ratio, JSON.stringify(project), projectDuration(project), req.params.id, req.user.id]
+    `UPDATE video_projects SET name = ?, aspect_ratio = ?, project_json = ?, duration_seconds = ?, version = version + 1
+     WHERE id = ? AND user_id = ?${scope.sql}`,
+    [name, ratio, JSON.stringify(project), projectDuration(project), req.params.id, req.user.id, ...scope.params]
   );
   if (!result.affectedRows) return res.status(404).json({ error: 'VIDEO_PROJECT_NOT_FOUND' });
   const [rows] = await pool.query('SELECT * FROM video_projects WHERE id = ? AND user_id = ? LIMIT 1', [req.params.id, req.user.id]);
@@ -394,7 +429,9 @@ router.put('/:id', requirePermission('ai.generate'), async (req, res) => {
 });
 
 router.delete('/:id', requirePermission('ai.generate'), async (req, res) => {
-  const [result] = await pool.query('DELETE FROM video_projects WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
+  const scope = projectUnitScope(await resolveWorkspace(req));
+  const [result] = await pool.query(`DELETE FROM video_projects WHERE id = ? AND user_id = ?${scope.sql}`,
+    [req.params.id, req.user.id, ...scope.params]);
   if (!result.affectedRows) return res.status(404).json({ error: 'VIDEO_PROJECT_NOT_FOUND' });
   res.json({ ok: true });
 });
@@ -416,13 +453,22 @@ function referencedSourceIds(project) {
   return result;
 }
 
-async function loadProductionRenderAssets(project, projectRow) {
+async function loadProductionRenderAssets(project, projectRow, userId) {
   const sourceIds = referencedSourceIds(project);
   const sources = (Array.isArray(project.sources) ? project.sources : [])
     .filter((source) => source && sourceIds.has(String(source.id)) && /^\d+$/.test(String(source.productionPhotoId || '')));
   if (!sources.length) return [];
 
   const photoIds = [...new Set(sources.map((source) => Number(source.productionPhotoId)))];
+  if (process.env.ORGANIZATION_UNITS_ACTIVE === '1') {
+    const [users] = await pool.query('SELECT id, role, organization_id FROM users WHERE id = ? LIMIT 1', [userId]);
+    if (!users.length) throw new Error('RENDER_USER_NOT_FOUND');
+    await requirePhotosAccess({
+      user: users[0],
+      get(name) { return String(name).toLowerCase() === 'x-mamage-unit-id'
+        ? (projectRow.unit_id ? String(projectRow.unit_id) : 'legacy') : undefined; },
+    }, photoIds, 'read');
+  }
   const orgId = projectRow.org_id === null || projectRow.org_id === undefined ? null : Number(projectRow.org_id);
   const orgClause = orgId === null ? 'p.organization_id IS NULL' : 'p.organization_id = ?';
   const params = [...photoIds];
@@ -499,11 +545,13 @@ async function runRender(jobId, userId, projectRow, options) {
     const hasBlankClip = normalizeProjectClips(project).some((clip) => clip && clip.kind === 'blank');
     const hasProductionSource = renderSources.some((source) => /^\d+$/.test(String(source.productionPhotoId || '')));
     if (!ids.length && !hasProductionSource && !hasBlankClip) throw new Error('工程素材尚未上传到服务端');
+    const scope = projectUnitScope({ enabled: process.env.ORGANIZATION_UNITS_ACTIVE === '1', unitId: projectRow.unit_id });
     const assets = ids.length
-      ? (await pool.query(`SELECT * FROM video_editor_assets WHERE user_id = ? AND id IN (${ids.map(() => '?').join(',')})`, [userId, ...ids]))[0]
+      ? (await pool.query(`SELECT * FROM video_editor_assets WHERE user_id = ? AND id IN (${ids.map(() => '?').join(',')})${scope.sql}`,
+        [userId, ...ids, ...scope.params]))[0]
       : [];
     if (assets.length !== ids.length) throw new Error('工程包含无权访问或已经不存在的素材');
-    const productionAssets = await loadProductionRenderAssets(project, projectRow);
+    const productionAssets = await loadProductionRenderAssets(project, projectRow, userId);
     workDir = await videoStorage.createJobWorkDir(jobId);
     const localAssets = await materializeRenderAssets([...assets, ...productionAssets], workDir, userId);
     const outputPath = path.join(workDir, 'output.mp4');
@@ -578,7 +626,9 @@ async function recoverInterruptedRenders() {
 }
 
 router.post('/:id/render', requirePermission('ai.generate'), async (req, res) => {
-  const [projects] = await pool.query('SELECT * FROM video_projects WHERE id = ? AND user_id = ? LIMIT 1', [req.params.id, req.user.id]);
+  const scope = projectUnitScope(await resolveWorkspace(req));
+  const [projects] = await pool.query(`SELECT * FROM video_projects WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+    [req.params.id, req.user.id, ...scope.params]);
   if (!projects.length) return res.status(404).json({ error: 'VIDEO_PROJECT_NOT_FOUND' });
   try {
     videoStorage.assertObjectStorage();

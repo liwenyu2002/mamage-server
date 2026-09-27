@@ -443,7 +443,38 @@ router.post('/login', async (req, res) => {
 
 // 获取当前用户信息
 router.get('/me', authMiddleware, async (req, res) => {
-  res.json(req.user);
+  try {
+    const { resolveWorkspace, unitRoleAllows } = require('../lib/workspace_access');
+    const workspace = await resolveWorkspace(req);
+    if (!workspace.enabled) return res.json(req.user);
+    const permissions = new Set(req.user.permissions || []);
+    const scoped = ['projects.create', 'projects.update', 'projects.delete',
+      'photos.edit', 'photos.delete', 'upload.photo', 'ai.generate', 'faces.label', 'faces.merge'];
+    scoped.forEach((permission) => permissions.delete(permission));
+    if (workspace.unitId) {
+      if (workspace.collegeAdmin || unitRoleAllows(workspace.role, 'upload')) permissions.add('upload.photo');
+      if (workspace.collegeAdmin || unitRoleAllows(workspace.role, 'edit')) {
+        ['projects.create', 'projects.update', 'photos.edit', 'photos.delete', 'ai.generate'].forEach((permission) => permissions.add(permission));
+      }
+      if (workspace.collegeAdmin || unitRoleAllows(workspace.role, 'manage')) permissions.add('projects.delete');
+    } else if (workspace.collegeAdmin) {
+      ['projects.update', 'projects.delete', 'photos.edit', 'photos.delete', 'ai.generate'].forEach((permission) => permissions.add(permission));
+    }
+    const [faceGrants] = await pool.query(
+      'SELECT college_wide FROM face_search_grants WHERE organization_id = ? AND user_id = ? LIMIT 1',
+      [workspace.orgId, workspace.userId]
+    );
+    if (faceGrants.length) {
+      if ((req.user.permissions || []).includes('faces.label')) permissions.add('faces.label');
+      if ((req.user.permissions || []).includes('faces.merge')) permissions.add('faces.merge');
+    }
+    res.json({ ...req.user, permissions: [...permissions], activeUnitId: workspace.unitId,
+      unitRole: workspace.role, collegeAdmin: workspace.collegeAdmin,
+      faceSearchAllowed: faceGrants.length > 0 });
+  } catch (err) {
+    console.error('[users.me]', err);
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
 });
 
 // 更新当前用户资料（允许更新: name, department, avatar_url, nickname, email）

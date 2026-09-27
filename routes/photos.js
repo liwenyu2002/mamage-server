@@ -9,6 +9,7 @@ const fetch = require('node-fetch');
 const { Transform } = require('stream');
 const keys = require('../config/keys');
 const cosStorage = require('../lib/cos_storage');
+const { buildMediaUrl } = require('../lib/media_access');
 const JWT_SECRET = keys.JWT_SECRET;
 // 与 upload.js/app.js 保持一致：优先使用 UPLOAD_ABS_DIR 环境变量（从 config/keys 读取）
 const uploadsAbsDir = keys.UPLOAD_ABS_DIR || path.join(__dirname, '..', 'uploads');
@@ -36,6 +37,22 @@ const skipLocalFileCheck = (() => {
 // 如果挂在 /api/photos 下：GET /api/photos?projectId=1&limit=4&random=1&type=normal(可选)
 const { requirePermission, requireAdmin, hasPermissionForUserId } = require('../lib/permissions');
 const { searchPhotos: runPhotoSearch } = require('../lib/photo_search');
+const {
+  resolveWorkspace, requireProjectAccess, requirePhotoAccess, requirePhotosAccess, sendWorkspaceError,
+  assertNoActiveCopySource,
+} = require('../lib/workspace_access');
+
+router.param('id', async (req, res, next, value) => {
+  try {
+    if (!/^\d+$/.test(String(value))) return next();
+    await populateReqUserFromAuthIfPresent(req);
+    const action = req.method === 'PATCH' || req.method === 'DELETE' ? 'edit' : 'read';
+    await requirePhotoAccess(req, Number(value), action);
+    next();
+  } catch (err) {
+    if (!sendWorkspaceError(res, err)) next(err);
+  }
+});
 const AI_SEARCH_RATE_WINDOW_MS = Math.max(10000, Number(process.env.AI_SEARCH_RATE_WINDOW_MS || 60000));
 const AI_SEARCH_RATE_MAX = Math.max(1, Number(process.env.AI_SEARCH_RATE_MAX || 20));
 const aiSearchRateBuckets = new Map();
@@ -145,9 +162,10 @@ function getDirectZipPublicState(job) {
   return result;
 }
 
-async function getDirectZipResponse(job) {
+async function getDirectZipResponse(job, req) {
   const response = getDirectZipPublicState(job);
   if (job.status !== 'ready' || !job.objectKey) return response;
+  if (req) await requirePhotosAccess(req, job.photoIds, 'read');
   const signed = await cosStorage.signedGetUrl(job.objectKey, {
     expires: Math.max(60, Number(process.env.DIRECT_ZIP_DOWNLOAD_EXPIRES_SECONDS || 900)),
     downloadName: job.zipName,
@@ -671,7 +689,7 @@ function resolvePhotoSourceTargetUrl(req, row, variant = 'original') {
   const requested = String(variant || 'original').toLowerCase();
   const raw = requested === 'thumb' ? (row.thumbUrl || row.url) : (row.url || row.thumbUrl);
   if (!raw) return '';
-  const built = /^https?:\/\//i.test(String(raw)) ? String(raw) : buildUploadUrl(raw);
+  const built = buildMediaUrl(raw, { userId: req.user && req.user.id, photoId: row.id });
   return /^https?:\/\//i.test(built)
     ? built
     : `${req.protocol}://${req.get('host')}${String(built).startsWith('/') ? built : `/${built}`}`;
@@ -757,6 +775,8 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
       ? parseInt(req.query.projectId, 10)
       : null;
     const random = req.query.random === '1' || req.query.random === 'true';
+    const workspace = await resolveWorkspace(req);
+    const scopedProject = projectId ? await requireProjectAccess(req, projectId, 'read') : null;
 
     let sql = `
       SELECT
@@ -810,6 +830,25 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
       conds.push('p.organization_id = ?');
       params.push(orgId);
     }
+    if (scopedProject && scopedProject.unit_id) {
+      conds.push('p.unit_id = ?');
+      params.push(scopedProject.unit_id);
+    } else if (scopedProject) {
+      conds.push('p.unit_id IS NULL');
+    } else if (workspace.enabled && workspace.unitId) {
+      conds.push('p.unit_id = ?');
+      params.push(workspace.unitId);
+    } else if (workspace.enabled) {
+      conds.push('p.unit_id IS NULL');
+    }
+    if (workspace.enabled && !workspace.collegeAdmin) {
+      conds.push(`NOT EXISTS (
+        SELECT 1 FROM projects restricted
+        WHERE restricted.id = p.project_id
+          AND restricted.restricted_to_user_id IS NOT NULL
+          AND restricted.restricted_to_user_id <> ?)`);
+      params.push(workspace.userId);
+    }
 
     if (conds.length > 0) {
       sql += ' WHERE ' + conds.join(' AND ');
@@ -847,14 +886,9 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
         if (!raw) return null;
         const str = String(raw);
 
-        // 远程 URL 直接透传（例如 COS 返回的 https://bucket.cos...）
-        if (/^https?:\/\//i.test(str)) {
-          return str;
-        }
+        const finalUrl = buildMediaUrl(str, { userId: req.user && req.user.id, photoId: p.id });
 
-        const finalUrl = buildUploadUrl(str);
-
-        if (skipLocalFileCheck) {
+        if (skipLocalFileCheck || /^https?:\/\//i.test(str)) {
           return finalUrl;
         }
 
@@ -897,6 +931,7 @@ router.get('/', requirePermission('photos.view'), async (req, res) => {
 
     res.json(mapped);
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('GET /api/photos error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -915,6 +950,7 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
 
     // organization scoping: only return photos for user's organization
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const workspace = await resolveWorkspace(req);
 
     let sql = `
       SELECT
@@ -954,6 +990,16 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
       sql += ' AND p.organization_id = ?';
       params.push(orgId);
     }
+    if (workspace.enabled && workspace.unitId) {
+      sql += ' AND pr.unit_id = ?';
+      params.push(workspace.unitId);
+    } else if (workspace.enabled) {
+      sql += ' AND pr.unit_id IS NULL';
+    }
+    if (workspace.enabled && !workspace.collegeAdmin) {
+      sql += ' AND (pr.restricted_to_user_id IS NULL OR pr.restricted_to_user_id = ?)';
+      params.push(workspace.userId);
+    }
 
     if (random) {
       sql += ' ORDER BY RAND()';
@@ -970,10 +1016,8 @@ router.get('/scenery/random', requirePermission('photos.view'), async (req, res)
       function resolveUrl(raw) {
         if (!raw) return null;
         const str = String(raw);
-        if (/^https?:\/\//i.test(str)) return str;
-
-        const finalUrl = buildUploadUrl(str);
-        if (skipLocalFileCheck) return finalUrl;
+        const finalUrl = buildMediaUrl(str, { userId: req.user && req.user.id, photoId: p.id });
+        if (skipLocalFileCheck || /^https?:\/\//i.test(str)) return finalUrl;
 
         try {
           let rel = str;
@@ -1040,6 +1084,17 @@ router.get('/search', async (req, res) => {
     }
 
     const orgId = getScopedOrgIdFromReq(req);
+    const workspace = await resolveWorkspace(req);
+    const scopedProject = projectId && workspace.enabled
+      ? await requireProjectAccess(req, projectId, 'read') : null;
+    let faceSearchAllowed = !workspace.enabled;
+    if (workspace.enabled) {
+      const [grants] = await pool.query(
+        'SELECT 1 FROM face_search_grants WHERE organization_id = ? AND user_id = ? LIMIT 1',
+        [workspace.orgId, workspace.userId]
+      );
+      faceSearchAllowed = grants.length > 0;
+    }
     const smartRaw = String(req.query.smart || req.query.mode || '').trim().toLowerCase();
     const smart = smartRaw === '1' || smartRaw === 'true' || smartRaw === 'smart' || smartRaw === 'ai';
     const result = await runPhotoSearch({
@@ -1049,11 +1104,17 @@ router.get('/search', async (req, res) => {
       projectId,
       sort: req.query.sort,
       orgId,
+      userId,
+      unitId: scopedProject ? scopedProject.unit_id : workspace.unitId,
+      workspaceEnabled: workspace.enabled || process.env.ORGANIZATION_UNITS_ACTIVE === '1',
+      collegeAdmin: workspace.collegeAdmin,
+      faceSearchAllowed,
       // 公开演示口禁用付费模型，登录用户显式 smart=1 才调用；无论如何都有增强检索兜底。
       enableAi: Boolean(userId && smart && allowAiSearchForUser(userId)),
     });
     res.json(result);
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('GET /api/photos/search error:', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -1086,6 +1147,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
     if (ids.length > MAX_DELETE_PHOTOS) {
       return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_DELETE_PHOTOS });
     }
+    await requirePhotosAccess(req, ids, 'delete');
 
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
     const conn = await pool.getConnection();
@@ -1100,7 +1162,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
         selSql += ' AND organization_id = ?';
         selParams.push(orgId);
       }
-      const [selectedRows] = await conn.query(selSql, selParams);
+      const [selectedRows] = await conn.query(`${selSql} FOR UPDATE`, selParams);
       rows = selectedRows || [];
 
       if (rows.length === 0) {
@@ -1110,6 +1172,8 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
 
       foundIds = rows.map((r) => r.id);
       notFoundIds = ids.filter((id) => !foundIds.includes(id));
+
+      await assertNoActiveCopySource(conn, foundIds);
 
       await conn.query('DELETE FROM photos WHERE id IN (?)', [foundIds]);
 
@@ -1151,6 +1215,7 @@ router.post('/delete', requirePermission('photos.delete'), async (req, res) => {
       storageDeleteQueued: true,
     });
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('POST /api/photos/delete error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -1167,6 +1232,7 @@ router.post('/assign-section', requirePermission('photos.edit'), async (req, res
       : [];
     if (!ids.length) return res.status(400).json({ error: 'no valid photo id' });
     if (ids.length > 500) return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: 500 });
+    await requirePhotosAccess(req, ids, 'edit');
 
     const rawSection = req.body ? (req.body.timelineSectionId ?? req.body.timeline_section_id ?? req.body.sectionId ?? null) : null;
     const sectionId = rawSection === null || rawSection === undefined || String(rawSection).trim() === ''
@@ -1216,6 +1282,7 @@ router.post('/assign-section', requirePermission('photos.edit'), async (req, res
       notFoundIds: ids.filter((id) => !foundIds.includes(id)),
     });
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('POST /api/photos/assign-section error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
@@ -1226,6 +1293,9 @@ router.post('/assign-section', requirePermission('photos.edit'), async (req, res
 // 兼容旧版 body { photoIds: [..] }（自动选最高分为基底）。异步任务，返回 { jobId }
 router.post('/group-rescue', requirePermission('photos.edit'), async (req, res) => {
   try {
+    if ((await resolveWorkspace(req)).enabled) {
+      return res.status(403).json({ error: 'GROUP_RESCUE_UNAVAILABLE_IN_WORKSPACE' });
+    }
     const body = req.body || {};
     const basePhotoId = body.basePhotoId !== undefined ? parseInt(body.basePhotoId, 10) : null;
     const referencePhotoIds = Array.isArray(body.referencePhotoIds)
@@ -1296,13 +1366,19 @@ async function resolveShareZipScope(code) {
 // 内网 HTTP 不是 secure context，浏览器没有 showSaveFilePicker。先用带 Bearer 的 POST
 // 换一个短时、一次性票据，再让浏览器原生下载管理器通过 GET 边收边落盘，避免把数 GB ZIP
 // 全部堆进页面内存。票据只保存在本进程，过期或使用一次后立即失效。
-router.post('/zip-ticket', requirePermission('photos.view'), (req, res) => {
+router.post('/zip-ticket', requirePermission('photos.view'), async (req, res) => {
   const ids = Array.isArray(req.body && req.body.photoIds)
     ? Array.from(new Set(req.body.photoIds.map((n) => parseInt(n, 10)).filter((n) => !Number.isNaN(n))))
     : [];
   if (!ids.length) return res.status(400).json({ error: 'photoIds must be a non-empty array' });
   if (ids.length > MAX_ZIP_PHOTOS) {
     return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
+  }
+  try {
+    await requirePhotosAccess(req, ids, 'read');
+  } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
+    return res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
 
   const now = Date.now();
@@ -1338,13 +1414,19 @@ router.post('/zip-direct', requirePermission('photos.view'), async (req, res) =>
   if (ids.length > MAX_ZIP_PHOTOS) {
     return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
   }
+  try {
+    await requirePhotosAccess(req, ids, 'read');
+  } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
+    return res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
 
   cleanupDirectZipJobs();
   const organizationId = req.user.organization_id === undefined || req.user.organization_id === null ? null : Number(req.user.organization_id);
   const reusable = findReusableDirectZipJob(req.user.id, organizationId, ids);
   if (reusable) {
     try {
-      return res.json({ ...(await getDirectZipResponse(reusable)), reused: true });
+      return res.json({ ...(await getDirectZipResponse(reusable, req)), reused: true });
     } catch (err) {
       console.error('[photos.zip-direct] reuse response failed:', reusable.id, err && err.stack ? err.stack : err);
       return res.status(500).json({ error: 'DIRECT_ZIP_SIGN_FAILED' });
@@ -1405,7 +1487,7 @@ router.get('/zip-direct', requirePermission('photos.view'), async (req, res) => 
     .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0));
   try {
     const states = await Promise.all(jobs.map(async (job) => ({
-      ...(await getDirectZipResponse(job)),
+      ...(await getDirectZipResponse(job, req)),
       fileCount: Array.isArray(job.photoIds) ? job.photoIds.length : 0,
     })));
     return res.json({ jobs: states });
@@ -1424,7 +1506,7 @@ router.get('/zip-direct/:jobId', requirePermission('photos.view'), async (req, r
     return res.status(403).json({ error: 'DIRECT_ZIP_JOB_FORBIDDEN' });
   }
   try {
-    return res.json(await getDirectZipResponse(job));
+    return res.json(await getDirectZipResponse(job, req));
   } catch (err) {
     console.error('[photos.zip-direct] sign download failed:', job.id, err && err.stack ? err.stack : err);
     return res.status(500).json({ error: 'DIRECT_ZIP_SIGN_FAILED' });
@@ -1464,6 +1546,7 @@ router.post('/zip', (req, res, next) => {
 async function handleZipRequest(req, res) {
   try {
     const shareCode = req.body && req.body.shareCode ? String(req.body.shareCode).trim() : '';
+    if (shareCode) return res.status(403).json({ error: 'PUBLIC_BULK_DOWNLOAD_DISABLED' });
     let shareScope = null;
     if (shareCode) {
       shareScope = await resolveShareZipScope(shareCode);
@@ -1483,6 +1566,7 @@ async function handleZipRequest(req, res) {
     if (ids.length > MAX_ZIP_PHOTOS) {
       return res.status(413).json({ error: 'TOO_MANY_PHOTOS', maxPhotoIds: MAX_ZIP_PHOTOS });
     }
+    if (!shareScope) await requirePhotosAccess(req, ids, 'read');
 
     // 延迟 require archiver，这样在缺少依赖时能返回友好提示
     let archiver;
@@ -1896,6 +1980,7 @@ async function handleZipRequest(req, res) {
     // finalize
     if (!clientClosed) archive.finalize();
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('POST /api/photos/zip error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -1983,7 +2068,8 @@ router.get('/:id/pixel-source', requirePermission('photos.view'), async (req, re
     const raw = variant === 'original' ? (row.url || row.thumbUrl) : (row.thumbUrl || row.url);
     if (!raw) return res.status(404).json({ error: 'photo source not found' });
 
-    const built = /^https?:\/\//i.test(String(raw)) ? String(raw) : buildUploadUrl(raw);
+    const built = /^https?:\/\//i.test(String(raw)) ? String(raw)
+      : buildMediaUrl(raw, { userId: req.user && req.user.id, photoId: row.id });
     const targetUrl = /^https?:\/\//i.test(built)
       ? built
       : `${req.protocol}://${req.get('host')}${String(built).startsWith('/') ? built : `/${built}`}`;
@@ -2052,7 +2138,8 @@ router.get('/:id/direct-url', requirePermission('photos.view'), async (req, res)
     const download = String(req.query.download || '') === '1';
     const fallbackName = `${String(row.title || `photo-${id}`).replace(/[\\/:*?"<>|]/g, '_') || `photo-${id}`}${getExtFromStorageKey(key)}`;
     const signed = await cosStorage.signedGetUrl(key, {
-      expires: Math.max(60, Number(process.env.COS_SIGNED_READ_EXPIRES_SECONDS || 900)),
+      expires: cosStorage.keyFromUrlOrPath(raw).startsWith('uploads/units/')
+        ? 60 : Math.max(60, Number(process.env.COS_SIGNED_READ_EXPIRES_SECONDS || 900)),
       downloadName: download ? fallbackName : undefined,
     });
     return res.json({
@@ -2126,9 +2213,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
 
     function resolveUrl(raw) {
       if (!raw) return null;
-      const str = String(raw);
-      if (/^https?:\/\//i.test(str)) return str;
-      return buildUploadUrl(str);
+      return buildMediaUrl(raw, { userId: req.user && req.user.id, photoId: p.id });
     }
 
     let parsedTags = null;
@@ -2262,11 +2347,11 @@ router.patch('/:id', requirePermission('photos.edit'), async (req, res) => {
       timelineSectionId: p.timelineSectionId || null,
       timelineSectionName: p.timelineSectionName || null,
       timelineSectionTime: p.timelineSectionTime || null,
-      url: buildUploadUrl(p.url),
-      thumbUrl: buildUploadUrl(p.thumbUrl),
-      publicDownloadUrl: p.publicDownloadUrl ? buildUploadUrl(p.publicDownloadUrl) : null,
-      playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
-      playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
+      url: buildMediaUrl(p.url, { userId: req.user.id, photoId: p.id }),
+      thumbUrl: buildMediaUrl(p.thumbUrl, { userId: req.user.id, photoId: p.id }),
+      publicDownloadUrl: p.publicDownloadUrl ? buildMediaUrl(p.publicDownloadUrl, { userId: req.user.id, photoId: p.id }) : null,
+      playbackUrl: p.playbackUrl ? buildMediaUrl(p.playbackUrl, { userId: req.user.id, photoId: p.id }) : null,
+      playback_url: p.playbackUrl ? buildMediaUrl(p.playbackUrl, { userId: req.user.id, photoId: p.id }) : null,
       title: p.title,
       description: p.description,
       adjustments: parsePhotoAdjustments(p.adjustments),

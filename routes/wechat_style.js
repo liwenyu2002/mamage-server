@@ -8,6 +8,7 @@ const router = express.Router();
 const fetch = require('node-fetch');
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
+const { resolveWorkspace, sendWorkspaceError } = require('../lib/workspace_access');
 const { extractStyleBlocksFromHtml } = require('../lib/wechat_style_extract');
 const { extractFullArticleFromHtml } = require('../lib/wechat_article_import');
 
@@ -242,13 +243,17 @@ router.post('/import-article', requirePermission('ai.generate'), async (req, res
 router.get('/blocks', requirePermission('ai.generate'), async (req, res) => {
   try {
     const orgId = (req.user && req.user.organization_id !== undefined) ? req.user.organization_id : null;
+    const workspace = await resolveWorkspace(req);
     // <=> 为 MySQL NULL 安全等于，兼容用户暂未归属任何组织（org_id 为 NULL）的场景
     const [rows] = await pool.query(
-      'SELECT * FROM wechat_style_blocks WHERE org_id <=> ? ORDER BY created_at DESC LIMIT 500',
-      [orgId]
+      `SELECT * FROM wechat_style_blocks WHERE org_id <=> ?
+       ${workspace.enabled ? (workspace.unitId ? 'AND unit_id = ?' : 'AND unit_id IS NULL') : ''}
+       ORDER BY created_at DESC LIMIT 500`,
+      workspace.enabled && workspace.unitId ? [orgId, workspace.unitId] : [orgId]
     );
     res.json({ blocks: (rows || []).map(rowToBlock) });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('GET /api/wechat-style/blocks error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
@@ -258,6 +263,10 @@ router.get('/blocks', requirePermission('ai.generate'), async (req, res) => {
 // 批量保存提取结果（或用户自建块），≤30/次（与提取上限对齐）。
 router.post('/blocks', requirePermission('ai.generate'), async (req, res) => {
   try {
+    const workspace = await resolveWorkspace(req);
+    if (workspace.enabled && (!workspace.unitId || (!workspace.collegeAdmin && !['editor', 'manager'].includes(workspace.role)))) {
+      return res.status(403).json({ error: 'UNIT_EDITOR_REQUIRED' });
+    }
     const input = req.body && req.body.blocks;
     if (!Array.isArray(input) || input.length === 0) {
       return res.status(400).json({ code: 4001, message: 'blocks is required (non-empty array)' });
@@ -299,9 +308,10 @@ router.post('/blocks', requirePermission('ai.generate'), async (req, res) => {
       // source 恒为 'extracted'：builtin 块只存在于前端内置数组，不经此接口落库，防止客户端伪造 source='builtin'
       const [result] = await pool.query(
         `INSERT INTO wechat_style_blocks
-           (org_id, type, name, html_template, accent_editable, source, source_url, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, 'extracted', ?, ?, NOW())`,
-        [orgId, r.type, r.name, r.htmlTemplate, r.accentEditable ? 1 : 0, r.sourceUrl, createdBy]
+           (org_id, unit_id, type, name, html_template, accent_editable, source, source_url, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'extracted', ?, ?, NOW())`,
+        [orgId, workspace.enabled ? workspace.unitId : null, r.type, r.name, r.htmlTemplate,
+          r.accentEditable ? 1 : 0, r.sourceUrl, createdBy]
       );
       insertedIds.push(result.insertId);
     }
@@ -312,6 +322,7 @@ router.post('/blocks', requirePermission('ai.generate'), async (req, res) => {
     );
     res.status(201).json({ blocks: (savedRows || []).map(rowToBlock) });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('POST /api/wechat-style/blocks error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
@@ -320,6 +331,7 @@ router.post('/blocks', requirePermission('ai.generate'), async (req, res) => {
 // DELETE /api/wechat-style/blocks/:id  本 org 且（创建者本人或 admin/superadmin）
 router.delete('/blocks/:id', requirePermission('ai.generate'), async (req, res) => {
   try {
+    const workspace = await resolveWorkspace(req);
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ code: 4001, message: 'invalid id' });
 
@@ -333,14 +345,20 @@ router.delete('/blocks/:id', requirePermission('ai.generate'), async (req, res) 
     const sameOrg = (rowOrgId === null && orgId === null) || (rowOrgId !== null && orgId !== null && Number(rowOrgId) === Number(orgId));
     if (!sameOrg) return res.status(404).json({ code: 4041, message: 'block not found' });
 
+    if (workspace.enabled && (!workspace.unitId || Number(row.unit_id) !== workspace.unitId)) {
+      return res.status(404).json({ code: 4041, message: 'block not found' });
+    }
+
     const requesterId = req.user && req.user.id ? Number(req.user.id) : null;
     const isOwner = requesterId !== null && row.created_by !== null && Number(row.created_by) === requesterId;
-    const isAdmin = req.user && (req.user.role === 'admin' || req.user.role === 'superadmin');
+    const isAdmin = workspace.enabled ? (workspace.collegeAdmin || workspace.role === 'manager')
+      : req.user && (req.user.role === 'admin' || req.user.role === 'superadmin');
     if (!isOwner && !isAdmin) return res.status(403).json({ code: 4030, message: 'forbidden' });
 
     await pool.query('DELETE FROM wechat_style_blocks WHERE id = ?', [id]);
     res.json({ deleted: true, id });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('DELETE /api/wechat-style/blocks/:id error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }

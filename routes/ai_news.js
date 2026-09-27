@@ -1,9 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const { pool, buildUploadUrl } = require('../db');
+const { pool } = require('../db');
 const { enqueueJob, runJobNow, getOrgIdForUser } = require('../lib/ai_job_worker');
 const { generateFromPrompt } = require('../ai_function/ai_for_news/ai_for_news');
 const { requirePermission } = require('../lib/permissions');
+const {
+  positiveId, resolveWorkspace, requireProjectAccess, requirePhotosAccess, sendWorkspaceError,
+  WorkspaceAccessError,
+} = require('../lib/workspace_access');
 const { renderNewsPreviewPng } = require('../lib/news_preview_renderer');
 const { getActiveTemplates } = require('../lib/channel_templates');
 const { checkAndReserveQuota } = require('../lib/ai_quota');
@@ -16,6 +20,19 @@ const MAX_PHOTOS = 30;
 const MAX_PREVIEW_HTML_CHARS = 300000;
 const MIN_BATCH_CHANNELS = 1;
 const MAX_BATCH_CHANNELS = 5;
+
+async function validateNewsSources(req, rawProjectId, selectedPhotos = []) {
+  const workspace = await resolveWorkspace(req);
+  if (!workspace.enabled) return workspace;
+  if (rawProjectId) {
+    const projectId = positiveId(rawProjectId);
+    if (!projectId) throw new WorkspaceAccessError('INVALID_PROJECT', 400);
+    await requireProjectAccess(req, projectId, 'read');
+  }
+  const ids = selectedPhotos.map((photo) => positiveId(photo?.id)).filter(Boolean);
+  if (ids.length) await requirePhotosAccess(req, ids, 'read');
+  return workspace;
+}
 
 function toNameList(input) {
   if (!input) return [];
@@ -246,6 +263,7 @@ router.post('/generate', requirePermission('ai.generate'), async (req, res) => {
     const clientRequestId = body.clientRequestId || null;
     const options = body.options || {};
     const sync = (req.query && req.query.sync === 'true') || options.sync || false;
+    const workspace = await validateNewsSources(req, projectId, body.selectedPhotos);
 
     let prompt = '';
     if (body.fullPrompt) {
@@ -280,8 +298,9 @@ router.post('/generate', requirePermission('ai.generate'), async (req, res) => {
     }
 
     const [insertResult] = await pool.query(
-      'INSERT INTO ai_jobs (user_id, project_id, status, model, prompt_text, options, client_request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())',
-      [req.user && req.user.id ? req.user.id : null, projectId, 'pending', options.model || 'default', prompt, JSON.stringify(options || {}), clientRequestId || null]
+      'INSERT INTO ai_jobs (user_id, project_id, unit_id, status, model, prompt_text, options, client_request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())',
+      [req.user && req.user.id ? req.user.id : null, projectId, workspace.enabled ? workspace.unitId : null,
+        'pending', options.model || 'default', prompt, JSON.stringify(options || {}), clientRequestId || null]
     );
 
     const jobId = insertResult.insertId;
@@ -316,6 +335,7 @@ router.post('/generate', requirePermission('ai.generate'), async (req, res) => {
     await enqueueJob(jobId);
     res.status(202).json({ jobId, status: 'pending', estimatedSeconds: 5 });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('POST /api/ai/news/generate error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
@@ -333,8 +353,7 @@ router.get('/jobs/:jobId', requirePermission('ai.generate'), async (req, res) =>
     // 归属校验：job 只能被创建者本人（或超管）读取；对外统一 404 不暴露存在性
     const requesterId = req.user && req.user.id ? Number(req.user.id) : null;
     const isOwner = requesterId !== null && job.user_id !== null && Number(job.user_id) === requesterId;
-    const isSuper = req.user && req.user.role === 'superadmin';
-    if (!isOwner && !isSuper) return res.status(404).json({ code: 4041, message: 'job not found' });
+    if (!isOwner) return res.status(404).json({ code: 4041, message: 'job not found' });
 
     const [resRows] = await pool.query('SELECT * FROM ai_results WHERE job_id = ? ORDER BY id DESC LIMIT 1', [id]);
     const result = resRows && resRows[0] ? resRows[0] : null;
@@ -374,6 +393,7 @@ router.post('/generate/batch', requirePermission('ai.generate'), async (req, res
     const referenceArticle = body.referenceArticle || '';
     const interviewText = body.interviewText || '';
     const projectId = body.projectId || null;
+    const workspace = await validateNewsSources(req, projectId, selectedPhotos);
 
     // 去重后再校验数量，防止客户端传重复 key 绕过 5 个渠道上限
     const rawChannels = Array.isArray(body.channels) ? body.channels : [];
@@ -429,10 +449,11 @@ router.post('/generate/batch', requirePermission('ai.generate'), async (req, res
     const formSnapshotToStore = { ...(form || {}), selectedPhotos: photoNameSummaries };
 
     const [batchInsert] = await pool.query(
-      'INSERT INTO ai_job_batches (user_id, project_id, form_snapshot, selected_photo_ids, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
+      'INSERT INTO ai_job_batches (user_id, project_id, unit_id, form_snapshot, selected_photo_ids, status, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())',
       [
         req.user && req.user.id ? req.user.id : null,
         projectId,
+        workspace.enabled ? workspace.unitId : null,
         JSON.stringify(formSnapshotToStore),
         JSON.stringify(selectedPhotos.map((p) => p.id)),
         'pending',
@@ -450,10 +471,11 @@ router.post('/generate/batch', requirePermission('ai.generate'), async (req, res
       const jobOptions = { maxTokens: template.default_max_tokens };
 
       const [jobInsert] = await pool.query(
-        'INSERT INTO ai_jobs (user_id, project_id, status, model, prompt_text, options, client_request_id, batch_id, channel_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())',
+        'INSERT INTO ai_jobs (user_id, project_id, unit_id, status, model, prompt_text, options, client_request_id, batch_id, channel_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())',
         [
           req.user && req.user.id ? req.user.id : null,
           projectId,
+          workspace.enabled ? workspace.unitId : null,
           'pending',
           'default',
           prompt,
@@ -470,6 +492,7 @@ router.post('/generate/batch', requirePermission('ai.generate'), async (req, res
 
     res.status(202).json({ batchId, jobs });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('POST /api/ai/news/generate/batch error', e);
     res.status(500).json({ code: 5000, message: 'Internal server error' });
   }
@@ -488,8 +511,7 @@ router.get('/batches/:batchId', requirePermission('ai.generate'), async (req, re
     // 归属校验：与 GET /jobs/:jobId 同模式，仅创建者本人或超管可读，其余一律 404 不暴露存在性
     const requesterId = req.user && req.user.id ? Number(req.user.id) : null;
     const isOwner = requesterId !== null && batch.user_id !== null && Number(batch.user_id) === requesterId;
-    const isSuper = req.user && req.user.role === 'superadmin';
-    if (!isOwner && !isSuper) return res.status(404).json({ code: 4041, message: 'batch not found' });
+    if (!isOwner) return res.status(404).json({ code: 4041, message: 'batch not found' });
 
     const [jobRows] = await pool.query('SELECT * FROM ai_jobs WHERE batch_id = ? ORDER BY id ASC', [id]);
 
@@ -613,8 +635,7 @@ router.post('/jobs/:jobId/retry', requirePermission('ai.generate'), async (req, 
 
     const requesterId = req.user && req.user.id ? Number(req.user.id) : null;
     const isOwner = requesterId !== null && job.user_id !== null && Number(job.user_id) === requesterId;
-    const isSuper = req.user && req.user.role === 'superadmin';
-    if (!isOwner && !isSuper) return res.status(404).json({ code: 4041, message: 'job not found' });
+    if (!isOwner) return res.status(404).json({ code: 4041, message: 'job not found' });
 
     if (job.status !== 'failed') {
       return res.status(409).json({ code: 4091, message: `job status is ${job.status}, only failed jobs can be retried` });

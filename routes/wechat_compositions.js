@@ -7,6 +7,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { requirePermission } = require('../lib/permissions');
+const { resolveWorkspace, sendWorkspaceError } = require('../lib/workspace_access');
 const cosStorage = require('../lib/cos_storage');
 const { rehostDocImages } = require('../lib/wechat_image_rehost');
 
@@ -142,6 +143,13 @@ function rowToDetail(row) {
   };
 }
 
+function compositionScope(workspace) {
+  if (!workspace.enabled) return { sql: '', params: [] };
+  return workspace.unitId
+    ? { sql: ' AND unit_id = ?', params: [workspace.unitId] }
+    : { sql: ' AND unit_id IS NULL', params: [] };
+}
+
 // 校验/序列化 doc；成功返回 { docJson, blockCount, imageCount }，失败返回 { error }（400 文案）。
 function validateAndSerializeDoc(rawDoc) {
   if (!Array.isArray(rawDoc)) {
@@ -185,13 +193,15 @@ function validateAndSerializeBlockConfig(rawBlockConfig) {
 router.get('/', requirePermission('ai.generate'), async (req, res) => {
   try {
     const userId = req.user.id;
+    const scope = compositionScope(await resolveWorkspace(req));
     const [rows] = await pool.query(
       `SELECT id, name, title, block_count, image_count, created_at, updated_at
-       FROM wechat_compositions WHERE user_id = ? ORDER BY updated_at DESC`,
-      [userId]
+       FROM wechat_compositions WHERE user_id = ?${scope.sql} ORDER BY updated_at DESC`,
+      [userId, ...scope.params]
     );
     res.json({ items: (rows || []).map(rowToSummary) });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('[GET /api/wechat-compositions] error', e && e.stack ? e.stack : e);
     res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
@@ -240,6 +250,8 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
   try {
     const body = req.body || {};
     const userId = req.user.id;
+    const workspace = await resolveWorkspace(req);
+    const scope = compositionScope(workspace);
 
     const name = normalizeName(body.name);
     if (name.length > MAX_NAME_LEN) {
@@ -261,8 +273,8 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
       : null;
 
     const [[{ cnt }]] = await pool.query(
-      'SELECT COUNT(*) AS cnt FROM wechat_compositions WHERE user_id = ?',
-      [userId]
+      `SELECT COUNT(*) AS cnt FROM wechat_compositions WHERE user_id = ?${scope.sql}`,
+      [userId, ...scope.params]
     );
     if (cnt >= MAX_ARCHIVES_PER_USER) {
       return res.status(409).json({ error: 'ARCHIVE_LIMIT', limit: MAX_ARCHIVES_PER_USER });
@@ -270,11 +282,12 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
 
     const [result] = await pool.query(
       `INSERT INTO wechat_compositions
-        (user_id, org_id, name, title, digest, doc, block_config, theme_key, block_count, image_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        (user_id, org_id, unit_id, name, title, digest, doc, block_config, theme_key, block_count, image_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
       [
         userId,
         Number.isNaN(orgId) ? null : orgId,
+        workspace.enabled ? workspace.unitId : null,
         name,
         title || null,
         digest || null,
@@ -294,6 +307,7 @@ router.post('/', requirePermission('ai.generate'), async (req, res) => {
     scheduleRehost(saved.id, userId); // 后台固化微信图片（对象存储未配置时 no-op）
     res.status(201).json({ id: saved.id, name: saved.name, createdAt: saved.created_at, updatedAt: saved.updated_at });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('[POST /api/wechat-compositions] error', e && e.stack ? e.stack : e);
     res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
@@ -306,14 +320,16 @@ router.get('/:id', requirePermission('ai.generate'), async (req, res) => {
     if (!id) return res.status(400).json({ error: 'INVALID_ID' });
 
     const userId = req.user.id;
+    const scope = compositionScope(await resolveWorkspace(req));
     const [rows] = await pool.query(
-      'SELECT * FROM wechat_compositions WHERE id = ? AND user_id = ? LIMIT 1',
-      [id, userId]
+      `SELECT * FROM wechat_compositions WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+      [id, userId, ...scope.params]
     );
     if (!rows || rows.length === 0) return res.status(404).json({ error: 'NOT_FOUND' });
 
     res.json(rowToDetail(rows[0]));
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('[GET /api/wechat-compositions/:id] error', e && e.stack ? e.stack : e);
     res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
@@ -326,9 +342,10 @@ router.put('/:id', requirePermission('ai.generate'), async (req, res) => {
     if (!id) return res.status(400).json({ error: 'INVALID_ID' });
 
     const userId = req.user.id;
+    const scope = compositionScope(await resolveWorkspace(req));
     const [existingRows] = await pool.query(
-      'SELECT id FROM wechat_compositions WHERE id = ? AND user_id = ? LIMIT 1',
-      [id, userId]
+      `SELECT id FROM wechat_compositions WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+      [id, userId, ...scope.params]
     );
     if (!existingRows || existingRows.length === 0) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -393,6 +410,7 @@ router.put('/:id', requirePermission('ai.generate'), async (req, res) => {
     if (body.doc !== undefined) scheduleRehost(id, userId); // doc 有更新才后台固化图片
     res.json({ id: saved.id, name: saved.name, updatedAt: saved.updated_at });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('[PUT /api/wechat-compositions/:id] error', e && e.stack ? e.stack : e);
     res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
@@ -405,15 +423,17 @@ router.delete('/:id', requirePermission('ai.generate'), async (req, res) => {
     if (!id) return res.status(400).json({ error: 'INVALID_ID' });
 
     const userId = req.user.id;
+    const scope = compositionScope(await resolveWorkspace(req));
     const [rows] = await pool.query(
-      'SELECT id FROM wechat_compositions WHERE id = ? AND user_id = ? LIMIT 1',
-      [id, userId]
+      `SELECT id FROM wechat_compositions WHERE id = ? AND user_id = ?${scope.sql} LIMIT 1`,
+      [id, userId, ...scope.params]
     );
     if (!rows || rows.length === 0) return res.status(404).json({ error: 'NOT_FOUND' });
 
     await pool.query('DELETE FROM wechat_compositions WHERE id = ? AND user_id = ?', [id, userId]);
     res.json({ ok: true });
   } catch (e) {
+    if (sendWorkspaceError(res, e)) return;
     console.error('[DELETE /api/wechat-compositions/:id] error', e && e.stack ? e.stack : e);
     res.status(500).json({ error: 'INTERNAL_ERROR' });
   }

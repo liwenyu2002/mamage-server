@@ -60,7 +60,9 @@ const aiNewsRouter = require('./routes/ai_news');
 const aiVideoRouter = require('./routes/ai_video');
 const videoProjectsRouter = require('./routes/video_projects');
 const orgsRouter = require('./routes/organizations');
+const workspacesRouter = require('./routes/workspaces');
 const shareRouter = require('./routes/share');
+const internalSharesRouter = require('./routes/internal_shares');
 const similarityRouter = require('./routes/similarity_groups');
 const facesRouter = require('./routes/faces');
 const imageProxyRouter = require('./routes/image_proxy');
@@ -109,8 +111,8 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Private-Network', 'true');
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Range,If-None-Match,If-Modified-Since');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Mamage-Unit-Id,X-Requested-With,Range,If-None-Match,If-Modified-Since');
   if (req.method === 'OPTIONS') {
     return originAllowed || !origin ? res.status(204).end() : res.status(403).end();
   }
@@ -147,9 +149,11 @@ app.use('/api/wechat-preview', wechatPreviewRouter);
 app.use('/api/wechat-compositions', wechatCompositionsRouter);
 app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
+app.use('/api/workspaces', workspacesRouter);
 app.use('/api/auth', require('./routes/auth_dingtalk'));
 app.use('/api/network', require('./routes/network'));
 app.use('/api/share', shareRouter);
+app.use('/api/internal-shares', internalSharesRouter);
 app.use('/api/similarity', similarityRouter);
 app.use('/api', facesRouter);
 
@@ -183,6 +187,8 @@ async function startup() {
   app.listen(PORT, () => {
     console.log(`API server listening on http://localhost:${PORT}`);
   });
+
+  require('./lib/organization_copy_worker').start();
 
   // AI 打标队列是纯内存的：重启后把 pending/running 孤儿重新入队。
   // 延迟执行避开启动高峰；AI_REQUEUE_ON_BOOT=0 可关闭。

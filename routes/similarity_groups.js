@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
 const JWT_SECRET = keys.JWT_SECRET;
 const { requirePermission, hasPermissionForUserId } = require('../lib/permissions');
+const { resolveWorkspace, requireProjectAccess, sendWorkspaceError } = require('../lib/workspace_access');
 
 function l2Normalize(arr) {
     let s = 0;
@@ -85,6 +86,9 @@ router.get('/groups', requirePermission('photos.view'), async (req, res) => {
     try {
         const projectId = req.query.projectId ? Number(req.query.projectId) : null;
         if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+        const project = await requireProjectAccess(req, projectId, 'read');
+        const workspace = await resolveWorkspace(req);
+        const unitId = workspace.enabled ? Number(project.unit_id) || null : null;
 
         const threshold = req.query.threshold ? Number(req.query.threshold) : 0.6;
         const minSize = req.query.minSize ? Math.max(1, Number(req.query.minSize)) : 2;
@@ -97,9 +101,11 @@ router.get('/groups', requirePermission('photos.view'), async (req, res) => {
             SELECT p.id AS photo_id, e.embedding
             FROM ai_image_embeddings e
             JOIN photos p ON e.photo_id = p.id
-            WHERE p.project_id = ? AND e.model_name = ?
+            WHERE p.project_id = ? AND e.model_name = ? AND p.organization_id = ?
+              ${workspace.enabled ? (unitId ? 'AND p.unit_id = ?' : 'AND p.unit_id IS NULL') : ''}
         `;
-        const [rows] = await pool.query(sql, [projectId, modelName]);
+        const [rows] = await pool.query(sql, [projectId, modelName, workspace.orgId,
+            ...(unitId ? [unitId] : [])]);
 
         if (!rows || rows.length === 0) return res.json({ groups: [] });
 
@@ -211,6 +217,7 @@ router.get('/groups', requirePermission('photos.view'), async (req, res) => {
 
         res.json({ modelName, groups });
     } catch (e) {
+        if (sendWorkspaceError(res, e)) return;
         console.error('/api/similarity/groups error', e && e.stack ? e.stack : e);
         res.status(500).json({ error: 'internal server error' });
     }
@@ -221,6 +228,9 @@ router.get('/pairs', requirePermission('photos.view'), async (req, res) => {
     try {
         const projectId = req.query.projectId ? Number(req.query.projectId) : null;
         if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+        const project = await requireProjectAccess(req, projectId, 'read');
+        const workspace = await resolveWorkspace(req);
+        const unitId = workspace.enabled ? Number(project.unit_id) || null : null;
         const modelName = req.query.modelName || 'resnet50';
         const minScore = req.query.minScore ? Number(req.query.minScore) : 0.0;
 
@@ -228,9 +238,11 @@ router.get('/pairs', requirePermission('photos.view'), async (req, res) => {
             SELECT p.id AS photo_id, e.embedding
             FROM ai_image_embeddings e
             JOIN photos p ON e.photo_id = p.id
-            WHERE p.project_id = ? AND e.model_name = ?
+            WHERE p.project_id = ? AND e.model_name = ? AND p.organization_id = ?
+              ${workspace.enabled ? (unitId ? 'AND p.unit_id = ?' : 'AND p.unit_id IS NULL') : ''}
         `;
-        const [rows] = await pool.query(sql, [projectId, modelName]);
+        const [rows] = await pool.query(sql, [projectId, modelName, workspace.orgId,
+            ...(unitId ? [unitId] : [])]);
         if (!rows || rows.length === 0) return res.json({ pairs: [] });
 
         const ids = [];
@@ -252,6 +264,7 @@ router.get('/pairs', requirePermission('photos.view'), async (req, res) => {
         pairs.sort((x, y) => y.score - x.score);
         res.json({ modelName, pairs });
     } catch (e) {
+        if (sendWorkspaceError(res, e)) return;
         console.error('/api/similarity/pairs error', e && e.stack ? e.stack : e);
         res.status(500).json({ error: 'internal server error' });
     }
@@ -276,7 +289,16 @@ router.get('/groups/simple', async (req, res) => {
 
         const projectId = req.query.projectId ? Number(req.query.projectId) : null;
         if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+        const workspace = await resolveWorkspace(req);
+        const project = workspace.enabled ? await requireProjectAccess(req, projectId, 'read') : null;
         const orgId = getScopedOrgIdFromReq(req);
+        if (!isAuthed && process.env.ORGANIZATION_UNITS_ACTIVE === '1') {
+          const [projects] = await pool.query(
+            'SELECT unit_id FROM projects WHERE id = ? AND organization_id = ? LIMIT 1',
+            [projectId, orgId]
+          );
+          if (!projects.length || projects[0].unit_id) return res.status(404).json({ error: 'Project not found' });
+        }
 
         // 推荐默认值
         const modelName = 'resnet50';
@@ -296,6 +318,12 @@ router.get('/groups/simple', async (req, res) => {
         } else {
             sql += ' AND p.organization_id = ?';
             params.push(orgId);
+        }
+        if (workspace.enabled) {
+          sql += project.unit_id ? ' AND p.unit_id = ?' : ' AND p.unit_id IS NULL';
+          if (project.unit_id) params.push(project.unit_id);
+        } else if (!isAuthed && process.env.ORGANIZATION_UNITS_ACTIVE === '1') {
+          sql += ' AND p.unit_id IS NULL';
         }
         const [rows] = await pool.query(sql, params);
         if (!rows || rows.length === 0) return res.json({ modelName, groups: [] });

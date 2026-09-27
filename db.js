@@ -119,10 +119,22 @@ function buildInternalMediaUrl(p) {
   const url = buildUploadUrl(p);
   if (!INTERNAL_UPLOAD_BASE_URL || !url) return url;
   const publicBase = UPLOAD_BASE_URL.replace(/\/$/, '');
+  let internalUrl = url;
   if (String(url).startsWith(publicBase + '/')) {
-    return INTERNAL_UPLOAD_BASE_URL + String(url).slice(publicBase.length);
+    internalUrl = INTERNAL_UPLOAD_BASE_URL + String(url).slice(publicBase.length);
   }
-  return url;
+  const match = /\/api\/image\/(uploads\/units\/(\d+)\/[^?]+)/.exec(String(internalUrl));
+  if (match && MEDIA_URL_SECRET) {
+    const key = decodeURIComponent(match[1]);
+    const payload = { v: 1, t: 'service', k: key, w: Number(match[2]),
+      e: Math.floor(Date.now() / 1000) + 300 };
+    const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = crypto.createHmac('sha256', MEDIA_URL_SECRET).update(encoded).digest('base64url');
+    const parsed = new URL(internalUrl);
+    parsed.searchParams.set('ma', `${encoded}.${signature}`);
+    return parsed.toString();
+  }
+  return internalUrl;
 }
 
 module.exports = { pool, buildUploadUrl, buildInternalMediaUrl, signMediaQuery, UPLOAD_BASE_URL };

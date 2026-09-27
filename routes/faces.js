@@ -1,7 +1,11 @@
 ﻿const express = require('express');
 const router = express.Router();
-const { pool, buildUploadUrl } = require('../db');
+const { pool } = require('../db');
+const { buildMediaUrl } = require('../lib/media_access');
 const { requirePermission } = require('../lib/permissions');
+const {
+  resolveWorkspace, requireProjectAccess, requirePhotoAccess, sendWorkspaceError,
+} = require('../lib/workspace_access');
 const { detectFacesForPhoto } = require('../lib/face_detector');
 const { getFaceAvatarDataUrl } = require('../lib/face_avatar');
 const {
@@ -34,12 +38,66 @@ function getOrgIdFromReq(req) {
   return Number.isFinite(n) ? n : null;
 }
 
+router.use((req, res, next) => {
+  if (req.path === '/faces/find-me' || req.path === '/faces/find-me/share') return next();
+  return requirePermission('photos.view')(req, res, async () => {
+    try {
+      const workspace = await resolveWorkspace(req);
+      if (!workspace.enabled) return next();
+      const [grants] = await pool.query(
+        `SELECT college_wide FROM face_search_grants
+         WHERE organization_id = ? AND user_id = ? LIMIT 1`,
+        [workspace.orgId, workspace.userId]
+      );
+      if (!grants.length || !grants[0].college_wide) {
+        return res.status(403).json({ error: 'FACE_SEARCH_GRANT_REQUIRED' });
+      }
+      const photoId = Number(req.params?.photoId || req.query?.photoId || req.body?.photoId);
+      if (Number.isSafeInteger(photoId) && photoId > 0) await requirePhotoAccess(req, photoId, 'read');
+      await pool.query(
+        `INSERT INTO organization_access_audit
+           (organization_id, unit_id, user_id, action, resource_type, resource_id)
+         VALUES (?, ?, ?, 'face.search', 'photo', ?)`,
+        [workspace.orgId, workspace.unitId, workspace.userId, Number.isSafeInteger(photoId) ? photoId : null]
+      );
+      next();
+    } catch (err) {
+      if (!sendWorkspaceError(res, err)) next(err);
+    }
+  });
+});
+
 function appendOrgScope(sqlBase, alias, orgId, params) {
   if (orgId === null) {
     return `${sqlBase} AND ${alias}.organization_id IS NULL`;
   }
   params.push(orgId);
   return `${sqlBase} AND ${alias}.organization_id = ?`;
+}
+
+function appendVisiblePhotoScope(sql, workspace, params) {
+  if (!workspace?.enabled) return sql;
+  if (!workspace.unitId) return `${sql} AND COALESCE(pr.unit_id, p.unit_id) IS NULL`;
+  if (!workspace.collegeAdmin) {
+    sql += ' AND (pr.restricted_to_user_id IS NULL OR pr.restricted_to_user_id = ?)';
+    params.push(workspace.userId);
+  }
+  params.push(workspace.unitId, workspace.orgId, workspace.unitId, workspace.userId);
+  return `${sql} AND (
+    COALESCE(pr.unit_id, p.unit_id) IS NULL
+    OR COALESCE(pr.unit_id, p.unit_id) = ?
+    OR EXISTS (
+      SELECT 1 FROM internal_shares s
+      WHERE s.organization_id = ? AND s.target_unit_id = ?
+        AND (s.target_user_id IS NULL OR s.target_user_id = ?)
+        AND s.mode IN ('read', 'collaborate') AND s.revoked_at IS NULL
+        AND (s.expires_at IS NULL OR s.expires_at > NOW())
+        AND ((s.share_type = 'album' AND s.project_id = p.project_id)
+          OR (s.share_type = 'collection' AND EXISTS (
+            SELECT 1 FROM internal_share_items si
+            WHERE si.share_id = s.id AND si.photo_id = p.id)))
+    )
+  )`;
 }
 
 function schemaErrorResponse(res, err, endpointTag) {
@@ -125,14 +183,15 @@ function mapFaceRow(row) {
   };
 }
 
-function mapRelatedPhoto(row) {
+function mapRelatedPhoto(row, userId = null) {
   return {
     id: String(row.id),
     photoId: String(row.id),
     projectId: row.projectId || null,
     projectName: row.projectName || null,
-    url: row.url ? buildUploadUrl(row.url) : null,
-    thumbUrl: row.thumbUrl ? buildUploadUrl(row.thumbUrl) : (row.url ? buildUploadUrl(row.url) : null),
+    url: row.url ? buildMediaUrl(row.url, { userId, photoId: row.id }) : null,
+    thumbUrl: row.thumbUrl ? buildMediaUrl(row.thumbUrl, { userId, photoId: row.id })
+      : (row.url ? buildMediaUrl(row.url, { userId, photoId: row.id }) : null),
     title: row.title || row.description || null,
     description: row.description || null,
   };
@@ -174,7 +233,7 @@ async function listFacesByPhotoId(photoId, orgId) {
   return (rows || []).map(mapFaceRow);
 }
 
-async function getFaceWithPerson(faceId, orgId) {
+async function getFaceWithPerson(faceId, orgId, workspace = null) {
   const params = [faceId];
   let sql = `
     SELECT
@@ -188,16 +247,18 @@ async function getFaceWithPerson(faceId, orgId) {
       p.description AS photo_description
     FROM photo_faces pf
     LEFT JOIN face_persons fp ON pf.person_id = fp.id
-    LEFT JOIN photos p ON p.id = pf.photo_id
+    JOIN photos p ON p.id = pf.photo_id
+    LEFT JOIN projects pr ON pr.id = p.project_id
     WHERE pf.id = ?
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
+  sql = appendVisiblePhotoScope(sql, workspace, params);
   sql += ' LIMIT 1';
   const [rows] = await pool.query(sql, params);
   return rows && rows.length ? rows[0] : null;
 }
 
-async function listRelatedPhotosByPersonId(personId, orgId, limit = null) {
+async function listRelatedPhotosByPersonId(personId, orgId, limit = null, userId = null, workspace = null) {
   const hasLimit = Number.isFinite(Number(limit)) && Number(limit) > 0;
   const safeLimit = hasLimit ? Math.max(1, Math.min(5000, Number(limit))) : null;
   const params = [personId];
@@ -217,13 +278,14 @@ async function listRelatedPhotosByPersonId(personId, orgId, limit = null) {
     WHERE pf.person_id = ?
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
+  sql = appendVisiblePhotoScope(sql, workspace, params);
   sql += ' ORDER BY p.created_at DESC, p.id DESC';
   if (safeLimit) {
     sql += ' LIMIT ?';
     params.push(safeLimit);
   }
   const [rows] = await pool.query(sql, params);
-  return (rows || []).map(mapRelatedPhoto);
+  return (rows || []).map((row) => mapRelatedPhoto(row, userId));
 }
 
 function normalizeIncomingFace(face, idx) {
@@ -399,12 +461,12 @@ async function upsertFacesForPhoto({ photoId, orgId, incomingFaces, force }) {
   };
 }
 
-async function buildFaceProfile({ faceId, personId, orgId }) {
+async function buildFaceProfile({ faceId, personId, orgId, userId = null, workspace = null }) {
   let faceRow = null;
   let targetPersonId = Number.isFinite(Number(personId)) && Number(personId) > 0 ? Number(personId) : null;
 
   if (!targetPersonId && Number.isFinite(Number(faceId)) && Number(faceId) > 0) {
-    faceRow = await getFaceWithPerson(Number(faceId), orgId);
+    faceRow = await getFaceWithPerson(Number(faceId), orgId, workspace);
     if (!faceRow) return null;
     targetPersonId = faceRow.person_id ? Number(faceRow.person_id) : null;
   }
@@ -444,13 +506,13 @@ async function buildFaceProfile({ faceId, personId, orgId }) {
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
       };
-      relatedPhotos = await listRelatedPhotosByPersonId(targetPersonId, orgId, null);
+      relatedPhotos = await listRelatedPhotosByPersonId(targetPersonId, orgId, null, userId, workspace);
     }
   }
 
   if (!person) {
     if (!faceRow && Number.isFinite(Number(faceId)) && Number(faceId) > 0) {
-      faceRow = await getFaceWithPerson(Number(faceId), orgId);
+      faceRow = await getFaceWithPerson(Number(faceId), orgId, workspace);
       if (!faceRow) return null;
     }
 
@@ -474,7 +536,7 @@ async function buildFaceProfile({ faceId, personId, orgId }) {
         thumbUrl: faceRow.photo_thumb_url,
         title: faceRow.photo_title,
         description: faceRow.photo_description,
-      })];
+      }, userId)];
     }
   }
 
@@ -488,7 +550,7 @@ async function buildFaceProfile({ faceId, personId, orgId }) {
   let avatarFaceRow = faceRow;
   const coverId = person && person.coverFaceId ? Number(person.coverFaceId) : null;
   if (coverId && (!faceRow || Number(faceRow.id) !== coverId)) {
-    const coverRow = await getFaceWithPerson(coverId, orgId);
+    const coverRow = await getFaceWithPerson(coverId, orgId, workspace);
     if (coverRow) avatarFaceRow = coverRow;
   }
   const avatarDataUrl = avatarFaceRow ? await getFaceAvatarDataUrl(avatarFaceRow) : null;
@@ -528,9 +590,12 @@ router.get('/faces', requirePermission('photos.view'), async (req, res) => {
         SELECT pf.*, fp.name AS person_name
         FROM photo_faces pf
         LEFT JOIN face_persons fp ON pf.person_id = fp.id
+        JOIN photos p ON p.id = pf.photo_id
+        LEFT JOIN projects pr ON pr.id = p.project_id
         WHERE pf.person_id = ?
       `;
       sql = appendOrgScope(sql, 'pf', orgId, params);
+      sql = appendVisiblePhotoScope(sql, req.workspace, params);
       sql += ' ORDER BY pf.created_at DESC, pf.id DESC LIMIT 500';
       const [rows] = await pool.query(sql, params);
       const faces = (rows || []).map(mapFaceRow);
@@ -587,7 +652,7 @@ router.post('/faces/label', requirePermission('photos.view'), async (req, res) =
 
     if (!Number.isFinite(faceId) || faceId <= 0) return res.status(400).json({ error: 'faceId is required' });
 
-    const faceRow = await getFaceWithPerson(faceId, orgId);
+    const faceRow = await getFaceWithPerson(faceId, orgId, req.workspace);
     if (!faceRow) return res.status(404).json({ error: 'face not found' });
 
     const conn = await pool.getConnection();
@@ -639,7 +704,7 @@ router.post('/faces/label', requirePermission('photos.view'), async (req, res) =
       conn.release();
     }
 
-    const profile = await buildFaceProfile({ faceId, personId: null, orgId });
+    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace });
     return res.json(profile);
   } catch (err) {
     console.error('POST /api/faces/label error:', err && err.stack ? err.stack : err);
@@ -683,7 +748,7 @@ router.get('/faces/:faceId/person', requirePermission('photos.view'), async (req
     const faceId = Number(req.params.faceId);
     if (!Number.isFinite(faceId) || faceId <= 0) return res.status(400).json({ error: 'invalid faceId' });
 
-    const profile = await buildFaceProfile({ faceId, personId: null, orgId });
+    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace });
     if (!profile) return res.status(404).json({ error: 'face not found' });
     return res.json(profile);
   } catch (err) {
@@ -702,7 +767,7 @@ router.get('/faces/:faceId', requirePermission('photos.view'), async (req, res, 
     const faceId = Number(req.params.faceId);
     if (!Number.isFinite(faceId) || faceId <= 0) return res.status(400).json({ error: 'invalid faceId' });
 
-    const profile = await buildFaceProfile({ faceId, personId: null, orgId });
+    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace });
     if (!profile) return res.status(404).json({ error: 'face not found' });
     return res.json(profile);
   } catch (err) {
@@ -722,7 +787,7 @@ router.get('/faces/person', requirePermission('photos.view'), async (req, res) =
       return res.status(400).json({ error: 'faceId or personId is required' });
     }
 
-    const profile = await buildFaceProfile({ faceId, personId, orgId });
+    const profile = await buildFaceProfile({ faceId, personId, orgId, userId: req.user.id, workspace: req.workspace });
     if (!profile) return res.status(404).json({ error: 'person/face not found' });
     return res.json(profile);
   } catch (err) {
@@ -742,7 +807,7 @@ router.get('/faces/profile', requirePermission('photos.view'), async (req, res) 
       return res.status(400).json({ error: 'faceId or personId is required' });
     }
 
-    const profile = await buildFaceProfile({ faceId, personId, orgId });
+    const profile = await buildFaceProfile({ faceId, personId, orgId, userId: req.user.id, workspace: req.workspace });
     if (!profile) return res.status(404).json({ error: 'person/face not found' });
     return res.json(profile);
   } catch (err) {
@@ -925,7 +990,7 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
       conn.release();
     }
 
-    const profile = await buildFaceProfile({ faceId: null, personId: targetPersonId, orgId });
+    const profile = await buildFaceProfile({ faceId: null, personId: targetPersonId, orgId, userId: req.user.id, workspace: req.workspace });
     return res.json({
       ok: true,
       organizationId: orgId,
@@ -987,7 +1052,7 @@ async function splitGridAvatar(row) {
   return getFaceAvatarDataUrl(preferThumb, SPLIT_GRID_AVATAR_SIZE);
 }
 
-async function loadPersonFacesWithPhoto(personId, orgId) {
+async function loadPersonFacesWithPhoto(personId, orgId, workspace = null) {
   const params = [personId];
   let sql = `
     SELECT
@@ -1004,19 +1069,21 @@ async function loadPersonFacesWithPhoto(personId, orgId) {
     WHERE pf.person_id = ?
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
+  sql = appendVisiblePhotoScope(sql, workspace, params);
   sql += ' ORDER BY pf.created_at DESC, pf.id DESC LIMIT 5000';
   const [rows] = await pool.query(sql, params);
   return rows || [];
 }
 
-function toSplitFaceItem(row, score) {
+function toSplitFaceItem(row, score, userId = null) {
   const item = {
     faceId: String(row.id),
     photoId: row.photo_id,
     photoTitle: row.photo_title || row.photo_description || null,
     projectId: row.photo_project_id || row.project_id || null,
     projectName: row.project_name || null,
-    thumbUrl: row.photo_thumb_url ? buildUploadUrl(row.photo_thumb_url) : (row.photo_url ? buildUploadUrl(row.photo_url) : null),
+    thumbUrl: row.photo_thumb_url ? buildMediaUrl(row.photo_thumb_url, { userId, photoId: row.photo_id })
+      : (row.photo_url ? buildMediaUrl(row.photo_url, { userId, photoId: row.photo_id }) : null),
     status: row.status || 'detected',
     createdAt: row.created_at || null,
     avatarDataUrl: null,
@@ -1064,15 +1131,10 @@ router.get('/persons/:personId/faces', requirePermission('photos.view'), async (
     pageSize = Math.max(12, Math.min(120, Math.floor(pageSize)));
     const offset = (Math.floor(page) - 1) * pageSize;
 
-    const cntParams = [personId];
-    let cntSql = 'SELECT COUNT(*) AS total FROM photo_faces pf WHERE pf.person_id = ?';
-    cntSql = appendOrgScope(cntSql, 'pf', orgId, cntParams);
-    const [cntRows] = await pool.query(cntSql, cntParams);
-    const total = cntRows && cntRows[0] ? Number(cntRows[0].total) || 0 : 0;
-
-    const rows = await loadPersonFacesWithPhoto(personId, orgId);
+    const rows = await loadPersonFacesWithPhoto(personId, orgId, req.workspace);
+    const total = rows.length;
     const pageRows = rows.slice(offset, offset + pageSize);
-    const items = pageRows.map((row) => toSplitFaceItem(row, null));
+    const items = pageRows.map((row) => toSplitFaceItem(row, null, req.user.id));
     await attachAvatars(items, new Map(pageRows.map((r) => [Number(r.id), r])), pageSize);
 
     return res.json({
@@ -1104,7 +1166,7 @@ router.post('/persons/:personId/split-preview', requirePermission('faces.merge')
     const seedFaceIds = parseFaceIdArray(req.body && req.body.seedFaceIds);
     if (!seedFaceIds.length) return res.status(400).json({ error: 'seedFaceIds is required' });
 
-    const rows = await loadPersonFacesWithPhoto(personId, orgId);
+    const rows = await loadPersonFacesWithPhoto(personId, orgId, req.workspace);
     if (rows.length < 2) return res.status(400).json({ error: '该人物脸太少，无法拆分' });
 
     const ownedIds = new Set(rows.map((r) => Number(r.id)));
@@ -1117,9 +1179,9 @@ router.post('/persons/:personId/split-preview', requirePermission('faces.merge')
     }
 
     const result = splitFacesBySeeds(rows, seedFaceIds);
-    const moveItems = result.move.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id))));
-    const keepItems = result.keep.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id))));
-    const undecidedItems = result.undecided.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id))));
+    const moveItems = result.move.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id)), req.user.id));
+    const keepItems = result.keep.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id)), req.user.id));
+    const undecidedItems = result.undecided.map((r) => toSplitFaceItem(r, result.scoreOf.get(Number(r.id)), req.user.id));
 
     // 头像预算：优先种子+搬走组（用户重点核对），其次判不了的，最后保留组
     await attachAvatars(
@@ -1257,8 +1319,8 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
     }
 
     const [originalProfile, newPersonProfile] = await Promise.all([
-      buildFaceProfile({ faceId: null, personId, orgId }),
-      buildFaceProfile({ faceId: null, personId: newPersonId, orgId }),
+      buildFaceProfile({ faceId: null, personId, orgId, userId: req.user.id, workspace: req.workspace }),
+      buildFaceProfile({ faceId: null, personId: newPersonId, orgId, userId: req.user.id, workspace: req.workspace }),
     ]);
 
     return res.json({
@@ -1307,7 +1369,7 @@ router.patch('/persons/:personId', requirePermission('faces.label'), async (req,
       return res.status(404).json({ error: 'person not found' });
     }
 
-    const profile = await buildFaceProfile({ faceId: null, personId, orgId });
+    const profile = await buildFaceProfile({ faceId: null, personId, orgId, userId: req.user.id, workspace: req.workspace });
     if (!profile) return res.status(404).json({ error: 'person not found' });
     return res.json(profile);
   } catch (err) {
@@ -1323,7 +1385,7 @@ router.get('/persons/:personId', requirePermission('photos.view'), async (req, r
     const personId = Number(req.params.personId);
     if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
 
-    const profile = await buildFaceProfile({ faceId: null, personId, orgId });
+    const profile = await buildFaceProfile({ faceId: null, personId, orgId, userId: req.user.id, workspace: req.workspace });
     if (!profile) return res.status(404).json({ error: 'person not found' });
     return res.json(profile);
   } catch (err) {
@@ -1342,7 +1404,7 @@ router.get('/persons/:personId/photos', requirePermission('photos.view'), async 
     const limit = useAll ? null : (req.query.limit ? Number(req.query.limit) : 200);
     if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
 
-    const photos = await listRelatedPhotosByPersonId(personId, orgId, limit);
+    const photos = await listRelatedPhotosByPersonId(personId, orgId, limit, req.user.id, req.workspace);
     return res.json({ personId: String(personId), photos, list: photos, total: photos.length });
   } catch (err) {
     console.error('GET /api/persons/:personId/photos error:', err && err.stack ? err.stack : err);
@@ -1459,6 +1521,7 @@ const { findMe, FindMeError, checkRateLimit } = require('../lib/find_me');
 const findMeUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }).single('photo');
 
 function findMeErrorResponse(res, err) {
+  if (sendWorkspaceError(res, err)) return res;
   if (err instanceof FindMeError) {
     return res.status(err.status).json({ error: err.code, ...(err.extra || {}) });
   }
@@ -1474,8 +1537,14 @@ router.post('/faces/find-me', requirePermission('photos.view'), (req, res) => {
       if (!checkRateLimit(req.ip)) return res.status(429).json({ error: 'RATE_LIMITED' });
       const projectId = Number(req.body && req.body.projectId);
       if (!Number.isFinite(projectId) || projectId <= 0) return res.status(400).json({ error: 'projectId is required' });
+      const project = await requireProjectAccess(req, projectId, 'read');
       const orgId = getOrgIdFromReq(req);
-      const result = await findMe(req.file && req.file.buffer, { projectId, orgId });
+      const result = await findMe(req.file && req.file.buffer,
+        { projectId, orgId, unitId: project.unit_id || null,
+          mediaContext: { userId: req.user.id } });
+      if ((await resolveWorkspace(req)).enabled && result?.person) {
+        result.person = { matched: true, bestSim: result.person.bestSim };
+      }
       return res.json(result);
     } catch (err) {
       return findMeErrorResponse(res, err);
@@ -1493,7 +1562,7 @@ router.post('/faces/find-me/share', (req, res) => {
       if (!code) return res.status(400).json({ error: 'shareCode is required' });
 
       const [rows] = await pool.query(
-        'SELECT id, share_type, project_id, organization_id, expires_at, revoked_at FROM share_links WHERE code = ? LIMIT 1', [code]
+        'SELECT id, share_type, project_id, organization_id, unit_id, sync_mode, expires_at, revoked_at FROM share_links WHERE code = ? LIMIT 1', [code]
       );
       if (!rows || !rows.length) return res.status(404).json({ error: 'NOT_FOUND' });
       const s = rows[0];
@@ -1502,21 +1571,37 @@ router.post('/faces/find-me/share', (req, res) => {
 
       let scope;
       if (s.share_type === 'collection') {
-        const [items] = await pool.query('SELECT photo_id FROM share_link_items WHERE share_id = ?', [s.id]);
+        const [items] = await pool.query(
+          `SELECT si.photo_id FROM share_link_items si JOIN photos ph ON ph.id = si.photo_id
+           WHERE si.share_id = ? AND ph.organization_id = ?
+             ${s.unit_id ? 'AND ph.unit_id = ?' : ''}`,
+          [s.id, s.organization_id, ...(s.unit_id ? [s.unit_id] : [])]
+        );
         scope = { photoIds: (items || []).map((r) => Number(r.photo_id)).filter(Boolean) };
       } else if (s.share_type === 'project') {
-        scope = { projectId: Number(s.project_id), orgId: s.organization_id === null ? null : Number(s.organization_id) };
+        if (s.unit_id && s.sync_mode === 'approval') {
+          const [items] = await pool.query(
+            `SELECT si.photo_id FROM share_link_items si JOIN photos ph ON ph.id = si.photo_id
+             WHERE si.share_id = ? AND ph.organization_id = ? AND ph.unit_id = ?`,
+            [s.id, s.organization_id, s.unit_id]
+          );
+          scope = { photoIds: (items || []).map((r) => Number(r.photo_id)).filter(Boolean) };
+        } else {
+          scope = { projectId: Number(s.project_id),
+            orgId: s.organization_id === null ? null : Number(s.organization_id),
+            unitId: s.unit_id || null };
+        }
       } else {
         return res.status(400).json({ error: 'UNSUPPORTED_SHARE_TYPE' });
       }
 
+      scope.mediaContext = { shareId: s.id };
       const result = await findMe(req.file && req.file.buffer, scope);
-      // 分享者明确开放“拍照找我”后，返回命中的人物档案姓名用于提示；不暴露内部人物 id。
+      // Anonymous links never reveal the shared college person library.
       if (result && result.person) {
         result.person = {
           matched: true,
           bestSim: result.person.bestSim,
-          name: result.person.name || null,
         };
       }
       return res.json(result);

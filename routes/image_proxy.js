@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const cosStorage = require('../lib/cos_storage');
+const { unitIdFromKey, authorizeMediaKey } = require('../lib/media_access');
 
 const router = express.Router();
 
@@ -76,7 +77,9 @@ function setObjectHeaders(res, key, object) {
   if (object.ContentLength !== undefined && object.ContentLength !== null) {
     res.setHeader('Content-Length', String(object.ContentLength));
   }
-  if (object.CacheControl) {
+  if (unitIdFromKey(key)) {
+    res.setHeader('Cache-Control', 'private, no-store');
+  } else if (object.CacheControl) {
     res.setHeader('Cache-Control', object.CacheControl);
   } else {
     res.setHeader('Cache-Control', DEFAULT_CACHE_CONTROL);
@@ -121,6 +124,12 @@ router.use(async (req, res) => {
   if (!key || !cosStorage.isSafeKey(key)) return res.status(400).end();
   if (!isAllowedKeyPrefix(key)) return res.status(404).end();
   if (!verifyMediaSignature(key, req.query || {})) return res.status(403).end();
+  try {
+    if (!await authorizeMediaKey(key, req.query && req.query.ma)) return res.status(403).end();
+  } catch (err) {
+    console.error('[image_proxy] access check failed:', err && err.message ? err.message : err);
+    return res.status(503).end();
+  }
 
   if (!cosStorage.isConfigured()) {
     return res.status(503).json({ error: 'S3_NOT_CONFIGURED' });

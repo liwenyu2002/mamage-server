@@ -1,13 +1,14 @@
 // routes/projects.js
 const express = require('express');
 const router = express.Router();
-const { pool, buildUploadUrl } = require('../db');
+const { pool } = require('../db');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
 const cosStorage = require('../lib/cos_storage');
+const { buildMediaUrl } = require('../lib/media_access');
 const JWT_SECRET = keys.JWT_SECRET;
 
 // 如果请求没有运行全量 authMiddleware，但前端仍然携带了 Bearer token，
@@ -77,6 +78,28 @@ const skipLocalFileCheck = (() => {
 
 // 基于数据库的权限检查（使用 role_permissions 表）
 const { requirePermission } = require('../lib/permissions');
+const {
+  resolveWorkspace, projectListScope, requireProjectAccess, assertNoActiveCopySource, sendWorkspaceError,
+} = require('../lib/workspace_access');
+
+router.param('id', async (req, res, next, value) => {
+  try {
+    if (!/^\d+$/.test(String(value))) return next();
+    await populateReqUserFromAuthIfPresent(req);
+    const workspace = await resolveWorkspace(req);
+    if (workspace.enabled) {
+      const action = req.method === 'GET' ? 'read'
+        : req.method === 'DELETE' ? 'manage' : 'edit';
+      await requireProjectAccess(req, Number(value), action);
+    } else if (!req.user) {
+      const [rows] = await pool.query('SELECT unit_id FROM projects WHERE id = ? LIMIT 1', [Number(value)]);
+      if (rows.length && rows[0].unit_id) return res.status(404).json({ error: 'PROJECT_NOT_FOUND' });
+    }
+    next();
+  } catch (err) {
+    if (!sendWorkspaceError(res, err)) next(err);
+  }
+});
 
 // 小工具：安全解析 meta JSON
 function parseMeta(meta) {
@@ -138,7 +161,7 @@ function parsePhotoAdjustments(adjustments) {
 
 // 选择封面：优先选同时包含标签 '合影' 和 '推荐' 的最新照片，次优包含 '合影'，次优包含 '推荐'，否则取最新一张
 function chooseCoverFromPhotos(photoRows) {
-  if (!photoRows || photoRows.length === 0) return { url: null, thumbUrl: null };
+  if (!photoRows || photoRows.length === 0) return { id: null, url: null, thumbUrl: null };
 
   // photoRows 假定按 created_at DESC, id DESC 排序（最新在前）
   let preferBoth = null;
@@ -166,7 +189,11 @@ function chooseCoverFromPhotos(photoRows) {
   }
 
   const chosen = preferBoth || preferHe || preferTui || first;
-  return { url: chosen.url || null, thumbUrl: chosen.thumbUrl || null };
+  return { id: chosen.id, url: chosen.url || null, thumbUrl: chosen.thumbUrl || null };
+}
+
+function mediaUrl(req, path, photoId) {
+  return path ? buildMediaUrl(path, { userId: req.user && req.user.id, photoId }) : null;
 }
 
 async function fetchProjectPreviewPhotos(projectIds, orgId, latestLimit = 6) {
@@ -427,6 +454,8 @@ router.get('/', async (req, res) => {
     await populateReqUserFromAuthIfPresent(req);
     // organization scoping: only show projects for user's organization
     const orgId = getScopedOrgIdFromReq(req);
+    const workspace = await resolveWorkspace(req);
+    const unitScope = projectListScope(workspace);
 
     let mainSql = `
       SELECT
@@ -439,6 +468,7 @@ router.get('/', async (req, res) => {
         p.photo_ids AS photoIds,
         p.tags,
         p.admin_id AS adminId,
+        p.unit_id AS unitId,
         p.created_at AS createdAt,
         p.updated_at AS updatedAt,
         (
@@ -466,6 +496,8 @@ router.get('/', async (req, res) => {
       mainSql += ' WHERE p.organization_id = ?';
       mainParams.push(orgId);
     }
+    if (unitScope.sql) mainSql += ` AND ${unitScope.sql}`;
+    mainParams.push(...unitScope.params);
     mainSql += ' ORDER BY p.created_at DESC LIMIT ?';
     mainParams.push(limit);
 
@@ -495,8 +527,8 @@ router.get('/', async (req, res) => {
         for (const item of list) {
           const pRows = byProj[item.id] || [];
           const cover = chooseCoverFromPhotos(pRows);
-          item.coverUrl = cover.url ? buildUploadUrl(cover.url) : null;
-          item.coverThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+          item.coverUrl = mediaUrl(req, cover.url, cover.id);
+          item.coverThumbUrl = mediaUrl(req, cover.thumbUrl, cover.id);
         }
       }
     } catch (e) {
@@ -520,6 +552,8 @@ router.get('/scenery', async (req, res) => {
     // allow optional Bearer token even on this public route
     await populateReqUserFromAuthIfPresent(req);
     const orgId = getScopedOrgIdFromReq(req);
+    const workspace = await resolveWorkspace(req);
+    const unitScope = projectListScope(workspace);
 
     // attempt to query by projects.type first
     let projSql = `
@@ -533,6 +567,7 @@ router.get('/scenery', async (req, res) => {
         p.photo_ids AS photoIds,
         p.tags,
         p.admin_id AS adminId,
+        p.unit_id AS unitId,
         p.created_at AS createdAt,
         p.updated_at AS updatedAt
       FROM projects p
@@ -545,6 +580,8 @@ router.get('/scenery', async (req, res) => {
       projSql += ' AND p.organization_id = ?';
       projParams.push(orgId);
     }
+    if (unitScope.sql) projSql += ` AND ${unitScope.sql}`;
+    projParams.push(...unitScope.params);
     projSql += ' ORDER BY p.created_at DESC';
 
     let projRows;
@@ -564,6 +601,7 @@ router.get('/scenery', async (req, res) => {
           p.photo_ids AS photoIds,
           p.tags,
           p.admin_id AS adminId,
+          p.unit_id AS unitId,
           p.created_at AS createdAt,
           p.updated_at AS updatedAt
         FROM projects p
@@ -572,9 +610,11 @@ router.get('/scenery', async (req, res) => {
       const like = '%scenery%';
       const fbParams = [like, like];
       if (orgId === null) {
-        projRows = (await pool.query(fallbackSql + ' AND p.organization_id IS NULL', fbParams))[0] || [];
+        projRows = (await pool.query(fallbackSql + ' AND p.organization_id IS NULL'
+          + (unitScope.sql ? ` AND ${unitScope.sql}` : ''), fbParams.concat(unitScope.params)))[0] || [];
       } else {
-        projRows = (await pool.query(fallbackSql + ' AND p.organization_id = ?', fbParams.concat([orgId])))[0] || [];
+        projRows = (await pool.query(fallbackSql + ' AND p.organization_id = ?'
+          + (unitScope.sql ? ` AND ${unitScope.sql}` : ''), fbParams.concat([orgId], unitScope.params)))[0] || [];
       }
     }
 
@@ -607,8 +647,8 @@ router.get('/scenery', async (req, res) => {
       tags: parseTags(p.tags),
       photos: (byProj[p.id] || []).map(ph => ({
         ...ph,
-        url: ph.url ? buildUploadUrl(ph.url) : null,
-        thumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null
+        url: mediaUrl(req, ph.url, ph.id),
+        thumbUrl: mediaUrl(req, ph.thumbUrl, ph.id)
       }))
     }));
 
@@ -670,12 +710,16 @@ router.get('/list', async (req, res) => {
     // add organization scoping to whereClauses
     await populateReqUserFromAuthIfPresent(req);
     const orgId = getScopedOrgIdFromReq(req);
+    const workspace = await resolveWorkspace(req);
+    const unitScope = projectListScope(workspace);
     if (orgId === null) {
       whereClauses.push('p.organization_id IS NULL');
     } else {
       whereClauses.push('p.organization_id = ?');
       params.push(orgId);
     }
+    if (unitScope.sql) whereClauses.push(unitScope.sql);
+    params.push(...unitScope.params);
 
     const whereSql = whereClauses.length
       ? `WHERE ${whereClauses.join(' AND ')}`
@@ -714,6 +758,7 @@ router.get('/list', async (req, res) => {
         p.photo_ids AS photoIds,
         p.tags,
         p.admin_id AS adminId,
+        p.unit_id AS unitId,
         p.created_at AS createdAt,
         p.updated_at AS updatedAt,
         (
@@ -773,13 +818,13 @@ router.get('/list', async (req, res) => {
         for (const item of list) {
           const pRows = byProj[item.id] || [];
           const cover = chooseCoverFromPhotos(pRows);
-          item.coverUrl = cover.url ? buildUploadUrl(cover.url) : null;
-          item.coverThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+          item.coverUrl = mediaUrl(req, cover.url, cover.id);
+          item.coverThumbUrl = mediaUrl(req, cover.thumbUrl, cover.id);
           item.previewImages = pRows.filter((ph) => String(ph.type || '').toLowerCase() !== 'video').slice(0, 6).map((ph) => ({
             id: ph.id,
-            url: ph.url ? buildUploadUrl(ph.url) : null,
-            thumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null,
-            fullThumbUrl: ph.thumbUrl ? buildUploadUrl(ph.thumbUrl) : null,
+            url: mediaUrl(req, ph.url, ph.id),
+            thumbUrl: mediaUrl(req, ph.thumbUrl, ph.id),
+            fullThumbUrl: mediaUrl(req, ph.thumbUrl, ph.id),
             type: ph.type || null,
           })).filter((ph) => ph && (ph.url || ph.thumbUrl));
         }
@@ -820,6 +865,7 @@ router.get('/:id', async (req, res) => {
         p.photo_ids AS photoIds,
         p.tags,
         p.admin_id AS adminId,
+        p.unit_id AS unitId,
         p.created_at AS createdAt,
         p.updated_at AS updatedAt
       FROM projects p
@@ -902,18 +948,27 @@ router.get('/:id', async (req, res) => {
 
     project.photos = photoRows.map((p) => ({
       ...p,
-      url: p.url ? buildUploadUrl(p.url) : null,
-      thumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
-      publicDownloadUrl: p.publicDownloadUrl ? buildUploadUrl(p.publicDownloadUrl) : null,
-      playbackUrl: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
-      playback_url: p.playbackUrl ? buildUploadUrl(p.playbackUrl) : null,
-      fullUrl: p.url ? buildUploadUrl(p.url) : null,
-      fullThumbUrl: p.thumbUrl ? buildUploadUrl(p.thumbUrl) : null,
+      url: mediaUrl(req, p.url, p.id),
+      thumbUrl: mediaUrl(req, p.thumbUrl, p.id),
+      publicDownloadUrl: mediaUrl(req, p.publicDownloadUrl, p.id),
+      playbackUrl: mediaUrl(req, p.playbackUrl, p.id),
+      playback_url: mediaUrl(req, p.playbackUrl, p.id),
+      fullUrl: mediaUrl(req, p.url, p.id),
+      fullThumbUrl: mediaUrl(req, p.thumbUrl, p.id),
       description: p.description || null,
       adjustments: parsePhotoAdjustments(p.adjustments)
     }));
 
-    if (shouldIncludeFaces && project.photos.length > 0) {
+    const workspace = await resolveWorkspace(req);
+    let faceSearchAllowed = !workspace.enabled;
+    if (workspace.enabled && shouldIncludeFaces) {
+      const [grants] = await pool.query(
+        'SELECT 1 FROM face_search_grants WHERE organization_id = ? AND user_id = ? LIMIT 1',
+        [workspace.orgId, workspace.userId]
+      );
+      faceSearchAllowed = grants.length > 0;
+    }
+    if (shouldIncludeFaces && faceSearchAllowed && project.photos.length > 0) {
       try {
         let faceSql = `
           SELECT
@@ -968,8 +1023,8 @@ router.get('/:id', async (req, res) => {
     // 根据照片列表选封面：优先 '合影' 且 被 AI 推荐('推荐') 的最新照片
     try {
       const cover = chooseCoverFromPhotos(photoRows);
-      project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
-      project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+      project.coverFullUrl = mediaUrl(req, cover.url, cover.id);
+      project.coverFullThumbUrl = mediaUrl(req, cover.thumbUrl, cover.id);
     } catch (e) {
       project.coverFullUrl = null;
       project.coverFullThumbUrl = null;
@@ -1005,6 +1060,8 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
     const uuid = uuidv4();
     const adminId = req.user && req.user.id ? req.user.id : null;
     const orgId = req.user && (req.user.organization_id !== undefined && req.user.organization_id !== null) ? parseInt(req.user.organization_id, 10) : null;
+    const workspace = await resolveWorkspace(req);
+    const unitId = workspace.enabled ? workspace.unitId : null;
 
     const metaObj = parseMeta(body.meta);
     if (rawEventDate) {
@@ -1026,8 +1083,8 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
       await conn.beginTransaction();
       try {
         [result] = await conn.query(
-          `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, organization_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-          [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId, orgId]
+          `INSERT INTO projects (uuid, name, description, event_date, meta, tags, admin_id, organization_id, unit_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [uuid, finalName, finalDesc, rawEventDate, JSON.stringify(metaObj), tagsArr ? JSON.stringify(tagsArr) : null, adminId, orgId, unitId]
         );
       } catch (e) {
         if (e && (e.code === 'ER_BAD_FIELD_ERROR' || (e.message && e.message.indexOf('Unknown column') !== -1))) {
@@ -1079,8 +1136,8 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
           [newId]
         );
         const cover = chooseCoverFromPhotos(photos);
-        project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
-        project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+        project.coverFullUrl = mediaUrl(req, cover.url, cover.id);
+        project.coverFullThumbUrl = mediaUrl(req, cover.thumbUrl, cover.id);
       } catch (e) {
         project.coverFullUrl = null;
         project.coverFullThumbUrl = null;
@@ -1214,8 +1271,8 @@ router.post('/:id/update', requirePermission('projects.update'), async (req, res
         [id]
       );
       const cover = chooseCoverFromPhotos(photos);
-      project.coverFullUrl = cover.url ? buildUploadUrl(cover.url) : null;
-      project.coverFullThumbUrl = cover.thumbUrl ? buildUploadUrl(cover.thumbUrl) : null;
+      project.coverFullUrl = mediaUrl(req, cover.url, cover.id);
+      project.coverFullThumbUrl = mediaUrl(req, cover.thumbUrl, cover.id);
     } catch (e) {
       project.coverFullUrl = null;
       project.coverFullThumbUrl = null;
@@ -1429,10 +1486,12 @@ router.delete('/:id', requirePermission('projects.delete'), async (req, res) => 
       const [photoRows] = await conn.query(
         `SELECT id, url, thumb_url AS thumbUrl, public_download_url AS publicDownloadUrl, playback_url AS playbackUrl
          FROM photos
-         WHERE project_id = ?`,
+         WHERE project_id = ? FOR UPDATE`,
         [id]
       );
       photos = photoRows || [];
+
+      await assertNoActiveCopySource(conn, photos.map((photo) => photo.id));
 
       if (photos.length > 0) {
         await conn.query('DELETE FROM photos WHERE project_id = ?', [id]);
@@ -1494,6 +1553,7 @@ router.delete('/:id', requirePermission('projects.delete'), async (req, res) => 
       notFoundFiles
     });
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('DELETE /api/projects/:id error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
