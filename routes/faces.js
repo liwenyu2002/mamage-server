@@ -39,6 +39,7 @@ function getOrgIdFromReq(req) {
 }
 
 router.use((req, res, next) => {
+  if (!/^\/(?:faces(?:\/|$)|persons(?:\/|$)|photos\/\d+\/faces(?:\/|$))/.test(req.path)) return next();
   if (req.path === '/faces/find-me' || req.path === '/faces/find-me/share') return next();
   return requirePermission('photos.view')(req, res, async () => {
     try {

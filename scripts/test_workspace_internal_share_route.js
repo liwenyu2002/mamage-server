@@ -98,10 +98,13 @@ async function main() {
     app.use('/api/photos', photosRouter);
     app.use('/api/image', imageProxyRouter);
     app.use('/api', facesRouter);
+    app.get('/api/health', (_req, res) => res.json({ ok: true }));
     server = await new Promise((resolve) => {
       const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
     });
     const base = `http://127.0.0.1:${server.address().port}/api/internal-shares`;
+    const health = await fetch(base.replace(/\/internal-shares$/, '/health'));
+    assert.equal(health.status, 200);
     const token = (userId) => jwt.sign({ id: userId }, JWT_SECRET, { expiresIn: '5m' });
     const workspaceBase = base.replace(/\/internal-shares$/, '/workspaces');
     const demoAlbums = await fetch(base.replace(/\/internal-shares$/, '/projects?demo=1'));
