@@ -537,6 +537,7 @@ router.get('/', async (req, res) => {
 
     res.json(list);
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('[GET /api/projects] error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -654,6 +655,7 @@ router.get('/scenery', async (req, res) => {
 
     res.json(result);
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('[GET /api/projects/scenery] error:', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -835,6 +837,7 @@ router.get('/list', async (req, res) => {
 
     res.json({ list, page, pageSize, total, hasMore });
   } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
     console.error('[GET /api/projects/list] error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
