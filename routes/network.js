@@ -9,6 +9,7 @@
 const os = require('os');
 const express = require('express');
 const fetch = require('node-fetch');
+const { requirePermission } = require('../lib/permissions');
 const router = express.Router();
 
 const LAN_HTTPS_PORT = Number(process.env.LAN_HTTPS_PORT || 3443);
@@ -133,11 +134,25 @@ router.get('/lan', async (req, res) => {
   // 不向未认证访客暴露。内网地址仅在判定访客身处校园网时下发——公网侧
   // （扫描器/陌生访客）拿不到任何内网信息（对应漏扫"内部IP泄露"项）。
   const onIntranet = Boolean(visitorOnIntranet && lan);
+  res.set('Cache-Control', 'no-store');
   res.json({
     ok: onIntranet,
     lanIp: onIntranet ? lan.address : null,
     lanPort: onIntranet ? LAN_HTTPS_PORT : null,
     visitorOnIntranet,
+    reportedAt: new Date().toISOString(),
+  });
+});
+
+// VPN users may reach the campus LAN while their public-site traffic exits elsewhere.
+// Keep automatic detection conservative, but let signed-in users request the address explicitly.
+router.get('/lan/manual', requirePermission('photos.view'), (req, res) => {
+  const lan = pickLanAddress();
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: Boolean(lan),
+    lanIp: lan ? lan.address : null,
+    lanPort: lan ? LAN_HTTPS_PORT : null,
     reportedAt: new Date().toISOString(),
   });
 });
