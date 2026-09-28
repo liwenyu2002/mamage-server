@@ -1165,30 +1165,46 @@ function fetchBuffer(url, maxBytes, timeoutMs) {
   });
 }
 
-function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographerId }) {
+const similarityPending = { normal: [], low: [] };
+const similarityQueuedIds = new Set();
+let similarityRunning = 0;
+
+function drainSimilarityQueue() {
+  const concurrency = Math.max(1, Math.min(2, Number(process.env.IMAGE_SIMILARITY_POST_UPLOAD_CONCURRENCY) || 1));
+  while (similarityRunning < concurrency) {
+    const item = similarityPending.normal.shift() || similarityPending.low.shift();
+    if (!item) return;
+    similarityRunning += 1;
+    Promise.resolve().then(async () => {
+      const imageSim = require('../lib/image_similarity');
+      const thumbUrl = buildInternalMediaUrl(item.thumbRel);
+      const buffer = item.thumbBuffer || await fetchBuffer(thumbUrl,
+        Number(process.env.IMAGE_SIMILARITY_FETCH_MAX_BYTES || 5 * 1024 * 1024),
+        Number(process.env.IMAGE_SIMILARITY_FETCH_TIMEOUT_MS || 15000));
+      const embedding = await imageSim.encodeImageFromBuffer(buffer);
+      await imageSim.saveEmbedding(item.insertedId, embedding);
+    }).catch((err) => console.error('[image_similarity] encode/save failed', err && err.message ? err.message : err))
+      .finally(() => {
+        similarityRunning -= 1;
+        similarityQueuedIds.delete(String(item.insertedId));
+        setImmediate(drainSimilarityQueue);
+      });
+  }
+}
+
+function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographerId, priority = 'normal' }) {
   try {
     const aiWorker = require('../lib/ai_tags_worker');
-    aiWorker.enqueue({ id: insertedId, relPath: thumbRel });
+    aiWorker.enqueue({ id: insertedId, relPath: thumbRel, priority });
   } catch (err) {
     console.error('[upload] enqueue ai analyze failed:', err && err.message ? err.message : err);
   }
 
-  try {
-    const imageSim = require('../lib/image_similarity');
-    const run = async () => {
-      let buf = thumbBuffer;
-      if (!buf) {
-        const thumbUrl = buildInternalMediaUrl(thumbRel);
-        buf = await fetchBuffer(thumbUrl, Number(process.env.IMAGE_SIMILARITY_FETCH_MAX_BYTES || 5 * 1024 * 1024), Number(process.env.IMAGE_SIMILARITY_FETCH_TIMEOUT_MS || 15000));
-      }
-      const emb = await imageSim.encodeImageFromBuffer(buf);
-      await imageSim.saveEmbedding(insertedId, emb);
-    };
-    setImmediate(() => {
-      run().catch((err) => console.error('[image_similarity] encode/save failed', err && err.message ? err.message : err));
-    });
-  } catch (err) {
-    console.error('[upload] enqueue embedding failed:', err && err.message ? err.message : err);
+  if (!similarityQueuedIds.has(String(insertedId))) {
+    similarityQueuedIds.add(String(insertedId));
+    similarityPending[priority === 'low' ? 'low' : 'normal'].push({ insertedId, thumbRel,
+      thumbBuffer: priority === 'low' ? null : thumbBuffer });
+    setImmediate(drainSimilarityQueue);
   }
 
   try {
@@ -1196,6 +1212,7 @@ function enqueuePostUploadJobs({ insertedId, thumbRel, thumbBuffer, photographer
     faceAutoWorker.enqueueFaceAutoJob({
       photoId: insertedId,
       uploaderId: photographerId || null,
+      priority,
     });
   } catch (err) {
     console.error('[upload] enqueue face auto detect failed:', err && err.message ? err.message : err);

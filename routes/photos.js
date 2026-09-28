@@ -2220,6 +2220,20 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
     let parsedTags = null;
     try { parsedTags = p.tags ? JSON.parse(p.tags) : null; } catch (e) { parsedTags = null; }
 
+    let sourceAttribution = null;
+    try { sourceAttribution = typeof p.sourceAttribution === 'string' ? JSON.parse(p.sourceAttribution) : (p.sourceAttribution || null); }
+    catch (_) { sourceAttribution = null; }
+    if (sourceAttribution?.type === 'external_import' && sourceAttribution.sourceAlbumUrl) {
+      try {
+        await requireProjectAccess(req, p.projectId, 'edit');
+        if (!await hasPermissionForUserId(req.user.id, 'projects.update')) throw new Error('NOT_EDITOR');
+      }
+      catch (_) {
+        sourceAttribution = { ...sourceAttribution };
+        delete sourceAttribution.sourceAlbumUrl;
+      }
+    }
+
     res.json({
       id: p.id,
       uuid: p.uuid,
@@ -2234,7 +2248,7 @@ router.get('/:id', requirePermission('photos.view'), async (req, res) => {
       playback_url: resolveUrl(p.playbackUrl),
       title: p.title,
       description: p.description || null,
-      sourceAttribution: (() => { try { return typeof p.sourceAttribution === 'string' ? JSON.parse(p.sourceAttribution) : (p.sourceAttribution || null); } catch (_) { return null; } })(),
+      sourceAttribution,
       adjustments: parsePhotoAdjustments(p.adjustments),
       tags: parsedTags,
       aiStatus: p.aiStatus || null,

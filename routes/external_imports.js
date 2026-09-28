@@ -1,199 +1,242 @@
 const express = require('express');
-const { randomUUID } = require('crypto');
 const { pool } = require('../db');
-const { requirePermission } = require('../lib/permissions');
-const { requireProjectAccess, sendWorkspaceError } = require('../lib/workspace_access');
-const { parsePhotoPlusUrl, scanPhotoPlus } = require('../lib/external_gallery_scan');
-const { scanFromTemplate } = require('../lib/external_gallery_templates');
-const { parsePublicHttpsUrl } = require('../lib/public_remote_fetch');
+const { requirePermission, hasPermissionForUserId } = require('../lib/permissions');
+const { requireProjectAccess, resolveWorkspace, sendWorkspaceError } = require('../lib/workspace_access');
+const { buildMediaUrl } = require('../lib/media_access');
+const { createJob } = require('../lib/external_import_jobs');
 const worker = require('../lib/external_import_worker');
 
 const router = express.Router();
-const SCAN_TTL_MS = 15 * 60 * 1000;
-const scans = new Map();
-const activeUsers = new Set();
-let activeScans = 0;
 
-function cleanupScans() {
-  for (const [id, scan] of scans) if (scan.expiresAt <= Date.now()) scans.delete(id);
-  while (scans.size > 20) scans.delete(scans.keys().next().value);
+router.post('/scan', requirePermission('upload.photo'), (_req, res) => {
+  res.status(410).json({ error: 'CLIENT_OUTDATED', message: '转存流程已升级，请刷新页面后重试' });
+});
+
+function validId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
-
-const scanCleanupTimer = setInterval(cleanupScans, 5 * 60 * 1000);
-scanCleanupTimer.unref?.();
 
 function handleError(res, err) {
   if (sendWorkspaceError(res, err)) return;
   const status = Number(err?.status) || 500;
   if (status >= 500) console.error('[external-import]', err?.message || err);
-  res.status(status).json({ error: status >= 500 ? 'EXTERNAL_IMPORT_FAILED' : 'INVALID_REQUEST', message: status >= 500 ? '操作失败，请稍后重试' : err.message });
+  res.status(status).json({
+    error: err?.code || (status >= 500 ? 'EXTERNAL_IMPORT_FAILED' : 'INVALID_REQUEST'),
+    message: status >= 500 ? '操作失败，请稍后重试' : err.message,
+  });
 }
 
-router.post('/scan', requirePermission('upload.photo'), async (req, res) => {
-  const parsed = parsePhotoPlusUrl(req.body?.url);
-  if (!parsed && !parsePublicHttpsUrl(req.body?.url)) {
-    return res.status(400).json({ error: 'UNSUPPORTED_URL', message: '请填写公开的 HTTPS 相册链接' });
-  }
-  const userId = Number(req.user.id);
-  if (activeScans >= 1 || activeUsers.has(userId)) {
-    return res.status(429).json({ error: 'SCAN_BUSY', message: '正在扫描相册，请稍后再试' });
-  }
-  activeScans += 1;
-  activeUsers.add(userId);
+async function permissions(req, projectId) {
+  await requireProjectAccess(req, projectId, 'read');
+  let canSeeUrl = false;
   try {
-    cleanupScans();
-    const result = parsed ? await scanPhotoPlus(parsed.canonicalUrl) : await scanFromTemplate(req.body.url);
-    const scanId = randomUUID();
-    scans.set(scanId, { ...result, userId, expiresAt: Date.now() + SCAN_TTL_MS });
-    cleanupScans();
-    return res.json({
-      scanId,
-      provider: result.provider,
-      sourceUrl: result.sourceUrl,
-      title: result.title,
-      suggestedAlbumTitle: result.suggestedAlbumTitle,
-      suggestedSections: result.suggestedSections,
-      templateSource: result.templateSource,
-      reportedTotal: result.reportedTotal,
-      scannedCount: result.scannedCount,
-      complete: result.complete,
-      quality: result.quality,
-      expiresAt: new Date(Date.now() + SCAN_TTL_MS).toISOString(),
-      photos: result.photos.map(({ id, filename, previewUrl, sectionName, width, height, watermarked }) => ({ id, filename, previewUrl, sectionName, width, height, watermarked })),
-    });
-  } catch (err) {
-    return handleError(res, err);
-  } finally {
-    activeScans -= 1;
-    activeUsers.delete(userId);
-  }
-});
+    await requireProjectAccess(req, projectId, 'edit');
+    canSeeUrl = await hasPermissionForUserId(req.user.id, 'projects.update');
+  } catch (_) { /* album readers only see the source domain */ }
+  const workspace = await resolveWorkspace(req);
+  let canManageProject = false;
+  try { await requireProjectAccess(req, projectId, 'manage'); canManageProject = true; }
+  catch (_) { /* shared readers cannot manage the source album */ }
+  const canAdmin = workspace.collegeAdmin || (workspace.enabled && canManageProject)
+    || ['admin', 'superadmin'].includes(String(req.user.role));
+  return { canSeeUrl, canAdmin };
+}
+
+function serializeJob(row, access) {
+  let sourceDomain = '';
+  try { sourceDomain = new URL(row.source_url).hostname; } catch (_) { /* malformed old record */ }
+  return {
+    id: Number(row.id), projectId: Number(row.project_id), sourceTitle: row.source_title,
+    sourceDomain, ...(access.canSeeUrl ? { sourceUrl: row.source_url } : {}),
+    status: row.status, scanStatus: row.scan_status, scanErrorCode: row.scan_error_code,
+    discoveredCount: Number(row.discovered_count), reportedTotal: row.reported_total === null ? null : Number(row.reported_total),
+    selectedCount: Number(row.selected_count), cancelRequested: Boolean(row.cancel_requested),
+    canControl: access.canAdmin || Number(row.requested_by) === Number(access.userId),
+    createdAt: row.created_at, updatedAt: row.updated_at, finishedAt: row.finished_at,
+    retryAfter: row.retry_after,
+  };
+}
+
+async function findJob(req, id) {
+  const [rows] = await pool.query('SELECT * FROM external_import_jobs WHERE id = ? LIMIT 1', [id]);
+  if (!rows.length) throw Object.assign(new Error('转存任务不存在'), { status: 404 });
+  const access = await permissions(req, rows[0].project_id);
+  access.userId = req.user.id;
+  return { job: rows[0], access };
+}
 
 router.post('/jobs', requirePermission('upload.photo'), async (req, res) => {
-  cleanupScans();
-  const scan = scans.get(String(req.body?.scanId || ''));
-  if (!scan || scan.userId !== Number(req.user.id)) {
-    return res.status(400).json({ error: 'SCAN_EXPIRED', message: '扫描结果已过期，请重新扫描' });
-  }
-  const projectId = Number(req.body?.projectId);
-  const sectionId = req.body?.timelineSectionId ? Number(req.body.timelineSectionId) : null;
-  const ids = Array.isArray(req.body?.photoIds) ? [...new Set(req.body.photoIds.map(String))] : [];
-  const validId = scan.provider === 'photoplus' ? /^\d+$/ : /^[a-f0-9]{32}$/;
-  if (!Number.isSafeInteger(projectId) || projectId <= 0 || ids.length < 1 || ids.length > 1000 || ids.some((id) => !validId.test(id))) {
-    return res.status(400).json({ error: 'INVALID_SELECTION', message: '请选择要转存的照片和目标相册' });
-  }
-  if (sectionId !== null && (!Number.isSafeInteger(sectionId) || sectionId <= 0)) {
-    return res.status(400).json({ error: 'INVALID_SECTION', message: '环节无效' });
-  }
-  const byId = new Map(scan.photos.map((photo) => [photo.id, photo]));
-  if (ids.some((id) => !byId.has(id))) return res.status(400).json({ error: 'INVALID_SELECTION', message: '所选照片不属于扫描结果' });
-  if (req.body?.confirmRights !== true) {
-    return res.status(400).json({ error: 'CONFIRM_REQUIRED', message: '请确认已获得照片转存授权' });
-  }
-  const sectionMappings = req.body?.sectionMappings && typeof req.body.sectionMappings === 'object' && !Array.isArray(req.body.sectionMappings)
-    ? req.body.sectionMappings : {};
-  const sourceSections = new Set(scan.suggestedSections || []);
-  if (Object.keys(sectionMappings).some((name) => !sourceSections.has(name))) {
-    return res.status(400).json({ error: 'INVALID_SECTION_MAPPING', message: '来源环节不在扫描结果中' });
-  }
-
-  let conn;
+  const projectId = validId(req.body?.projectId);
+  if (!projectId) return res.status(400).json({ error: 'INVALID_PROJECT', message: '请选择目标相册' });
   try {
-    conn = await pool.getConnection();
-    await conn.beginTransaction();
-    const project = await requireProjectAccess(req, projectId, 'upload', conn);
-    if (Number(project.organization_id) !== Number(req.user.organization_id)) {
-      throw Object.assign(new Error('目标相册不存在'), { status: 404 });
-    }
-    if (sectionId !== null) {
-      const [sections] = await conn.query('SELECT id FROM project_timeline_sections WHERE id = ? AND project_id = ? LIMIT 1', [sectionId, projectId]);
-      if (!sections.length) throw Object.assign(new Error('所选环节不在当前相册中'), { status: 400 });
-    }
-    const mappedIds = [...new Set(Object.values(sectionMappings).filter((value) => value !== '' && value !== null).map(Number))];
-    if (mappedIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) throw Object.assign(new Error('环节映射无效'), { status: 400 });
-    if (mappedIds.length) {
-      const [mapped] = await conn.query('SELECT id FROM project_timeline_sections WHERE project_id = ? AND id IN (?)', [projectId, mappedIds]);
-      if (mapped.length !== mappedIds.length) throw Object.assign(new Error('环节映射不属于当前相册'), { status: 400 });
-    }
-    const [job] = await conn.query(
-      `INSERT INTO external_import_jobs
-       (provider, source_url, source_title, source_quality, organization_id, unit_id, project_id, timeline_section_id, requested_by, selected_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [scan.provider, scan.sourceUrl, scan.title, scan.quality, project.organization_id, project.unit_id, projectId, sectionId, req.user.id, ids.length]
-    );
-    const values = ids.map((id) => {
-      const photo = byId.get(id);
-      return [job.insertId, id, photo.filename, photo.sectionName || null,
-        photo.sectionName && Object.hasOwn(sectionMappings, photo.sectionName) && sectionMappings[photo.sectionName]
-          ? Number(sectionMappings[photo.sectionName]) : null,
-        photo.transferUrl, photo.previewUrl];
-    });
-    await conn.query(
-      'INSERT INTO external_import_items (job_id, provider_photo_id, filename, source_section_name, timeline_section_id, asset_url, preview_url) VALUES ?',
-      [values]
-    );
-    await conn.commit();
+    const result = await createJob(req, projectId, req.body?.url);
     worker.wake();
-    return res.status(201).json({ jobId: job.insertId, status: 'queued', selectedCount: ids.length });
-  } catch (err) {
-    if (conn) await conn.rollback().catch(() => null);
-    return handleError(res, err);
-  } finally {
-    if (conn) conn.release();
-  }
-});
-
-router.get('/jobs', requirePermission('upload.photo'), async (req, res) => {
-  const projectId = Number(req.query.projectId);
-  if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: 'INVALID_PROJECT' });
-  try {
-    await requireProjectAccess(req, projectId, 'read');
-    const [rows] = await pool.query(
-      `SELECT id, source_title AS sourceTitle, status, selected_count AS selectedCount,
-              cancel_requested AS cancelRequested, created_at AS createdAt
-       FROM external_import_jobs WHERE requested_by = ? AND project_id = ? ORDER BY id DESC LIMIT 5`,
-      [req.user.id, projectId]
-    );
-    return res.json({ jobs: rows });
+    return res.status(result.existing ? 200 : 201).json({ ...result, status: 'queued' });
   } catch (err) { return handleError(res, err); }
 });
 
-router.get('/jobs/:id', requirePermission('upload.photo'), async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'INVALID_JOB' });
+router.get('/jobs', requirePermission('photos.view'), async (req, res) => {
+  const projectId = validId(req.query.projectId);
+  if (!projectId) return res.status(400).json({ error: 'INVALID_PROJECT' });
   try {
-    const [jobs] = await pool.query(
-      `SELECT id, source_title AS sourceTitle, source_url AS sourceUrl, project_id AS projectId,
-              status, selected_count AS selectedCount, cancel_requested AS cancelRequested,
-              created_at AS createdAt, updated_at AS updatedAt
-       FROM external_import_jobs WHERE id = ? AND requested_by = ? LIMIT 1`,
-      [id, req.user.id]
+    const access = await permissions(req, projectId);
+    access.userId = req.user.id;
+    const [rows] = await pool.query(
+      'SELECT * FROM external_import_jobs WHERE project_id = ? ORDER BY id DESC LIMIT 8', [projectId]
     );
-    if (!jobs.length) return res.status(404).json({ error: 'JOB_NOT_FOUND' });
-    await requireProjectAccess(req, jobs[0].projectId, 'read');
-    const [counts] = await pool.query(
-      'SELECT status, COUNT(*) AS count FROM external_import_items WHERE job_id = ? GROUP BY status', [id]
+    const [sourceRows] = await pool.query(
+      `SELECT MAX(j.id) AS id, j.source_url, MAX(j.source_title) AS source_title,
+              MIN(j.created_at) AS started_at, COUNT(DISTINCT i.photo_id) AS photo_count
+       FROM external_import_jobs j
+       LEFT JOIN external_import_items i ON i.job_id = j.id AND i.status = 'done'
+       WHERE j.project_id = ? AND j.attribution_visible = 1
+       GROUP BY j.source_url ORDER BY MAX(j.id) DESC LIMIT 30`, [projectId]
     );
+    const sources = sourceRows.map((row) => {
+      let domain = '';
+      try { domain = new URL(row.source_url).hostname; } catch (_) { /* old record */ }
+      return {
+        id: Number(row.id), title: row.source_title, domain,
+        ...(access.canSeeUrl ? { url: row.source_url } : {}),
+        startedAt: row.started_at, photoCount: Number(row.photo_count),
+      };
+    });
+    return res.json({ jobs: rows.map((row) => serializeJob(row, access)), sources });
+  } catch (err) { return handleError(res, err); }
+});
+
+router.get('/jobs/:id', requirePermission('photos.view'), async (req, res) => {
+  const id = validId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'INVALID_JOB' });
+  try {
+    const { job, access } = await findJob(req, id);
+    const [counts] = await pool.query('SELECT status, COUNT(*) AS count FROM external_import_items WHERE job_id = ? GROUP BY status', [id]);
     const [issues] = await pool.query(
-      `SELECT provider_photo_id AS sourcePhotoId, filename, status, error_code AS errorCode
-      FROM external_import_items WHERE job_id = ? AND status IN ('failed', 'skipped') ORDER BY id DESC LIMIT 10`, [id]
+      `SELECT id, filename, status, error_code AS errorCode
+       FROM external_import_items WHERE job_id = ? AND (status = 'failed' OR (status = 'skipped' AND error_code IS NOT NULL)) ORDER BY id LIMIT 20`, [id]
     );
     const [active] = await pool.query(
       "SELECT filename FROM external_import_items WHERE job_id = ? AND status = 'running' ORDER BY id LIMIT 1", [id]
     );
-    return res.json({ ...jobs[0], counts: Object.fromEntries(counts.map((row) => [row.status, Number(row.count)])), activeFileName: active[0]?.filename || null, issues });
+    return res.json({
+      ...serializeJob(job, access),
+      counts: Object.fromEntries(counts.map((row) => [row.status, Number(row.count)])),
+      activeFileName: active[0]?.filename || null,
+      issues,
+    });
   } catch (err) { return handleError(res, err); }
 });
 
-router.post('/jobs/:id/cancel', requirePermission('upload.photo'), async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'INVALID_JOB' });
+router.get('/jobs/:id/updates', requirePermission('photos.view'), async (req, res) => {
+  const id = validId(req.params.id);
+  const afterPhotoId = Number(req.query.afterPhotoId || 0);
+  if (!id || !Number.isSafeInteger(afterPhotoId) || afterPhotoId < 0) return res.status(400).json({ error: 'INVALID_CURSOR' });
   try {
-    const [result] = await pool.query(
-      `UPDATE external_import_jobs SET cancel_requested = 1
-       WHERE id = ? AND requested_by = ? AND status IN ('queued', 'running')`, [id, req.user.id]
+    const { job } = await findJob(req, id);
+    const [rows] = await pool.query(
+      `SELECT ph.id, ph.url, ph.thumb_url AS thumbUrl, ph.title, ph.description,
+              ph.tags, ph.ai_status AS aiStatus, ph.type, ph.photographer_id AS photographerId,
+              ph.timeline_section_id AS timelineSectionId, pts.name AS timelineSectionName,
+              ph.created_at AS createdAt
+       FROM external_import_items i
+       JOIN photos ph ON ph.id = i.photo_id AND ph.project_id = ?
+       LEFT JOIN project_timeline_sections pts ON pts.id = ph.timeline_section_id
+       WHERE i.job_id = ? AND i.status = 'done' AND i.photo_id > ?
+       ORDER BY i.photo_id LIMIT 101`, [job.project_id, id, afterPhotoId]
     );
+    const page = rows.slice(0, 100).map((row) => ({
+      ...row,
+      url: buildMediaUrl(row.url, { userId: req.user.id, photoId: row.id }),
+      thumbUrl: buildMediaUrl(row.thumbUrl, { userId: req.user.id, photoId: row.id }),
+    }));
+    const [sections] = await pool.query(
+      `SELECT id, name, section_time AS sectionTime, sort_order AS sortOrder
+       FROM project_timeline_sections WHERE project_id = ? ORDER BY sort_order, id`, [job.project_id]
+    );
+    return res.json({ photos: page, hasMore: rows.length > 100, sections });
+  } catch (err) { return handleError(res, err); }
+});
+
+router.get('/jobs/:id/issues', requirePermission('photos.view'), async (req, res) => {
+  const id = validId(req.params.id);
+  const afterItemId = Number(req.query.afterItemId || 0);
+  if (!id || !Number.isSafeInteger(afterItemId) || afterItemId < 0) return res.status(400).json({ error: 'INVALID_CURSOR' });
+  try {
+    await findJob(req, id);
+    const [rows] = await pool.query(
+      `SELECT id, filename, status, error_code AS errorCode
+       FROM external_import_items WHERE job_id = ? AND id > ?
+       AND (status = 'failed' OR (status = 'skipped' AND error_code IS NOT NULL))
+       ORDER BY id LIMIT 101`, [id, afterItemId]
+    );
+    return res.json({ issues: rows.slice(0, 100), hasMore: rows.length > 100 });
+  } catch (err) { return handleError(res, err); }
+});
+
+router.post('/jobs/:id/cancel', requirePermission('photos.view'), async (req, res) => {
+  const id = validId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'INVALID_JOB' });
+  try {
+    const { job, access } = await findJob(req, id);
+    if (!access.canAdmin && Number(job.requested_by) !== Number(req.user.id)) return res.status(403).json({ error: 'FORBIDDEN' });
+    const [result] = await pool.query(
+      `UPDATE external_import_jobs SET cancel_requested = 1,
+       finished_at = IF(status = 'paused', NOW(), finished_at),
+       status = IF(status = 'paused', 'cancelled', status)
+       WHERE id = ? AND status IN ('queued', 'running', 'paused')`, [id]
+    );
+    worker.wake();
     return res.json({ ok: true, cancelRequested: Boolean(result.affectedRows) });
+  } catch (err) { return handleError(res, err); }
+});
+
+router.post('/jobs/:id/resume', requirePermission('photos.view'), async (req, res) => {
+  const id = validId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'INVALID_JOB' });
+  try {
+    const { job, access } = await findJob(req, id);
+    await requireProjectAccess(req, job.project_id, 'upload');
+    if (!access.canAdmin && Number(job.requested_by) !== Number(req.user.id)) return res.status(403).json({ error: 'FORBIDDEN' });
+    if (!['cancelled', 'paused', 'completed_with_errors'].includes(job.status)) {
+      return res.status(409).json({ error: 'JOB_NOT_RESUMABLE', message: '当前任务无需继续' });
+    }
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query('SELECT id FROM projects WHERE id = ? FOR UPDATE', [job.project_id]);
+      const [others] = await conn.query(
+        "SELECT id FROM external_import_jobs WHERE project_id = ? AND id <> ? AND status IN ('queued', 'running', 'paused') LIMIT 1",
+        [job.project_id, id]
+      );
+      if (others.length) throw Object.assign(new Error('当前相册已有其他转存任务'), { status: 409 });
+      await conn.query("UPDATE external_import_items SET status = 'pending', error_code = NULL, attempt_count = 0 WHERE job_id = ? AND status = 'failed'", [id]);
+      await conn.query(
+        `UPDATE external_import_jobs SET status = 'queued', cancel_requested = 0, retry_after = NULL,
+         scan_status = IF(scan_status = 'completed', 'completed', 'pending'), scan_error_code = NULL,
+         finished_at = NULL WHERE id = ?`, [id]
+      );
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback().catch(() => null);
+      throw err;
+    } finally { conn.release(); }
+    worker.wake();
+    return res.json({ ok: true });
+  } catch (err) { return handleError(res, err); }
+});
+
+router.post('/sources/:id/hide', requirePermission('projects.update'), async (req, res) => {
+  const id = validId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'INVALID_SOURCE' });
+  try {
+    const { job } = await findJob(req, id);
+    await requireProjectAccess(req, job.project_id, 'edit');
+    await pool.query(
+      'UPDATE external_import_jobs SET attribution_visible = 0 WHERE project_id = ? AND source_url = ?',
+      [job.project_id, job.source_url]
+    );
+    return res.json({ ok: true });
   } catch (err) { return handleError(res, err); }
 });
 

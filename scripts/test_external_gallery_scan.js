@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { parsePhotoPlusUrl, normalizePhotoPlusAsset, mapPhotoPlusPhoto } = require('../lib/external_gallery_scan');
+const { parsePhotoPlusUrl, normalizePhotoPlusAsset, mapPhotoPlusPhoto, collectPhotoPlusPage } = require('../lib/external_gallery_scan');
 
 assert.deepEqual(parsePhotoPlusUrl('https://live.photoplus.cn/live/92304200?accessFrom=qrcode#/live'), {
   activityNo: '92304200',
@@ -27,5 +27,17 @@ const photo = mapPhotoPlusPhoto({
 assert.equal(photo.transferUrl, 'https://pb.plusx.cn/watermarked.jpg');
 assert.equal(photo.watermarked, true);
 assert.equal(mapPhotoPlusPhoto({ ...photo, activity_no: 'other' }, '92304200'), null);
+
+const seen = new Set();
+const pages = Array.from({ length: 13 }, (_, page) => Array.from({ length: 100 }, (_, index) => ({
+  id: page * 100 + index + 1,
+  activity_no: '92304200',
+  pic_name: `photo-${page * 100 + index + 1}.jpg`,
+  small_img: '//pb.plusx.cn/preview.jpg',
+  watermark_origin_img: '//pb.plusx.cn/original.jpg',
+})));
+const collected = pages.flatMap((page) => collectPhotoPlusPage(page, '92304200', seen));
+assert.equal(collected.length, 1300);
+assert.equal(collectPhotoPlusPage(pages[0], '92304200', seen).length, 0);
 
 console.log('external gallery scan tests passed');
