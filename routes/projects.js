@@ -78,6 +78,8 @@ const skipLocalFileCheck = (() => {
 
 // 基于数据库的权限检查（使用 role_permissions 表）
 const { requirePermission } = require('../lib/permissions');
+const { sourceFromUrl, insertJob } = require('../lib/external_import_jobs');
+const externalImportWorker = require('../lib/external_import_worker');
 const {
   resolveWorkspace, projectListScope, requireProjectAccess, assertNoActiveCopySource, sendWorkspaceError,
 } = require('../lib/workspace_access');
@@ -1043,7 +1045,10 @@ router.get('/:id', async (req, res) => {
 // ==============================
 // 4. 创建项目：POST /api/projects  (仅 admin)
 // ==============================
-router.post('/', requirePermission('projects.create'), async (req, res) => {
+router.post('/', requirePermission('projects.create'), (req, res, next) => {
+  if (!String(req.body?.externalImportUrl || '').trim()) return next();
+  return requirePermission('upload.photo')(req, res, next);
+}, async (req, res) => {
   try {
     const body = req.body || {};
 
@@ -1052,12 +1057,17 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
     const rawEventDate = (body.eventDate || '').trim() || null;
     const tagsArr = normalizeTagsInput(body.tags);
     const timelineConfig = getTimelineConfigFromBody(body);
+    const rawImportUrl = String(body.externalImportUrl || '').trim();
+    const importSource = rawImportUrl ? sourceFromUrl(rawImportUrl) : null;
 
     if (!finalName) {
       return res.status(400).json({ error: 'projectName is required' });
     }
     if (timelineConfig.enabled && timelineConfig.sections.length === 0) {
       return res.status(400).json({ error: 'TIMELINE_SECTIONS_REQUIRED', message: '开启时间轴后至少需要添加一个环节名称' });
+    }
+    if (rawImportUrl && !importSource) {
+      return res.status(400).json({ error: 'INVALID_IMPORT_URL', message: '请填写公开的 HTTPS 相册链接' });
     }
 
     const uuid = uuidv4();
@@ -1081,6 +1091,7 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
     }
 
     let result;
+    let importJobId = null;
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -1105,7 +1116,14 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
       if (timelineConfig.enabled) {
         await replaceTimelineSections(conn, newId, timelineConfig.sections);
       }
+      if (importSource) {
+        importJobId = await insertJob(conn, {
+          source: importSource, projectId: newId, organizationId: orgId,
+          unitId, requestedBy: adminId,
+        });
+      }
       await conn.commit();
+      if (importJobId) externalImportWorker.wake();
 
       const [rows] = await pool.query(
         `
@@ -1131,6 +1149,7 @@ router.post('/', requirePermission('projects.create'), async (req, res) => {
       project.meta = parseMeta(project.meta);
       project.tags = parseTags(project.tags);
       await attachTimelineToProject(project);
+      if (importJobId) project.externalImportJobId = importJobId;
 
       // 计算封面（如果有照片）并填充为可访问的完整 URL
       try {
