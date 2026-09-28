@@ -846,7 +846,52 @@ router.get('/list', async (req, res) => {
 });
 
 // ==============================
-// 3. 项目详情：GET /api/projects/:id
+// 3. 当前页相册转存状态：GET /api/projects/import-status
+// ==============================
+router.get('/import-status', async (req, res) => {
+  const rawIds = String(req.query.ids || '');
+  const ids = [...new Set(rawIds.split(',').map(Number))];
+  if (!rawIds || !/^\d+(,\d+)*$/.test(rawIds) || ids.length > 50
+    || ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+    return res.status(400).json({ error: 'INVALID_PROJECT_IDS' });
+  }
+  try {
+    await populateReqUserFromAuthIfPresent(req);
+    const orgId = getScopedOrgIdFromReq(req);
+    const unitScope = projectListScope(await resolveWorkspace(req));
+    const [rows] = await pool.query(
+      `SELECT p.id AS projectId, j.status, j.scan_status AS scanStatus,
+              j.discovered_count AS discoveredCount, j.reported_total AS reportedTotal,
+              j.selected_count AS selectedCount,
+              (SELECT COUNT(*) FROM external_import_items i
+               WHERE i.job_id = j.id AND i.status = 'done') AS doneCount
+       FROM projects p
+       JOIN external_import_jobs j ON j.id = (
+         SELECT MAX(id) FROM external_import_jobs WHERE project_id = p.id
+       )
+       WHERE p.id IN (?)
+         AND ${orgId === null ? 'p.organization_id IS NULL' : 'p.organization_id = ?'}
+         ${unitScope.sql ? `AND ${unitScope.sql}` : ''}
+         AND j.status <> 'completed'`,
+      [ids, ...(orgId === null ? [] : [orgId]), ...unitScope.params]
+    );
+    return res.json({ statuses: Object.fromEntries(rows.map((row) => [row.projectId, {
+      status: row.status,
+      scanStatus: row.scanStatus,
+      discoveredCount: Number(row.discoveredCount) || 0,
+      reportedTotal: row.reportedTotal === null ? null : Number(row.reportedTotal),
+      selectedCount: Number(row.selectedCount) || 0,
+      doneCount: Number(row.doneCount) || 0,
+    }])) });
+  } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
+    console.error('[GET /api/projects/import-status] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==============================
+// 4. 项目详情：GET /api/projects/:id
 // ==============================
 router.get('/:id', async (req, res) => {
   try {
