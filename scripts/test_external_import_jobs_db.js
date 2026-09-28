@@ -3,7 +3,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
 const { JWT_SECRET } = require('../config/keys');
-const { createJob, ingestBatch } = require('../lib/external_import_jobs');
+const { createJob, ingestBatch, updateImportMetadata } = require('../lib/external_import_jobs');
 const externalImportRoutes = require('../routes/external_imports');
 
 async function main() {
@@ -13,6 +13,8 @@ async function main() {
   const user = users[0];
   let projectId;
   let jobId;
+  let singleProjectId;
+  let singleJobId;
   let server;
   try {
     const [created] = await pool.query(
@@ -35,9 +37,13 @@ async function main() {
       previewUrl: `https://gallery.example.com/thumb/${index + 1}.jpg`,
     }));
     for (let index = 0; index < photos.length; index += 100) {
-      await ingestBatch(job, photos.slice(index, index + 100), { title: '测试活动', reportedTotal: 1300 });
+      await ingestBatch(job, photos.slice(index, index + 100), {
+        title: '测试活动', reportedTotal: 1300, sourceSections: ['开幕', '闭幕'],
+      });
     }
-    assert.equal(await ingestBatch(job, photos.slice(0, 100), { title: '测试活动', reportedTotal: 1300 }), 0);
+    assert.equal(await ingestBatch(job, photos.slice(0, 100), {
+      title: '测试活动', reportedTotal: 1300, sourceSections: ['开幕', '闭幕'],
+    }), 0);
     const [[counts]] = await pool.query(
       'SELECT selected_count AS selectedCount, discovered_count AS discoveredCount, reported_total AS reportedTotal FROM external_import_jobs WHERE id = ?', [jobId]
     );
@@ -49,6 +55,11 @@ async function main() {
     const [[project]] = await pool.query('SELECT meta FROM projects WHERE id = ?', [projectId]);
     const meta = typeof project.meta === 'string' ? JSON.parse(project.meta) : project.meta;
     assert.equal(meta.timelineEnabled, true);
+    await updateImportMetadata({ id: jobId, project_id: projectId }, {
+      title: '来源相册标题', reportedTotal: 1300, suggestedSections: ['开幕', '闭幕'],
+    });
+    const [[existingProject]] = await pool.query('SELECT name FROM projects WHERE id = ?', [projectId]);
+    assert.equal(existingProject.name, '__external_import_test__', 'importing into an existing album must keep its title');
     const app = express();
     app.use(express.json());
     app.use('/api/external-imports', externalImportRoutes);
@@ -72,9 +83,53 @@ async function main() {
     assert.equal(resume.status, 200);
     const hide = await fetch(`${base}/sources/${jobId}/hide`, { method: 'POST', headers });
     assert.equal(hide.status, 200);
+
+    const [singleCreated] = await pool.query(
+      "INSERT INTO projects (uuid, name, organization_id, meta) VALUES (UUID(), '__single_source_test__', ?, JSON_OBJECT('timelineEnabled', false, '_pendingExternalImportTitle', '__single_source_test__'))",
+      [user.organization_id]
+    );
+    singleProjectId = singleCreated.insertId;
+    singleJobId = (await createJob(req, singleProjectId, 'https://gallery.example.com/single')).jobId;
+    await pool.query("UPDATE external_import_jobs SET status = 'running' WHERE id = ?", [singleJobId]);
+    await updateImportMetadata({ id: singleJobId, project_id: singleProjectId }, {
+      title: '来源相册', reportedTotal: 1, suggestedSections: ['图片直播'],
+    });
+    await ingestBatch({ id: singleJobId, project_id: singleProjectId }, [{
+      id: 'only-photo', filename: 'photo.jpg', sectionName: '图片直播',
+      transferUrl: 'https://gallery.example.com/original/photo.jpg',
+      previewUrl: 'https://gallery.example.com/thumb/photo.jpg',
+    }], { title: '来源相册', reportedTotal: 1, sourceSections: ['图片直播'] });
+    const [singleSections] = await pool.query('SELECT id FROM project_timeline_sections WHERE project_id = ?', [singleProjectId]);
+    assert.equal(singleSections.length, 0, 'one source section must not become a timeline');
+    const [[singleItem]] = await pool.query('SELECT timeline_section_id AS sectionId FROM external_import_items WHERE job_id = ?', [singleJobId]);
+    assert.equal(singleItem.sectionId, null);
+    const [[singleProject]] = await pool.query('SELECT name, meta FROM projects WHERE id = ?', [singleProjectId]);
+    const singleMeta = typeof singleProject.meta === 'string' ? JSON.parse(singleProject.meta) : singleProject.meta;
+    assert.equal(singleProject.name, '来源相册');
+    assert.equal(singleMeta.timelineEnabled, false);
+    assert.equal(singleMeta._pendingExternalImportTitle, undefined);
+    await pool.query(
+      "UPDATE projects SET name = '手动标题', meta = JSON_SET(meta, '$._pendingExternalImportTitle', '旧标题') WHERE id = ?",
+      [singleProjectId]
+    );
+    await updateImportMetadata({ id: singleJobId, project_id: singleProjectId }, {
+      title: '另一个来源标题', reportedTotal: 1, suggestedSections: [],
+    });
+    const [[renamedProject]] = await pool.query('SELECT name, meta FROM projects WHERE id = ?', [singleProjectId]);
+    assert.equal(renamedProject.name, '手动标题', 'a user rename during scanning must win');
+    const renamedMeta = typeof renamedProject.meta === 'string' ? JSON.parse(renamedProject.meta) : renamedProject.meta;
+    assert.equal(renamedMeta._pendingExternalImportTitle, undefined);
     console.log('external import DB integration: 1300 photos, dedupe, album lock, sections passed');
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
+    if (singleJobId) {
+      await pool.query('DELETE FROM external_import_items WHERE job_id = ?', [singleJobId]);
+      await pool.query('DELETE FROM external_import_jobs WHERE id = ?', [singleJobId]);
+    }
+    if (singleProjectId) {
+      await pool.query('DELETE FROM project_timeline_sections WHERE project_id = ?', [singleProjectId]);
+      await pool.query('DELETE FROM projects WHERE id = ?', [singleProjectId]);
+    }
     if (jobId) {
       await pool.query('DELETE FROM external_import_items WHERE job_id = ?', [jobId]);
       await pool.query('DELETE FROM external_import_jobs WHERE id = ?', [jobId]);

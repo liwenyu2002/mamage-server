@@ -78,7 +78,7 @@ const skipLocalFileCheck = (() => {
 
 // 基于数据库的权限检查（使用 role_permissions 表）
 const { requirePermission } = require('../lib/permissions');
-const { sourceFromUrl, insertJob } = require('../lib/external_import_jobs');
+const { PENDING_IMPORT_TITLE_KEY, sourceFromUrl, insertJob } = require('../lib/external_import_jobs');
 const externalImportWorker = require('../lib/external_import_worker');
 const {
   resolveWorkspace, projectListScope, requireProjectAccess, assertNoActiveCopySource, sendWorkspaceError,
@@ -1052,12 +1052,13 @@ router.post('/', requirePermission('projects.create'), (req, res, next) => {
   try {
     const body = req.body || {};
 
-    const finalName = (body.projectName || body.name || body.title || '').trim();
+    const rawImportUrl = String(body.externalImportUrl || '').trim();
+    const finalName = (body.projectName || body.name || body.title || '').trim()
+      || (rawImportUrl ? '正在解析相册' : '');
     const finalDesc = (body.description || body.desc || '').trim();
     const rawEventDate = (body.eventDate || '').trim() || null;
     const tagsArr = normalizeTagsInput(body.tags);
     const timelineConfig = getTimelineConfigFromBody(body);
-    const rawImportUrl = String(body.externalImportUrl || '').trim();
     const importSource = rawImportUrl ? sourceFromUrl(rawImportUrl) : null;
 
     if (!finalName) {
@@ -1081,6 +1082,7 @@ router.post('/', requirePermission('projects.create'), (req, res, next) => {
       metaObj.eventDate = rawEventDate;
     }
     metaObj.timelineEnabled = Boolean(timelineConfig.enabled);
+    if (importSource) metaObj[PENDING_IMPORT_TITLE_KEY] = finalName;
 
     // 强制要求创建项目的用户属于某个组织（projects.organization_id 为 NOT NULL 的情形）
     if (orgId === null) {

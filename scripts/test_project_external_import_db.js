@@ -26,6 +26,7 @@ async function main() {
     Authorization: `Bearer ${jwt.sign({ id: users[0].id }, JWT_SECRET)}`,
   };
   let projectId;
+  let optionalProjectId;
   try {
     const invalid = await fetch(base, {
       method: 'POST', headers,
@@ -51,6 +52,18 @@ async function main() {
     assert.equal(Number(jobs[0].id), Number(project.externalImportJobId));
     assert.equal(jobs[0].sourceUrl, 'https://gallery.example.com/event/123');
     assert.equal(jobs[0].status, 'queued');
+    const [[storedProject]] = await pool.query('SELECT meta FROM projects WHERE id = ?', [projectId]);
+    const meta = typeof storedProject.meta === 'string' ? JSON.parse(storedProject.meta) : storedProject.meta;
+    assert.equal(meta._pendingExternalImportTitle, name);
+
+    const optional = await fetch(base, {
+      method: 'POST', headers,
+      body: JSON.stringify({ externalImportUrl: 'https://gallery.example.com/event/456' }),
+    });
+    assert.equal(optional.status, 200);
+    optionalProjectId = Number((await optional.json()).id);
+    const [[optionalProject]] = await pool.query('SELECT name FROM projects WHERE id = ?', [optionalProjectId]);
+    assert.equal(optionalProject.name, '正在解析相册');
     console.log('create album with external import: invalid URL rejected, project and job created together');
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -61,6 +74,10 @@ async function main() {
     if (projectId) {
       await pool.query('DELETE FROM external_import_jobs WHERE project_id = ?', [projectId]);
       await pool.query('DELETE FROM projects WHERE id = ?', [projectId]);
+    }
+    if (optionalProjectId) {
+      await pool.query('DELETE FROM external_import_jobs WHERE project_id = ?', [optionalProjectId]);
+      await pool.query('DELETE FROM projects WHERE id = ?', [optionalProjectId]);
     }
     await pool.end();
   }
