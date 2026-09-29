@@ -358,9 +358,13 @@ router.get('/:code', async (req, res) => {
             `
                 SELECT
                     s.*, 
-                    u.name AS creatorName
+                    u.name AS creatorName,
+                    p.name AS projectName,
+                    o.name AS organizationName
                 FROM share_links s
                 LEFT JOIN users u ON s.created_by = u.id
+                LEFT JOIN projects p ON s.project_id = p.id AND s.share_type = 'project'
+                LEFT JOIN organizations o ON s.organization_id = o.id
                 WHERE s.code = ?
                 LIMIT 1
             `,
@@ -519,7 +523,8 @@ router.get('/:code', async (req, res) => {
         res.json({
             code: share.code,
             shareType: share.share_type,
-            title: share.title || null,
+            title: share.title || share.projectName || null,
+            organizationName: share.organizationName || null,
             note: share.note || null,
             createdBy: share.created_by || null,
             creatorName: share.creatorName || null,
