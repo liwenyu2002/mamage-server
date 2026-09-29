@@ -818,7 +818,7 @@ router.get('/faces/profile', requirePermission('photos.view'), async (req, res) 
   }
 });
 
-router.get('/persons', requirePermission('photos.view'), async (req, res) => {
+router.get('/persons', requirePermission('faces.merge'), async (req, res) => {
   try {
     const orgId = getOrgIdFromReq(req);
     if (!Number.isFinite(orgId) || orgId <= 0) {
@@ -1119,7 +1119,7 @@ async function getPersonRow(connOrPool, personId, orgId) {
 }
 
 // 拆分选择器：该人物名下所有脸（分页 + 服务端裁好的头像），用于人工勾种子
-router.get('/persons/:personId/faces', requirePermission('photos.view'), async (req, res) => {
+router.get('/persons/:personId/faces', requirePermission('faces.merge'), async (req, res) => {
   try {
     const orgId = getOrgIdFromReq(req);
     const personId = Number(req.params.personId);

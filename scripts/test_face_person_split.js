@@ -197,6 +197,12 @@ async function main() {
     const noAuth = await call(server, 'GET', '/api/persons/77/faces', {});
     assert.strictEqual(noAuth.status, 401, 'no token should 401');
 
+    const noPerm = await call(server, 'GET', '/api/persons/77/faces', { token: photographer });
+    assert.strictEqual(noPerm.status, 403, 'face list requires faces.merge');
+
+    const noSearchPerm = await call(server, 'GET', '/api/persons?q=张三', { token: photographer });
+    assert.strictEqual(noSearchPerm.status, 403, 'person search requires faces.merge');
+
     const ok = await call(server, 'GET', '/api/persons/77/faces?pageSize=12', { token: admin });
     assert.strictEqual(ok.status, 200, `expected 200 got ${ok.status}: ${ok.text}`);
     assert.strictEqual(ok.json.total, personFaces.length);
