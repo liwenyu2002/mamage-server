@@ -147,7 +147,8 @@ async function loadPhotos({ photoId, projectId, orgId, limit, offset }) {
       p.project_id AS projectId,
       p.organization_id AS organizationId,
       p.url,
-      p.thumb_url AS thumbUrl
+      p.thumb_url AS thumbUrl,
+      p.public_download_url AS publicDownloadUrl
     FROM photos p
   `;
   if (where.length) sql += ` WHERE ${where.join(' AND ')}`;

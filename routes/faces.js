@@ -207,6 +207,7 @@ async function getPhotoBasic(photoId, orgId) {
       organization_id AS organizationId,
       url,
       thumb_url AS thumbUrl,
+      public_download_url AS publicDownloadUrl,
       title,
       description
     FROM photos
