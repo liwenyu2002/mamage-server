@@ -9,6 +9,9 @@ const {
 const { detectFacesForPhoto } = require('../lib/face_detector');
 const { getFaceAvatarDataUrl } = require('../lib/face_avatar');
 const {
+  hasProtectedFaces, recordIdentityFeedback, recordSeparation, remapMergedFeedback,
+} = require('../lib/face_feedback');
+const {
   getOrgFaceClusterConfig,
   MIN_THRESHOLD,
   MAX_THRESHOLD,
@@ -354,6 +357,10 @@ function normalizeIncomingFace(face, idx) {
 async function upsertFacesForPhoto({ photoId, orgId, incomingFaces, force }) {
   const photo = await getPhotoBasic(photoId, orgId);
   if (!photo) return { notFound: true };
+  if (await hasProtectedFaces(pool, photoId, orgId)) {
+    return { notFound: false, photo, faces: await listFacesByPhotoId(photoId, orgId),
+      detectApplied: false, detectorMeta: null, message: '已保留人工纠正的人脸，请通过标注或拆分修改归属' };
+  }
 
   const incomingProvided = Array.isArray(incomingFaces);
   const hasIncoming = incomingProvided && incomingFaces.length > 0;
@@ -394,6 +401,9 @@ async function upsertFacesForPhoto({ photoId, orgId, incomingFaces, force }) {
         delParams.push(orgId);
       }
       await conn.query(delSql, delParams);
+      if (await hasProtectedFaces(conn, photoId, orgId)) {
+        throw Object.assign(new Error('已保留人工纠正的人脸，请刷新后重试'), { status: 409 });
+      }
 
       if (Array.isArray(facesToSave) && facesToSave.length > 0) {
         const normalizedFaces = facesToSave
@@ -638,6 +648,7 @@ router.post('/faces/detect', requirePermission('photos.view'), async (req, res) 
     });
   } catch (err) {
     console.error('POST /api/faces/detect error:', err && err.stack ? err.stack : err);
+    if (err.status === 409) return res.status(409).json({ error: err.message });
     if (schemaErrorResponse(res, err, 'POST /api/faces/detect')) return;
     if (detectorErrorResponse(res, err, 'POST /api/faces/detect')) return;
     return res.status(500).json({ error: 'Internal server error' });
@@ -661,6 +672,10 @@ router.post('/faces/label', requirePermission('photos.view'), async (req, res) =
     try {
       await conn.beginTransaction();
 
+      const [lockedFaces] = await conn.query(
+        'SELECT * FROM photo_faces WHERE id = ? AND organization_id <=> ? FOR UPDATE', [faceId, orgId]
+      );
+      if (!lockedFaces.length) throw new Error('face not found');
       let targetPersonId = null;
       if (personIdRaw !== undefined && personIdRaw !== null && String(personIdRaw).trim() !== '') {
         const pid = Number(personIdRaw);
@@ -698,6 +713,8 @@ router.post('/faces/label', requirePermission('photos.view'), async (req, res) =
       }
 
       await conn.query('UPDATE photo_faces SET person_id = ?, status = ? WHERE id = ?', [targetPersonId, targetPersonId ? 'confirmed' : 'detected', faceId]);
+      await recordIdentityFeedback(conn, { orgId, userId: req.user.id, action: 'label',
+        assignments: [{ face: lockedFaces[0], personId: targetPersonId, kind: 'explicit' }] });
       await conn.commit();
     } catch (e) {
       await conn.rollback();
@@ -922,7 +939,7 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
       await conn.beginTransaction();
 
       const [targetRows] = await conn.query(
-        'SELECT id, name, note, cover_face_id AS coverFaceId FROM face_persons WHERE organization_id = ? AND id = ? LIMIT 1',
+        'SELECT id, name, note, cover_face_id AS coverFaceId FROM face_persons WHERE organization_id = ? AND id = ? LIMIT 1 FOR UPDATE',
         [orgId, targetPersonId]
       );
       if (!targetRows || targetRows.length === 0) {
@@ -931,7 +948,7 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
       const target = targetRows[0];
 
       const [sourceRows] = await conn.query(
-        'SELECT id, name, note, cover_face_id AS coverFaceId FROM face_persons WHERE organization_id = ? AND id IN (?)',
+        'SELECT id, name, note, cover_face_id AS coverFaceId FROM face_persons WHERE organization_id = ? AND id IN (?) FOR UPDATE',
         [orgId, sourcePersonIds]
       );
       const foundSources = new Set((sourceRows || []).map((x) => Number(x.id)));
@@ -940,11 +957,27 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
         throw new Error(`source person not found: ${missing.join(',')}`);
       }
 
+      const [feedbackFaces] = await conn.query(
+        'SELECT * FROM photo_faces WHERE organization_id = ? AND person_id IN (?) ORDER BY id FOR UPDATE',
+        [orgId, [targetPersonId, ...sourcePersonIds]]
+      );
+      const referenceIds = new Set(parseFaceIdArray(body.referenceFaceIds || []));
+      const ownedIds = new Set(feedbackFaces.map((face) => Number(face.id)));
+      if ([...referenceIds].some((id) => !ownedIds.has(id))) {
+        throw Object.assign(new Error('reference face does not belong to merged persons'), { status: 400 });
+      }
+
       const [upd] = await conn.query(
         "UPDATE photo_faces SET person_id = ?, status = 'confirmed' WHERE organization_id = ? AND person_id IN (?)",
         [targetPersonId, orgId, sourcePersonIds]
       );
       movedFaces = upd && Number.isFinite(Number(upd.affectedRows)) ? Number(upd.affectedRows) : 0;
+      await remapMergedFeedback(conn, orgId, targetPersonId, sourcePersonIds);
+      await recordIdentityFeedback(conn, { orgId, userId: req.user.id, action: 'merge',
+        details: { targetPersonId, sourcePersonIds },
+        assignments: feedbackFaces.map((face) => ({ face, personId: targetPersonId,
+          kind: referenceIds.has(Number(face.id)) ? 'explicit' : 'group' })),
+      });
 
       const mergedName = target.name || ((sourceRows || []).map((r) => (r.name ? String(r.name).trim() : '')).find(Boolean) || null);
       const mergedNoteParts = [];
@@ -1004,6 +1037,7 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
     });
   } catch (err) {
     console.error('POST /api/persons/merge error:', err && err.stack ? err.stack : err);
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     if (schemaErrorResponse(res, err, 'POST /api/persons/merge')) return;
     if (err && err.message && (String(err.message).includes('person not found'))) {
       return res.status(404).json({ error: err.message });
@@ -1110,11 +1144,12 @@ async function attachAvatars(items, rowsById, budget) {
   return avatars.filter(Boolean).length;
 }
 
-async function getPersonRow(connOrPool, personId, orgId) {
+async function getPersonRow(connOrPool, personId, orgId, lock = false) {
   const params = [personId];
   let sql = 'SELECT id, person_no, name, note, cover_face_id FROM face_persons WHERE id = ?';
   sql = appendOrgScope(sql, 'face_persons', orgId, params);
   sql += ' LIMIT 1';
+  if (lock) sql += ' FOR UPDATE';
   const [rows] = await connOrPool.query(sql, params);
   return rows && rows.length ? rows[0] : null;
 }
@@ -1225,6 +1260,10 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
     const body = req.body || {};
     const moveFaceIds = parseFaceIdArray(body.moveFaceIds);
     if (!moveFaceIds.length) return res.status(400).json({ error: 'moveFaceIds is required' });
+    const seedFaceIds = parseFaceIdArray(body.seedFaceIds || []);
+    if (seedFaceIds.some((id) => !moveFaceIds.includes(id))) {
+      return res.status(400).json({ error: 'seed faces must be included in moved faces' });
+    }
     const newPersonName = body.newPersonName !== undefined && body.newPersonName !== null
       ? String(body.newPersonName).trim().slice(0, 80)
       : '';
@@ -1243,11 +1282,11 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
     try {
       await conn.beginTransaction();
 
-      const person = await getPersonRow(conn, personId, orgId);
+      const person = await getPersonRow(conn, personId, orgId, true);
       if (!person) throw Object.assign(new Error('person not found'), { status: 404 });
 
       const [rows] = await conn.query(
-        'SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ?',
+        'SELECT * FROM photo_faces WHERE person_id = ? AND organization_id = ? FOR UPDATE',
         [personId, orgId]
       );
       const ownedIds = new Set((rows || []).map((r) => Number(r.id)));
@@ -1276,8 +1315,7 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
       const movedIdSet = new Set(moveFaceIds);
       for (const mr of (moveRows || [])) {
         if (!movedIdSet.has(Number(mr.id))) continue;
-        let extra = null;
-        try { extra = mr.extra ? JSON.parse(String(mr.extra)) : null; } catch (e) { extra = null; }
+        const extra = parseJsonMaybe(mr.extra);
         const mergedExtra = JSON.stringify({
           ...(extra && typeof extra === 'object' ? extra : {}),
           splitFromPersonId: personId,
@@ -1290,6 +1328,14 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
         );
         movedFaces += upd && upd[0] && Number(upd[0].affectedRows) ? Number(upd[0].affectedRows) : 0;
       }
+      const seedSet = new Set(seedFaceIds);
+      const feedbackEventId = await recordIdentityFeedback(conn, { orgId, userId: req.user.id, action: 'split',
+        details: { originalPersonId: personId, newPersonId, seedFaceIds },
+        assignments: rows.map((face) => ({ face,
+          personId: movedIdSet.has(Number(face.id)) ? newPersonId : personId,
+          kind: seedSet.has(Number(face.id)) ? 'explicit' : 'group' })),
+      });
+      await recordSeparation(conn, orgId, personId, newPersonId, feedbackEventId);
 
       // 封面：新人物取搬走组里检测分最高的一张；原人物封面若被搬走则用剩余最好的一张补上
       const [newCoverRows] = await conn.query(
@@ -1597,6 +1643,7 @@ router.post('/faces/find-me/share', (req, res) => {
         return res.status(400).json({ error: 'UNSUPPORTED_SHARE_TYPE' });
       }
 
+      scope.orgId = s.organization_id == null ? null : Number(s.organization_id);
       scope.mediaContext = { shareId: s.id };
       const result = await findMe(req.file && req.file.buffer, scope);
       // Anonymous links never reveal the shared college person library.

@@ -52,9 +52,14 @@ const personRow = {
 };
 
 const calls = { updates: [], inserts: [], personUpdates: [] };
+const feedback = { events: [], samples: [], pairs: [] };
 
 function rowsFor(sql, params) {
   sql = String(sql);
+  if (sql.startsWith('INSERT INTO face_feedback_events')) { feedback.events.push(params); return [{ insertId: 8 }]; }
+  if (sql.trim().startsWith('INSERT INTO face_identity_feedback')) { feedback.samples.push(...params[0]); return [{ affectedRows: params[0].length }]; }
+  if (sql.trim().startsWith('INSERT INTO face_person_separations')) { feedback.pairs.push(params); return [{ affectedRows: 1 }]; }
+  if (sql.startsWith('SELECT * FROM photo_faces WHERE person_id')) return [personFaces];
   if (/SELECT role FROM users/i.test(sql)) return [[{ role: params && params[0] === 42 ? 'photographer' : 'admin' }], null];
   if (/SELECT organization_id FROM users/i.test(sql)) return [[{ organization_id: 1 }], null];
   if (/role_permissions/i.test(sql)) {
@@ -263,12 +268,18 @@ async function main() {
     const server = await listen(makeApp());
     const ok = await call(server, 'POST', '/api/persons/77/split', {
       token: admin,
-      body: { moveFaceIds: [201, 202, 203], newPersonName: '李四' },
+      body: { moveFaceIds: [201, 202, 203], seedFaceIds: [201], newPersonName: '李四' },
     });
     assert.strictEqual(ok.status, 200, `expected 200 got ${ok.status}: ${ok.text}`);
     assert.strictEqual(ok.json.newPersonId, '999');
     assert.strictEqual(ok.json.movedFaces, 3);
     assert.strictEqual(ok.json.originalPersonId, '77');
+    assert.strictEqual(feedback.events[0][2], 'split');
+    assert.strictEqual(feedback.samples.length, personFaces.length);
+    assert.strictEqual(feedback.samples.find((r) => r[2] === 201)[4], 'explicit');
+    assert.strictEqual(feedback.samples.find((r) => r[2] === 202)[4], 'group');
+    assert.strictEqual(feedback.samples.find((r) => r[2] === 101)[1], 77);
+    assert.deepStrictEqual(feedback.pairs, [[1, 77, 999, 8]]);
 
     assert.strictEqual(calls.inserts.length, 1, '应新建一个 face_persons');
     assert.strictEqual(calls.inserts[0].params[0], 1, 'organization_id');

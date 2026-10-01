@@ -18,13 +18,24 @@ const faceRows = [
 ];
 let insertedPersonId = null;
 let createdPersons = 0;
+let feedbackRows = [];
+let pairs = [];
+let protectedPhoto = false;
+let protectDuringDetection = false;
+let deletes = 0;
+let rollbacks = 0;
+let detectionCalls = 0;
+let insertedFace = null;
 
 async function query(sql, params = []) {
   const statement = String(sql).replace(/\s+/g, ' ').trim();
+  if (statement.startsWith('SELECT id FROM face_identity_feedback')) return [protectedPhoto ? [{ id: 1 }] : []];
+  if (statement.includes('FROM face_identity_feedback')) return [feedbackRows];
+  if (statement.includes('FROM face_person_separations')) return [pairs];
   if (statement.includes('FROM photos WHERE id = ?')) {
     return [[{ id: params[0], projectId: 7, organizationId: 2, url: 'unused.jpg' }]];
   }
-  if (statement.startsWith('DELETE FROM photo_faces')) return [{ affectedRows: 0 }];
+  if (statement.startsWith('DELETE FROM photo_faces')) { deletes++; return [{ affectedRows: 0 }]; }
   if (statement.includes('FROM photo_faces pf') && statement.includes('normalized_embedding')) {
     if (statement.includes('ROW_NUMBER() OVER')) {
       const perPerson = Number(params[2]) || 8;
@@ -45,6 +56,7 @@ async function query(sql, params = []) {
   }
   if (statement.startsWith('INSERT INTO photo_faces')) {
     insertedPersonId = params[3];
+    insertedFace = params;
     return [{ insertId: 99 }];
   }
   if (statement.startsWith('UPDATE face_persons')) return [{ affectedRows: 1 }];
@@ -61,7 +73,7 @@ require.cache[dbPath] = {
         query,
         beginTransaction: async () => {},
         commit: async () => {},
-        rollback: async () => {},
+        rollback: async () => { rollbacks++; },
         release: () => {},
       }),
     },
@@ -72,7 +84,10 @@ const detectorPath = require.resolve(path.join(ROOT, 'lib/face_detector'));
 require.cache[detectorPath] = {
   id: detectorPath, filename: detectorPath, loaded: true,
   exports: {
-    detectFacesForPhoto: async () => ({
+    detectFacesForPhoto: async () => {
+      detectionCalls++;
+      if (protectDuringDetection) protectedPhoto = true;
+      return ({
       faces: [{
         faceNo: 1,
         bbox: { left: 0.1, top: 0.1, width: 0.2, height: 0.2 },
@@ -80,7 +95,8 @@ require.cache[detectorPath] = {
         modelName: 'buffalo_l',
       }],
       meta: { modelName: 'buffalo_l' },
-    }),
+      });
+    },
   },
 };
 
@@ -101,7 +117,31 @@ async function main() {
   assert.strictEqual(insertedPersonId, 1, 'an old person must remain a match candidate');
   assert.strictEqual(createdPersons, 0, 'a matching old person must not be duplicated');
   assert.strictEqual(result.matchedCount, 1);
+  faceRows.splice(0, faceRows.length, { personId: 2, normalizedEmbedding: [0, 1] });
+  feedbackRows = [{ person_id: 1, sample_kind: 'explicit', normalized_embedding: [1, 0] }];
+  await detectAndClusterPhoto({ photoId: 11 });
+  assert.strictEqual(insertedPersonId, 1, 'durable correction must match even without recent automatic samples');
+  faceRows[0].normalizedEmbedding = [0.99, Math.sqrt(1 - 0.99 ** 2)];
+  pairs = [{ person_low_id: 1, person_high_id: 2 }];
+  await detectAndClusterPhoto({ photoId: 12 });
+  assert.strictEqual(insertedPersonId, null, 'separated near-tie cannot auto-assign');
+  assert.strictEqual(insertedFace[18], 'suspect');
+  assert.strictEqual(JSON.parse(insertedFace[20]).clusterDecision, 'manual_separation_conflict');
+  assert.strictEqual(createdPersons, 0, 'ambiguity must not create another duplicate person');
+  protectedPhoto = true;
+  const previousDeletes = deletes;
+  const previousDetections = detectionCalls;
+  const protectedResult = await detectAndClusterPhoto({ photoId: 13, force: true });
+  assert.strictEqual(protectedResult.reason, 'manual_faces_protected');
+  assert.strictEqual(deletes, previousDeletes);
+  assert.strictEqual(detectionCalls, previousDetections, 'force refresh must not even detect corrected photos');
+  protectedPhoto = false;
+  protectDuringDetection = true;
+  const raced = await detectAndClusterPhoto({ photoId: 14, force: true });
+  assert.strictEqual(raced.reason, 'manual_faces_protected');
+  assert.strictEqual(rollbacks, 1, 'a correction committed during detection must roll back destructive refresh');
   console.log('face cluster candidates: old person remains eligible after 5000 newer faces');
+  console.log('face feedback integration: persistent reference, split ambiguity, forced refresh and concurrent correction passed');
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -3,6 +3,8 @@ const path = require('path');
 const sharp = require('sharp');
 
 const ROOT = path.join(__dirname, '..');
+let separationPairs = [];
+let feedbackRows = [];
 process.env.FACE_DETECTOR_SERVICE_URL = 'http://127.0.0.1:8009';
 
 const otherFace = [0.4, Math.sqrt(1 - (0.4 * 0.4))];
@@ -19,7 +21,12 @@ require.cache[dbPath] = {
   id: dbPath, filename: dbPath, loaded: true,
   exports: {
     pool: {
-      query: async (sql) => {
+      query: async (sql, params) => {
+        if (sql.includes('FROM face_identity_feedback')) {
+          assert.deepStrictEqual(params[3].slice().sort((a, b) => a - b), [1, 2, 3, 4], 'memory must be scoped to authorized photos');
+          return [feedbackRows];
+        }
+        if (sql.includes('FROM face_person_separations')) return [separationPairs];
         if (sql.includes('FROM photo_faces')) return [rows];
         if (sql.includes('FROM face_persons')) return [[{ id: 10, name: 'query person' }]];
         throw new Error(`unexpected SQL: ${sql}`);
@@ -48,6 +55,16 @@ async function main() {
   assert.strictEqual(result.person.personId, 10);
   assert.deepStrictEqual(result.matches.map((m) => m.photoId).sort((a, b) => a - b), [1, 3, 4],
     'known person must not pull in another co-occurring person by raw similarity');
+  separationPairs = [{ person_low_id: 10, person_high_id: 20 }];
+  rows[1].ne = rows[2].ne = JSON.stringify([0.99, Math.sqrt(1 - 0.99 ** 2)]);
+  const ambiguous = await findMe(image, { projectId: 86, orgId: 2 });
+  assert.strictEqual(ambiguous.ambiguous, true);
+  assert.deepStrictEqual(ambiguous.matches, [], 'ambiguous separated people must not fall back to raw similarity');
+  assert.strictEqual(ambiguous.person, null);
+  rows[1].ne = rows[2].ne = JSON.stringify(otherFace);
+  feedbackRows = [{ person_id: 999, normalized_embedding: [1, 0], sample_kind: 'explicit' }];
+  const scoped = await findMe(image, { projectId: 86, orgId: 2 });
+  assert.strictEqual(scoped.person.personId, 10, 'feedback cannot introduce out-of-scope people');
   console.log('find me precision: unrelated co-occurring person is excluded');
 }
 

@@ -15,6 +15,7 @@ try {
 const { pool } = require('../db');
 const { detectFacesForPhoto } = require('../lib/face_detector');
 const { detectAndClusterPhoto } = require('../lib/face_auto_pipeline');
+const { hasProtectedFaces } = require('../lib/face_feedback');
 
 function parseArgs(argv) {
   const out = {};
@@ -165,10 +166,15 @@ async function getExistingFaceCount(photoId) {
 }
 
 async function writeFaces({ photo, orgIdForInsert, normalizedFaces }) {
+  if (await hasProtectedFaces(pool, photo.id, orgIdForInsert)) return;
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     await conn.query('DELETE FROM photo_faces WHERE photo_id = ?', [photo.id]);
+    if (await hasProtectedFaces(conn, photo.id, orgIdForInsert)) {
+      await conn.rollback();
+      return;
+    }
 
     if (normalizedFaces.length > 0) {
       const seenFaceNo = new Set();
@@ -270,6 +276,8 @@ async function main() {
     } else if (!orgId) {
       throw new Error('--resetOrg requires --orgId=<id>');
     } else {
+      const [corrections] = await pool.query('SELECT id FROM face_identity_feedback WHERE organization_id = ? LIMIT 1', [orgId]);
+      if (corrections.length) throw new Error('Organization has manual face corrections; reset is blocked to preserve feedback');
       console.log('[backfill_faces] resetting existing faces/persons for orgId=', orgId);
       await pool.query('DELETE FROM photo_faces WHERE organization_id = ?', [orgId]);
       await pool.query('DELETE FROM face_persons WHERE organization_id = ?', [orgId]);

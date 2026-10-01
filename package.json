@@ -13,6 +13,8 @@
     "face:deps": "python -m pip install -r scripts/requirements-face.txt",
     "face:service": "python -m uvicorn scripts.face_embed_service:app --host 127.0.0.1 --port 8009",
     "face:backfill": "node scripts/backfill_faces.js",
+    "face:feedback:audit": "node scripts/audit_face_feedback.js",
+    "test:face-feedback": "node scripts/test_face_feedback.js && node scripts/test_face_cluster_candidates.js && node scripts/test_find_me_precision.js && node scripts/test_face_person_split.js && node scripts/test_face_person_merge.js",
     "image:backfill": "node scripts/backfill_image_embeddings.js",
     "video:playback:backfill": "node scripts/backfill_video_playback.js",
     "video:transcript:backfill": "node scripts/backfill_video_transcripts.js --all",
