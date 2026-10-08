@@ -5,6 +5,12 @@ assert.deepEqual(parsePhotoPlusUrl('https://live.photoplus.cn/live/92304200?acce
   activityNo: '92304200',
   canonicalUrl: 'https://live.photoplus.cn/live/92304200#/live',
 });
+assert.deepEqual(parsePhotoPlusUrl('https://live.photoplus.cn/live/pc/75137386/#/6925272230967'), {
+  activityNo: '75137386',
+  viewerSign: '6925272230967',
+  canonicalUrl: 'https://live.photoplus.cn/live/pc/75137386/#/6925272230967',
+});
+assert.equal(parsePhotoPlusUrl('https://live.photoplus.cn/live/75137386/#/6925272230967').viewerSign, '6925272230967');
 assert.equal(parsePhotoPlusUrl('http://live.photoplus.cn/live/92304200'), null);
 assert.equal(parsePhotoPlusUrl('https://live.photoplus.cn.evil.test/live/92304200'), null);
 assert.equal(parsePhotoPlusUrl('https://live.photoplus.cn@127.0.0.1/live/92304200'), null);
@@ -24,8 +30,19 @@ const photo = mapPhotoPlusPhoto({
   width: 4800,
   height: 3200,
 }, '92304200');
-assert.equal(photo.transferUrl, 'https://pb.plusx.cn/watermarked.jpg');
-assert.equal(photo.watermarked, true);
+assert.equal(photo.transferUrl, 'https://pb.plusx.cn/unwatermarked.jpg');
+assert.equal(photo.watermarked, false);
+assert.equal(photo.quality, 'original_view');
+const watermarkedOnly = mapPhotoPlusPhoto({ id: 1, activity_no: '92304200',
+  small_img: '//pb.plusx.cn/preview.jpg', watermark_origin_img: '//pb.plusx.cn/watermarked.jpg',
+}, '92304200');
+assert.equal(watermarkedOnly.transferUrl, 'https://pb.plusx.cn/watermarked.jpg');
+assert.equal(watermarkedOnly.watermarked, true);
+assert.equal(mapPhotoPlusPhoto({ id: 1, activity_no: '92304200', small_img: '//pb.plusx.cn/thumb.jpg',
+  watermark_big_img: '//pb.plusx.cn/resized.jpg' }, '92304200'), null, 'resized previews cannot substitute for originals');
+assert.equal(mapPhotoPlusPhoto({ id: 1, activity_no: '92304200', small_img: '//pb.plusx.cn/preview.jpg',
+  origin_img: 'https://127.0.0.1/private.jpg', watermark_origin_img: '//pb.plusx.cn/watermarked.jpg',
+}, '92304200').transferUrl, 'https://pb.plusx.cn/watermarked.jpg');
 assert.equal(mapPhotoPlusPhoto({ ...photo, activity_no: 'other' }, '92304200'), null);
 
 const seen = new Set();
