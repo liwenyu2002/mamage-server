@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const keys = require('../config/keys');
 const cosStorage = require('../lib/cos_storage');
 const { buildMediaUrl } = require('../lib/media_access');
+const { usableFaceSql } = require('../lib/face_result_policy');
 const JWT_SECRET = keys.JWT_SECRET;
 
 // 如果请求没有运行全量 authMiddleware，但前端仍然携带了 Bearer token，
@@ -1027,7 +1028,7 @@ router.get('/:id', async (req, res) => {
             fp.name AS personName
           FROM photo_faces pf
           LEFT JOIN face_persons fp ON pf.person_id = fp.id
-          WHERE pf.project_id = ?
+          WHERE pf.project_id = ? AND ${usableFaceSql('pf')}
         `;
         const faceParams = [id];
         if (orgId === null) {

@@ -27,7 +27,7 @@ async function query(sql, params = []) {
   if (statement.startsWith('DELETE FROM photo_faces')) return [{ affectedRows: 0 }];
   if (statement.includes('FROM photo_faces pf') && statement.includes('ROW_NUMBER() OVER')) {
     assert(statement.includes('model_name = ?') && statement.includes('model_version <=> ?'));
-    assert(statement.includes("status NOT IN ('rejected', 'deleted')"));
+    assert(statement.includes("status NOT IN ('rejected', 'deleted', 'legacy_blocked')"));
     return [profileRows];
   }
   if (statement.includes('FROM ai_image_embeddings')) {
@@ -98,7 +98,17 @@ async function main() {
 
   feedbackRows = [reference(526, [0, 1], 'legacy')];
   await run();
-  assert.equal(inserted[3], null, 'recovered historical corrections must also stop profile drift');
+  assert.equal(inserted[3], 526, 'unreviewed legacy references must not override current results');
+
+  profileRows = [row(526, [0, 1])];
+  feedbackRows = [reference(526, [1, 0], 'legacy')];
+  await run();
+  assert.notEqual(inserted[3], 526, 'legacy feedback must not reintroduce a quarantined identity');
+
+  feedbackRows = [];
+  profileRows = [{ ...row(526, [1, 0]), status: 'legacy_blocked' }];
+  await run();
+  assert.notEqual(inserted[3], 526, 'blocked old results cannot seed a new automatic match');
 
   profileRows = [row(526, [0, 1])];
   feedbackRows = [reference(526, [1, 0])];

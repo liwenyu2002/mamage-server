@@ -19,6 +19,7 @@ const profiles = buildIdentityProfiles([
   { personId: 1, normalizedEmbedding: [1, 0, 0], ...space },
   { personId: 2, normalizedEmbedding: [1, 0], ...space, modelVersion: 'new' },
   { personId: 3, normalizedEmbedding: [1, 0], ...space, status: 'rejected' },
+  { personId: 4, normalizedEmbedding: [1, 0], ...space, status: 'legacy_blocked' },
 ], { space, sampleLimit: 2 });
 assert.equal(profiles.length, 1);
 assert.equal(profiles[0].count, 2);

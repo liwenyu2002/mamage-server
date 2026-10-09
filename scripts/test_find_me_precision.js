@@ -91,6 +91,12 @@ async function main() {
   assert.notStrictEqual(conflict.person?.personId, 10, 'reviewed references must veto automatic profile pollution');
 
   feedbackRows = [];
+  rows = [face(1, 10, 1)];
+  rows[0].status = 'legacy_blocked';
+  const blocked = await findMe(image, { projectId: 86, orgId: 2 });
+  assert.strictEqual(blocked.person, null, 'quarantined legacy faces cannot identify a person');
+  assert.deepStrictEqual(blocked.matches, [], 'quarantined legacy faces cannot appear in find-me results');
+
   rows = [face(1, 10, 0.8), face(2, 20, 0.79)];
   const tie = await findMe(image, { projectId: 86, orgId: 2 });
   assert.strictEqual(tie.ambiguous, true, 'ordinary near ties must abstain without a prior manual split');

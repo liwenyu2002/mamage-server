@@ -8,6 +8,7 @@ const {
 } = require('../lib/workspace_access');
 const { detectFacesForPhoto } = require('../lib/face_detector');
 const { getFaceAvatarDataUrl } = require('../lib/face_avatar');
+const { CURRENT_FACE_REVISION, usableFaceSql } = require('../lib/face_result_policy');
 const {
   hasProtectedFaces, recordIdentityFeedback, recordSeparation, remapMergedFeedback,
 } = require('../lib/face_feedback');
@@ -230,7 +231,7 @@ async function listFacesByPhotoId(photoId, orgId) {
       fp.name AS person_name
     FROM photo_faces pf
     LEFT JOIN face_persons fp ON pf.person_id = fp.id
-    WHERE pf.photo_id = ?
+    WHERE pf.photo_id = ? AND ${usableFaceSql('pf')}
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
   sql += ' ORDER BY pf.face_no ASC, pf.id ASC';
@@ -254,7 +255,7 @@ async function getFaceWithPerson(faceId, orgId, workspace = null) {
     LEFT JOIN face_persons fp ON pf.person_id = fp.id
     JOIN photos p ON p.id = pf.photo_id
     LEFT JOIN projects pr ON pr.id = p.project_id
-    WHERE pf.id = ?
+    WHERE pf.id = ? AND ${usableFaceSql('pf')}
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
   sql = appendVisiblePhotoScope(sql, workspace, params);
@@ -280,7 +281,7 @@ async function listRelatedPhotosByPersonId(personId, orgId, limit = null, userId
     FROM photo_faces pf
     JOIN photos p ON pf.photo_id = p.id
     LEFT JOIN projects pr ON p.project_id = pr.id
-    WHERE pf.person_id = ?
+    WHERE pf.person_id = ? AND ${usableFaceSql('pf')}
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
   sql = appendVisiblePhotoScope(sql, workspace, params);
@@ -443,7 +444,7 @@ async function upsertFacesForPhoto({ photoId, orgId, incomingFaces, force }) {
               face.modelVersion || null,
               face.status || 'detected',
               face.faceHash || null,
-              face.extra ? JSON.stringify(face.extra) : null,
+              JSON.stringify({ ...face.extra, recognitionRevision: CURRENT_FACE_REVISION }),
             ]
           );
         }
@@ -495,7 +496,9 @@ async function buildFaceProfile({ faceId, personId, orgId, userId = null, worksp
         person_no AS personNo,
         name,
         note,
-        cover_face_id AS coverFaceId,
+        CASE WHEN EXISTS (SELECT 1 FROM photo_faces cover
+          WHERE cover.id = face_persons.cover_face_id AND cover.person_id = face_persons.id
+            AND ${usableFaceSql('cover')}) THEN cover_face_id ELSE NULL END AS coverFaceId,
         created_at AS createdAt,
         updated_at AS updatedAt
       FROM face_persons
@@ -604,7 +607,7 @@ router.get('/faces', requirePermission('photos.view'), async (req, res) => {
         LEFT JOIN face_persons fp ON pf.person_id = fp.id
         JOIN photos p ON p.id = pf.photo_id
         LEFT JOIN projects pr ON pr.id = p.project_id
-        WHERE pf.person_id = ?
+        WHERE pf.person_id = ? AND ${usableFaceSql('pf')}
       `;
       sql = appendOrgScope(sql, 'pf', orgId, params);
       sql = appendVisiblePhotoScope(sql, req.workspace, params);
@@ -673,7 +676,7 @@ router.post('/faces/label', requirePermission('photos.view'), async (req, res) =
       await conn.beginTransaction();
 
       const [lockedFaces] = await conn.query(
-        'SELECT * FROM photo_faces WHERE id = ? AND organization_id <=> ? FOR UPDATE', [faceId, orgId]
+        `SELECT * FROM photo_faces WHERE id = ? AND organization_id <=> ? AND ${usableFaceSql()} FOR UPDATE`, [faceId, orgId]
       );
       if (!lockedFaces.length) throw new Error('face not found');
       let targetPersonId = null;
@@ -851,7 +854,8 @@ router.get('/persons', requirePermission('faces.merge'), async (req, res) => {
     const offset = (Math.floor(page) - 1) * pageSize;
 
     const q = req.query.q ? String(req.query.q).trim() : '';
-    const where = ['fp.organization_id = ?'];
+    const where = ['fp.organization_id = ?', `EXISTS (SELECT 1 FROM photo_faces active
+      WHERE active.person_id = fp.id AND ${usableFaceSql('active')})`];
     const params = [orgId];
     if (q) {
       const like = `%${q}%`;
@@ -872,12 +876,14 @@ router.get('/persons', requirePermission('faces.merge'), async (req, res) => {
          fp.person_no AS personNo,
          fp.name,
          fp.note,
-         fp.cover_face_id AS coverFaceId,
+         CASE WHEN EXISTS (SELECT 1 FROM photo_faces cover
+           WHERE cover.id = fp.cover_face_id AND cover.person_id = fp.id AND ${usableFaceSql('cover')})
+           THEN fp.cover_face_id ELSE NULL END AS coverFaceId,
          fp.created_at AS createdAt,
          fp.updated_at AS updatedAt,
          COUNT(pf.id) AS faceCount
        FROM face_persons fp
-       LEFT JOIN photo_faces pf ON pf.person_id = fp.id
+       LEFT JOIN photo_faces pf ON pf.person_id = fp.id AND ${usableFaceSql('pf')}
        ${whereSql}
        GROUP BY fp.id, fp.person_no, fp.name, fp.note, fp.cover_face_id, fp.created_at, fp.updated_at
        ORDER BY faceCount DESC, fp.updated_at DESC, fp.id DESC
@@ -958,7 +964,7 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
       }
 
       const [feedbackFaces] = await conn.query(
-        'SELECT * FROM photo_faces WHERE organization_id = ? AND person_id IN (?) ORDER BY id FOR UPDATE',
+        `SELECT * FROM photo_faces WHERE organization_id = ? AND person_id IN (?) AND ${usableFaceSql()} ORDER BY id FOR UPDATE`,
         [orgId, [targetPersonId, ...sourcePersonIds]]
       );
       const referenceIds = new Set(parseFaceIdArray(body.referenceFaceIds || []));
@@ -968,7 +974,7 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
       }
 
       const [upd] = await conn.query(
-        "UPDATE photo_faces SET person_id = ?, status = 'confirmed' WHERE organization_id = ? AND person_id IN (?)",
+        `UPDATE photo_faces SET person_id = ?, status = 'confirmed' WHERE organization_id = ? AND person_id IN (?) AND ${usableFaceSql()}`,
         [targetPersonId, orgId, sourcePersonIds]
       );
       movedFaces = upd && Number.isFinite(Number(upd.affectedRows)) ? Number(upd.affectedRows) : 0;
@@ -985,16 +991,16 @@ router.post('/persons/merge', requirePermission('faces.merge'), async (req, res)
       mergedNoteParts.push(`merged from: ${sourcePersonIds.join(',')}`);
       const mergedNote = mergedNoteParts.filter(Boolean).join(' | ').slice(0, 2000) || null;
 
-      let coverFaceId = target.coverFaceId ? Number(target.coverFaceId) : null;
+      let coverFaceId = ownedIds.has(Number(target.coverFaceId)) ? Number(target.coverFaceId) : null;
       if (!Number.isFinite(coverFaceId) || coverFaceId <= 0) {
-        const sourceCover = (sourceRows || []).map((r) => Number(r.coverFaceId)).find((n) => Number.isFinite(n) && n > 0);
+        const sourceCover = (sourceRows || []).map((r) => Number(r.coverFaceId)).find((n) => ownedIds.has(n));
         if (sourceCover) coverFaceId = sourceCover;
       }
       if (!Number.isFinite(coverFaceId) || coverFaceId <= 0) {
         const [coverRows] = await conn.query(
           `SELECT id
            FROM photo_faces
-           WHERE organization_id = ? AND person_id = ?
+           WHERE organization_id = ? AND person_id = ? AND ${usableFaceSql()}
            ORDER BY detection_score DESC, id ASC
            LIMIT 1`,
           [orgId, targetPersonId]
@@ -1102,7 +1108,7 @@ async function loadPersonFacesWithPhoto(personId, orgId, workspace = null) {
     FROM photo_faces pf
     JOIN photos p ON p.id = pf.photo_id
     LEFT JOIN projects pr ON pr.id = p.project_id
-    WHERE pf.person_id = ?
+    WHERE pf.person_id = ? AND ${usableFaceSql('pf')}
   `;
   sql = appendOrgScope(sql, 'pf', orgId, params);
   sql = appendVisiblePhotoScope(sql, workspace, params);
@@ -1286,7 +1292,7 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
       if (!person) throw Object.assign(new Error('person not found'), { status: 404 });
 
       const [rows] = await conn.query(
-        'SELECT * FROM photo_faces WHERE person_id = ? AND organization_id = ? FOR UPDATE',
+        `SELECT * FROM photo_faces WHERE person_id = ? AND organization_id = ? AND ${usableFaceSql()} FOR UPDATE`,
         [personId, orgId]
       );
       const ownedIds = new Set((rows || []).map((r) => Number(r.id)));
@@ -1323,7 +1329,7 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
           splitAt: new Date().toISOString(),
         });
         const upd = await conn.query(
-          "UPDATE photo_faces SET person_id = ?, status = 'confirmed', extra = ? WHERE id = ? AND person_id = ? AND organization_id = ?",
+          `UPDATE photo_faces SET person_id = ?, status = 'confirmed', extra = ? WHERE id = ? AND person_id = ? AND organization_id = ? AND ${usableFaceSql()}`,
           [newPersonId, mergedExtra, mr.id, personId, orgId]
         );
         movedFaces += upd && upd[0] && Number(upd[0].affectedRows) ? Number(upd[0].affectedRows) : 0;
@@ -1339,7 +1345,7 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
 
       // 封面：新人物取搬走组里检测分最高的一张；原人物封面若被搬走则用剩余最好的一张补上
       const [newCoverRows] = await conn.query(
-        'SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ? ORDER BY detection_score DESC, id ASC LIMIT 1',
+        `SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ? AND ${usableFaceSql()} ORDER BY detection_score DESC, id ASC LIMIT 1`,
         [newPersonId, orgId]
       );
       if (newCoverRows && newCoverRows.length) {
@@ -1349,7 +1355,7 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
       const oldCoverId = person.cover_face_id ? Number(person.cover_face_id) : null;
       if (oldCoverId && movedIdSet.has(oldCoverId)) {
         const [oldCoverRows] = await conn.query(
-          'SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ? ORDER BY detection_score DESC, id ASC LIMIT 1',
+          `SELECT id FROM photo_faces WHERE person_id = ? AND organization_id = ? AND ${usableFaceSql()} ORDER BY detection_score DESC, id ASC LIMIT 1`,
           [personId, orgId]
         );
         await conn.query(

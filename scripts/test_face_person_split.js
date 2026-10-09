@@ -83,7 +83,7 @@ function rowsFor(sql, params) {
     const wanted = new Set((params && params[0]) || []);
     return [personFaces.filter((f) => wanted.has(f.id)).map((f) => ({ id: f.id, extra: f.extra })), null];
   }
-  if (/SELECT id\s+FROM photo_faces\s+WHERE person_id = \? AND organization_id = \?\s+ORDER BY detection_score DESC/i.test(sql)) {
+  if (/SELECT id\s+FROM photo_faces\s+WHERE person_id = \? AND organization_id = \?\s+AND status NOT IN \([^)]+\)\s+ORDER BY detection_score DESC/i.test(sql)) {
     // 新人物封面取搬走组最高分；原人物封面补选剩余最高分
     const pid = params && params[0];
     const pool2 = pid === 999 ? personFaces.filter((f) => [201, 202, 203].includes(f.id)) : personFaces.filter((f) => [101, 102, 103, 104].includes(f.id));
