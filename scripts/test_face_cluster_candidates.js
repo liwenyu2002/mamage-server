@@ -38,7 +38,7 @@ async function query(sql, params = []) {
   if (statement.startsWith('DELETE FROM photo_faces')) { deletes++; return [{ affectedRows: 0 }]; }
   if (statement.includes('FROM photo_faces pf') && statement.includes('normalized_embedding')) {
     if (statement.includes('ROW_NUMBER() OVER')) {
-      const perPerson = Number(params[2]) || 8;
+      const perPerson = Number(params.at(-1)) || 8;
       const seen = new Map();
       return [faceRows.filter((row) => {
         const count = (seen.get(row.personId) || 0) + 1;
@@ -113,11 +113,12 @@ require.cache[configPath] = {
 const { detectAndClusterPhoto } = require(path.join(ROOT, 'lib/face_auto_pipeline'));
 
 async function main() {
+  for (const row of faceRows) Object.assign(row, { modelName: 'buffalo_l', modelVersion: null });
   const result = await detectAndClusterPhoto({ photoId: 10 });
   assert.strictEqual(insertedPersonId, 1, 'an old person must remain a match candidate');
   assert.strictEqual(createdPersons, 0, 'a matching old person must not be duplicated');
   assert.strictEqual(result.matchedCount, 1);
-  faceRows.splice(0, faceRows.length, { personId: 2, normalizedEmbedding: [0, 1] });
+  faceRows.splice(0, faceRows.length, { personId: 2, normalizedEmbedding: [0, 1], modelName: 'buffalo_l', modelVersion: null });
   feedbackRows = [{ person_id: 1, sample_kind: 'explicit', normalized_embedding: [1, 0] }];
   await detectAndClusterPhoto({ photoId: 11 });
   assert.strictEqual(insertedPersonId, 1, 'durable correction must match even without recent automatic samples');

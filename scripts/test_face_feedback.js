@@ -14,6 +14,7 @@ async function main() {
   assert.strictEqual(references[0].face_id, 1, 'old explicit feedback cannot be displaced by recent group samples');
   assert.strictEqual(referenceScore([1, 0], references), 1, 'group suggestions must not dilute explicit confirmation');
   assert.strictEqual(referenceScore([1, 0], selectReferences([old])), 1);
+  assert.strictEqual(referenceScore([0, 1], references), 0, 'unreviewed group suggestions must not overrule an explicit reference');
   assert.strictEqual(referenceScore([1, 0, 0], selectReferences([old])), -1, 'incompatible embeddings are ignored');
   const profiles = [];
   attachFeedbackReferences(profiles, new Map([[7, selectReferences([old])]]));
