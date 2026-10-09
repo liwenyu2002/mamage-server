@@ -152,6 +152,7 @@ app.use('/api/wechat-compositions', wechatCompositionsRouter);
 app.use('/api/favorites', userFavoritesRouter);
 app.use('/api/organizations', orgsRouter);
 app.use('/api/workspaces', workspacesRouter);
+app.use('/api/album-desktop', require('./routes/album_desktop'));
 app.use('/api/auth', require('./routes/auth_dingtalk'));
 app.use('/api/network', require('./routes/network'));
 app.use('/api/share', shareRouter);
