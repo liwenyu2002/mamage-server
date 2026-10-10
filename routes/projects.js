@@ -10,6 +10,8 @@ const keys = require('../config/keys');
 const cosStorage = require('../lib/cos_storage');
 const { buildMediaUrl } = require('../lib/media_access');
 const { usableFaceSql } = require('../lib/face_result_policy');
+const { createProjectPreviewReader } = require('../lib/project_previews');
+const readProjectPreviews = createProjectPreviewReader(pool);
 const JWT_SECRET = keys.JWT_SECRET;
 
 // 如果请求没有运行全量 authMiddleware，但前端仍然携带了 Bearer token，
@@ -894,6 +896,24 @@ router.get('/import-status', async (req, res) => {
 // ==============================
 // 4. 项目详情：GET /api/projects/:id
 // ==============================
+router.get('/:id/previews', requirePermission('photos.view'), async (req, res) => {
+  try {
+    const projectId = Number(req.params.id);
+    if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: 'INVALID_PROJECT_ID' });
+    // Always recheck access before serving cached rows; no signed URLs are cached.
+    const project = await requireProjectAccess(req, projectId, 'read');
+    const { photos, ...summary } = await readProjectPreviews(projectId, project.organization_id);
+    res.set('Cache-Control', 'private, no-store');
+    return res.json({ ...summary, list: photos.map(photo => ({
+      id: photo.id, thumbUrl: mediaUrl(req, photo.thumbUrl || photo.url, photo.id),
+    })) });
+  } catch (err) {
+    if (sendWorkspaceError(res, err)) return;
+    console.error('[projects] preview selection failed:', err.message);
+    return res.status(500).json({ error: 'PREVIEW_LOAD_FAILED' });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);

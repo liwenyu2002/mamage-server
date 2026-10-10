@@ -264,10 +264,22 @@ async function getFaceWithPerson(faceId, orgId, workspace = null) {
   return rows && rows.length ? rows[0] : null;
 }
 
-async function listRelatedPhotosByPersonId(personId, orgId, limit = null, userId = null, workspace = null) {
+function relatedPhotoScope(personId, orgId, workspace) {
+  const params = [personId];
+  let sql = `FROM photo_faces pf
+    JOIN photos p ON pf.photo_id = p.id
+    LEFT JOIN projects pr ON p.project_id = pr.id
+    WHERE pf.person_id = ? AND ${usableFaceSql('pf')}`;
+  sql = appendOrgScope(sql, 'pf', orgId, params);
+  sql = appendVisiblePhotoScope(sql, workspace, params);
+  return { sql, params };
+}
+
+async function listRelatedPhotosByPersonId(personId, orgId, limit = null, userId = null, workspace = null, offset = null) {
   const hasLimit = Number.isFinite(Number(limit)) && Number(limit) > 0;
   const safeLimit = hasLimit ? Math.max(1, Math.min(5000, Number(limit))) : null;
-  const params = [personId];
+  const scope = relatedPhotoScope(personId, orgId, workspace);
+  const params = [...scope.params];
   let sql = `
     SELECT DISTINCT
       p.id,
@@ -278,20 +290,33 @@ async function listRelatedPhotosByPersonId(personId, orgId, limit = null, userId
       p.title,
       p.description,
       p.created_at AS createdAt
-    FROM photo_faces pf
-    JOIN photos p ON pf.photo_id = p.id
-    LEFT JOIN projects pr ON p.project_id = pr.id
-    WHERE pf.person_id = ? AND ${usableFaceSql('pf')}
+    ${scope.sql}
   `;
-  sql = appendOrgScope(sql, 'pf', orgId, params);
-  sql = appendVisiblePhotoScope(sql, workspace, params);
   sql += ' ORDER BY p.created_at DESC, p.id DESC';
   if (safeLimit) {
     sql += ' LIMIT ?';
     params.push(safeLimit);
+    if (offset !== null) { sql += ' OFFSET ?'; params.push(offset); }
   }
   const [rows] = await pool.query(sql, params);
   return (rows || []).map((row) => mapRelatedPhoto(row, userId));
+}
+
+function profileReadOptions(req) {
+  const compact = String(req.query.compact || '') === '1';
+  const page = Math.max(1, Math.min(1000000, Math.floor(Number(req.query.page) || 1)));
+  const pageSize = Math.max(1, Math.min(72, Math.floor(Number(req.query.pageSize) || 24)));
+  return { compact, page, pageSize, includeAvatar: compact ? String(req.query.includeAvatar || '') === '1' : String(req.query.includeAvatar || '') !== '0' };
+}
+
+async function relatedPhotosPage(personId, orgId, userId, workspace, page, pageSize) {
+  const scope = relatedPhotoScope(personId, orgId, workspace);
+  const [photos, [counts]] = await Promise.all([
+    listRelatedPhotosByPersonId(personId, orgId, pageSize, userId, workspace, (page - 1) * pageSize),
+    pool.query(`SELECT COUNT(DISTINCT p.id) AS total ${scope.sql}`, scope.params),
+  ]);
+  const total = Number(counts[0]?.total) || 0;
+  return { photos, total, page, pageSize, hasMore: page * pageSize < total };
 }
 
 function normalizeIncomingFace(face, idx) {
@@ -474,7 +499,7 @@ async function upsertFacesForPhoto({ photoId, orgId, incomingFaces, force }) {
   };
 }
 
-async function buildFaceProfile({ faceId, personId, orgId, userId = null, workspace = null }) {
+async function buildFaceProfile({ faceId, personId, orgId, userId = null, workspace = null, compact = false, includeAvatar = true, page = 1, pageSize = 24 }) {
   let faceRow = null;
   let targetPersonId = Number.isFinite(Number(personId)) && Number(personId) > 0 ? Number(personId) : null;
 
@@ -486,6 +511,7 @@ async function buildFaceProfile({ faceId, personId, orgId, userId = null, worksp
 
   let person = null;
   let relatedPhotos = [];
+  let photoPage = null;
 
   if (targetPersonId) {
     const pParams = [targetPersonId];
@@ -521,7 +547,12 @@ async function buildFaceProfile({ faceId, personId, orgId, userId = null, worksp
         createdAt: p.createdAt,
         updatedAt: p.updatedAt,
       };
-      relatedPhotos = await listRelatedPhotosByPersonId(targetPersonId, orgId, null, userId, workspace);
+      if (compact) {
+        photoPage = await relatedPhotosPage(targetPersonId, orgId, userId, workspace, page, pageSize);
+        relatedPhotos = photoPage.photos;
+      } else {
+        relatedPhotos = await listRelatedPhotosByPersonId(targetPersonId, orgId, null, userId, workspace);
+      }
     }
   }
 
@@ -556,6 +587,12 @@ async function buildFaceProfile({ faceId, personId, orgId, userId = null, worksp
   }
 
   const face = faceRow ? mapFaceRow(faceRow) : null;
+  if (compact && face) { delete face.embedding; delete face.normalizedEmbedding; }
+  if (compact && !photoPage) {
+    const total = relatedPhotos.length;
+    if (page > 1) relatedPhotos = [];
+    photoPage = { total, page, pageSize, hasMore: false };
+  }
   const displayName = person && person.name
     ? person.name
     : (face ? `人脸#${face.faceNo}` : (person && person.displayName ? person.displayName : '未标注人物'));
@@ -568,7 +605,7 @@ async function buildFaceProfile({ faceId, personId, orgId, userId = null, worksp
     const coverRow = await getFaceWithPerson(coverId, orgId, workspace);
     if (coverRow) avatarFaceRow = coverRow;
   }
-  const avatarDataUrl = avatarFaceRow ? await getFaceAvatarDataUrl(avatarFaceRow) : null;
+  const avatarDataUrl = includeAvatar && avatarFaceRow ? await getFaceAvatarDataUrl(avatarFaceRow) : null;
 
   return {
     face,
@@ -580,9 +617,9 @@ async function buildFaceProfile({ faceId, personId, orgId, userId = null, worksp
       personId: person && person.personId ? person.personId : null,
     },
     avatarDataUrl,
-    avatarFaceId: avatarFaceRow && avatarDataUrl ? String(avatarFaceRow.id) : null,
+    avatarFaceId: avatarFaceRow ? String(avatarFaceRow.id) : null,
     relatedPhotos,
-    photos: relatedPhotos,
+    ...(compact ? { total: photoPage.total, page, pageSize, hasMore: photoPage.hasMore } : { photos: relatedPhotos }),
   };
 }
 
@@ -695,7 +732,9 @@ router.post('/faces/label', requirePermission('photos.view'), async (req, res) =
         const fParams = [personName];
         let fSql = 'SELECT id FROM face_persons WHERE name = ?';
         fSql = appendOrgScope(fSql, 'face_persons', orgId, fParams);
-        fSql += ' LIMIT 1';
+        fSql += ` ORDER BY EXISTS (SELECT 1 FROM photo_faces named
+          WHERE named.person_id = face_persons.id AND ${usableFaceSql('named')}) DESC,
+          updated_at DESC, id DESC LIMIT 1`;
         const [found] = await conn.query(fSql, fParams);
 
         if (found && found.length) {
@@ -764,13 +803,27 @@ router.get('/faces/cluster/config', requirePermission('photos.view'), async (req
   }
 });
 
+router.get('/faces/:faceId/avatar', requirePermission('photos.view'), async (req, res) => {
+  try {
+    const faceId = Number(req.params.faceId);
+    if (!Number.isSafeInteger(faceId) || faceId <= 0) return res.status(400).json({ error: 'invalid faceId' });
+    const row = await getFaceWithPerson(faceId, getOrgIdFromReq(req), req.workspace);
+    if (!row) return res.status(404).json({ error: 'face not found' });
+    res.set('Cache-Control', 'private, no-store');
+    return res.json({ faceId: String(faceId), avatarDataUrl: await getFaceAvatarDataUrl(row) });
+  } catch (err) {
+    if (schemaErrorResponse(res, err, 'GET /api/faces/:faceId/avatar')) return;
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.get('/faces/:faceId/person', requirePermission('photos.view'), async (req, res) => {
   try {
     const orgId = getOrgIdFromReq(req);
     const faceId = Number(req.params.faceId);
     if (!Number.isFinite(faceId) || faceId <= 0) return res.status(400).json({ error: 'invalid faceId' });
 
-    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace });
+    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace, ...profileReadOptions(req) });
     if (!profile) return res.status(404).json({ error: 'face not found' });
     return res.json(profile);
   } catch (err) {
@@ -789,7 +842,7 @@ router.get('/faces/:faceId', requirePermission('photos.view'), async (req, res, 
     const faceId = Number(req.params.faceId);
     if (!Number.isFinite(faceId) || faceId <= 0) return res.status(400).json({ error: 'invalid faceId' });
 
-    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace });
+    const profile = await buildFaceProfile({ faceId, personId: null, orgId, userId: req.user.id, workspace: req.workspace, ...profileReadOptions(req) });
     if (!profile) return res.status(404).json({ error: 'face not found' });
     return res.json(profile);
   } catch (err) {
@@ -809,7 +862,7 @@ router.get('/faces/person', requirePermission('photos.view'), async (req, res) =
       return res.status(400).json({ error: 'faceId or personId is required' });
     }
 
-    const profile = await buildFaceProfile({ faceId, personId, orgId, userId: req.user.id, workspace: req.workspace });
+    const profile = await buildFaceProfile({ faceId, personId, orgId, userId: req.user.id, workspace: req.workspace, ...profileReadOptions(req) });
     if (!profile) return res.status(404).json({ error: 'person/face not found' });
     return res.json(profile);
   } catch (err) {
@@ -829,7 +882,7 @@ router.get('/faces/profile', requirePermission('photos.view'), async (req, res) 
       return res.status(400).json({ error: 'faceId or personId is required' });
     }
 
-    const profile = await buildFaceProfile({ faceId, personId, orgId, userId: req.user.id, workspace: req.workspace });
+    const profile = await buildFaceProfile({ faceId, personId, orgId, userId: req.user.id, workspace: req.workspace, ...profileReadOptions(req) });
     if (!profile) return res.status(404).json({ error: 'person/face not found' });
     return res.json(profile);
   } catch (err) {
@@ -1275,11 +1328,17 @@ router.post('/persons/:personId/split', requirePermission('faces.merge'), async 
       : '';
     if (newPersonName) {
       const dupParams = [newPersonName, personId];
-      let dupSql = 'SELECT id FROM face_persons WHERE name = ? AND id <> ?';
+      let dupSql = `SELECT id FROM face_persons WHERE name = ? AND id <> ?
+        AND EXISTS (SELECT 1 FROM photo_faces active
+          WHERE active.person_id = face_persons.id AND ${usableFaceSql('active')})`;
       dupSql = appendOrgScope(dupSql, 'face_persons', orgId, dupParams);
       dupSql += ' LIMIT 1';
       const [dupRows] = await pool.query(dupSql, dupParams);
-      if (dupRows && dupRows.length) return res.status(409).json({ error: 'person name already exists' });
+      if (dupRows && dupRows.length) return res.status(409).json({
+        error: 'person name already exists',
+        message: '该姓名已被其他有效人物使用，请先搜索并确认是否需要合并人物。',
+        existingPersonId: String(dupRows[0].id),
+      });
     }
 
     const conn = await pool.getConnection();
@@ -1407,12 +1466,19 @@ router.patch('/persons/:personId', requirePermission('faces.label'), async (req,
     }
 
     const dupParams = [personName, personId];
-    let dupSql = 'SELECT id FROM face_persons WHERE name = ? AND id <> ?';
+    // Retain retired profiles for audit history without reserving a visible person's name.
+    let dupSql = `SELECT id FROM face_persons WHERE name = ? AND id <> ?
+      AND EXISTS (SELECT 1 FROM photo_faces active
+        WHERE active.person_id = face_persons.id AND ${usableFaceSql('active')})`;
     dupSql = appendOrgScope(dupSql, 'face_persons', orgId, dupParams);
     dupSql += ' LIMIT 1';
     const [dupRows] = await pool.query(dupSql, dupParams);
     if (dupRows && dupRows.length) {
-      return res.status(409).json({ error: 'person name already exists' });
+      return res.status(409).json({
+        error: 'person name already exists',
+        message: '该姓名已被其他有效人物使用，请在合并人物中搜索该姓名并核对人脸。',
+        existingPersonId: String(dupRows[0].id),
+      });
     }
 
     const updParams = [personName, personId];
@@ -1439,7 +1505,7 @@ router.get('/persons/:personId', requirePermission('photos.view'), async (req, r
     const personId = Number(req.params.personId);
     if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
 
-    const profile = await buildFaceProfile({ faceId: null, personId, orgId, userId: req.user.id, workspace: req.workspace });
+    const profile = await buildFaceProfile({ faceId: null, personId, orgId, userId: req.user.id, workspace: req.workspace, ...profileReadOptions(req) });
     if (!profile) return res.status(404).json({ error: 'person not found' });
     return res.json(profile);
   } catch (err) {
@@ -1457,6 +1523,12 @@ router.get('/persons/:personId/photos', requirePermission('photos.view'), async 
     const useAll = all === '1' || all === 'true' || all === 'yes' || all === 'y';
     const limit = useAll ? null : (req.query.limit ? Number(req.query.limit) : 200);
     if (!Number.isFinite(personId) || personId <= 0) return res.status(400).json({ error: 'invalid personId' });
+
+    if (req.query.page !== undefined || req.query.pageSize !== undefined) {
+      const { page, pageSize } = profileReadOptions(req);
+      const result = await relatedPhotosPage(personId, orgId, req.user.id, req.workspace, page, pageSize);
+      return res.json({ personId: String(personId), ...result });
+    }
 
     const photos = await listRelatedPhotosByPersonId(personId, orgId, limit, req.user.id, req.workspace);
     return res.json({ personId: String(personId), photos, list: photos, total: photos.length });
